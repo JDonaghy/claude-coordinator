@@ -4807,6 +4807,30 @@ impl CoordApp {
                             }
                         }
                     }
+                    // #2454: the Reports panel's result table is a MAIN-panel
+                    // grid too (#1911 moved the section stack to the sidebar,
+                    // leaving nothing else here), so it needs its own arm for
+                    // the same reason the Queue grid above does.
+                    //
+                    // Unlike Queue/Plans there is NO pre-select step: the
+                    // result table has no row selection (the left-click path
+                    // below still treats a `Row` hit as a no-op), so the
+                    // target is built straight from the hit's own row index.
+                    // `reports_row_context_target` resolves it through the
+                    // catalogue's declared `row_identity` and returns `None`
+                    // for a report whose rows name no issue — which is what
+                    // makes this arm fall through silently on `usage`,
+                    // `decisions` and `queue-outcomes` instead of opening an
+                    // empty or all-inert menu.
+                    if self.active_view == SidebarView::Reports {
+                        if let Some(DataTableHit::Row { idx }) = self.reports_table_hit(pos) {
+                            if let Some(target) = self.reports_row_context_target(idx) {
+                                if self.open_context_menu(pos, target) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
                     if self.active_view == SidebarView::Plans && !self.plans_detail_open {
                         // #1122: while the detail pane is open the roster
                         // list isn't painted at all, so `plans_row_at`

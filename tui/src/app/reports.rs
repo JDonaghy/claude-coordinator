@@ -1521,6 +1521,130 @@ impl CoordApp {
         ))
     }
 
+    // ── #2454: per-row identity and the row context menu ─────────────────
+    //
+    // The generic-vs-hardcoded line (see this module's header) holds here
+    // for one reason: a "jump elsewhere" menu needs the row's **identity**,
+    // never its **content**. So the catalogue declares WHERE that identity
+    // lives (`ReportDef::row_identity`, mirroring `coord/reports.py`'s
+    // `RowIdentity`) and everything below is an optional-field check — not a
+    // `match` on a report id. A report that wants the menu opts in
+    // server-side; `usage` grouped `by=repo`, `decisions` and
+    // `queue-outcomes` declare nothing and get no menu, with no Rust change
+    // either way.
+    //
+    // This is exactly the door #2405 found shut: it needed a row click to
+    // render the *Pipeline's* detail pane for the row, which no declaration
+    // can express. Identity can be declared; rendering cannot.
+
+    /// The `(coord-local repo, issue)` the result row at **display index**
+    /// `display_idx` is about, or `None`.
+    ///
+    /// `None` covers every "this row is not one issue" case in one shape:
+    /// no result, no catalogue entry for it, no `row_identity` declared, a
+    /// declared column the rows don't actually carry, or a cell that doesn't
+    /// read as a repo name / positive issue number.
+    ///
+    /// `display_idx` is an index into what the operator SEES, so it goes
+    /// through `reports_row_order` — a right-click after a header-click sort
+    /// must resolve the row under the cursor, not the row that happened to
+    /// occupy that slot in the daemon's own order.
+    pub(crate) fn reports_row_identity(&self, display_idx: usize) -> Option<(String, u64)> {
+        let result = self.reports_result.as_ref()?;
+        let identity = self
+            .reports_catalogue()
+            .iter()
+            .find(|d| d.id == result.report_id)?
+            .row_identity
+            .as_ref()?;
+        if identity.repo_column.is_empty() || identity.issue_column.is_empty() {
+            return None;
+        }
+        let order = Self::reports_row_order(result, self.reports_sort);
+        let row = result.rows.get(*order.get(display_idx)?)?;
+        // By column NAME, never by position — the same rule cell lookup
+        // follows, and for the same reason: `rows` may carry keys beyond
+        // `columns` and a daemon may reorder them.
+        let repo = row
+            .get(identity.repo_column.as_str())
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?
+            .to_string();
+        let issue = Self::reports_issue_cell_number(row.get(identity.issue_column.as_str())?)?;
+        Some((repo, issue))
+    }
+
+    /// A declared issue cell → a positive issue number.
+    ///
+    /// Tolerant on purpose, in the same spirit as `reports_cell_text`'s
+    /// unknown-`kind` fallback: the wire says `int` today, but a JSON number
+    /// that round-tripped through a float, or a string, must not silently
+    /// cost the operator their menu. Zero and negative values are rejected —
+    /// there is no issue #0, so passing one on to `select_issue` could only
+    /// ever produce a jump that goes nowhere.
+    fn reports_issue_cell_number(value: &serde_json::Value) -> Option<u64> {
+        let n = if let Some(n) = value.as_u64() {
+            n
+        } else if let Some(n) = value.as_i64() {
+            u64::try_from(n).ok()?
+        } else if let Some(f) = value.as_f64() {
+            if !f.is_finite() || f < 1.0 || f.fract() != 0.0 {
+                return None;
+            }
+            f as u64
+        } else {
+            let s = value.as_str()?;
+            s.trim().trim_start_matches('#').parse::<u64>().ok()?
+        };
+        (n > 0).then_some(n)
+    }
+
+    /// The right-click target for the result-table row at display index
+    /// `display_idx`, or `None` when that row names no issue.
+    ///
+    /// `None` means **no menu opens at all** (`open_context_menu` returns
+    /// `false` on an empty item list, and this returns before that). That is
+    /// the resolution of #2454's "disabled with a reason, or absent?"
+    /// question for the *unresolvable* case: there is no useful reason to
+    /// show. "You right-clicked a `usage`-grouped-by-repo row" is not an
+    /// actionable sentence, and a menu whose every item is inert is worse
+    /// than no menu.
+    pub(crate) fn reports_row_context_target(
+        &self,
+        display_idx: usize,
+    ) -> Option<ContextMenuTarget> {
+        let (repo_name, issue_number) = self.reports_row_identity(display_idx)?;
+        Some(ContextMenuTarget::ReportRow {
+            repo_name,
+            issue_number,
+        })
+    }
+
+    /// The menu for a Reports result row: one item, "View on Board".
+    ///
+    /// Always enabled, deliberately — the same call `context_menu_items_for_
+    /// drive_queue_row` documents for its own "View on Board": the row
+    /// carries a real issue number, and `select_issue`'s existing
+    /// no-op-if-not-loaded behaviour is an acceptable landing (no new toast).
+    /// The *report-level* gate has already happened by the time this is
+    /// called — a report with no `row_identity` never produces a target.
+    ///
+    /// Deliberately narrow. Everything the row's detail would have shown
+    /// lives on the Board's own detail pane one keystroke away, and every
+    /// extra verb here would need row *content*, which is the coupling this
+    /// design exists to avoid.
+    pub(crate) fn context_menu_items_for_report_row(
+        &self,
+        _repo_name: &str,
+        _issue_number: u64,
+    ) -> Vec<ContextMenuItem> {
+        vec![ContextMenuItem::action(
+            "report-row-view-on-board",
+            "View on Board",
+        )]
+    }
+
     /// #1910: number of rows actually visible inside the result table's own
     /// viewport, straight from the last-painted `DataTableLayout`.
     ///
@@ -2069,4 +2193,419 @@ impl CoordApp {
 pub(crate) enum ReportExportDest {
     Path(std::path::PathBuf),
     Cancelled,
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// #2454: `row_identity` → right-click "View on Board".
+//
+// These live in-crate (rather than in `app/tests.rs`) for the reason
+// `drive_queue.rs` puts its own `TuiDriver` tests next to their module: the
+// behaviour under test is this file's, and reading the rule and the test that
+// pins it in one place is what keeps the "no per-report `match`" property
+// from quietly eroding.
+//
+// The catalogue JSON below is deliberately a FIXTURE, not a copy of
+// `coord/reports.py`'s real catalogue — the same posture the Reports tests in
+// `app/tests.rs` already take. It carries a report that DECLARES a
+// `row_identity` and one that does not, so what is pinned is the generic
+// rule ("declared → menu; not declared → no menu"), never the string
+// `"completed"`.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::fixtures::make_app_with_reports;
+
+    /// Two reports: one declaring `row_identity`, one declaring none.
+    fn catalogue_json() -> &'static str {
+        r#"{
+            "reports": [
+                {
+                    "id": "completed",
+                    "title": "Completed",
+                    "description": "What left the pipeline in a window",
+                    "params": [
+                        {
+                            "id": "since", "label": "Time range", "kind": "choice",
+                            "choices": ["1h", "6h", "24h", "3d", "7d"],
+                            "default": "24h", "help": "", "free_form": true
+                        },
+                        {
+                            "id": "repo", "label": "Repo", "kind": "text",
+                            "choices": [], "default": "", "help": "", "free_form": false
+                        }
+                    ],
+                    "row_identity": {"repo_column": "repo", "issue_column": "issue"}
+                },
+                {
+                    "id": "spend-by-repo",
+                    "title": "Spend By Repo",
+                    "description": "One row per repo — no single issue",
+                    "params": [],
+                    "row_identity": null
+                }
+            ]
+        }"#
+    }
+
+    /// A `completed`-shaped result: two rows in the same repo, with
+    /// distinguishable titles so a jump can be proved to have landed on one
+    /// specific row rather than "whichever issue the Board defaults to".
+    fn completed_result_json() -> &'static str {
+        r#"{
+            "report_id": "completed",
+            "generated_at": 1000.0,
+            "window": [0.0, 1000.0],
+            "columns": ["repo", "issue", "title", "started_at", "ended_at"],
+            "column_meta": [
+                {"id": "repo", "label": "Repo", "kind": "text", "align": "left", "weight": 1.0},
+                {"id": "issue", "label": "Issue", "kind": "int", "align": "right", "weight": 0.6},
+                {"id": "title", "label": "Title", "kind": "text", "align": "left", "weight": 3.0},
+                {"id": "started_at", "label": "Started", "kind": "timestamp", "align": "left", "weight": 1.0},
+                {"id": "ended_at", "label": "Ended", "kind": "timestamp", "align": "left", "weight": 1.0}
+            ],
+            "rows": [
+                {"repo": "myrepo", "issue": 7, "title": "Zulu target issue",
+                 "started_at": 100.0, "ended_at": 400.0},
+                {"repo": "myrepo", "issue": 9, "title": "Alpha decoy issue",
+                 "started_at": 50.0, "ended_at": 300.0}
+            ],
+            "notes": []
+        }"#
+    }
+
+    /// The same rows under a report id whose catalogue entry declares no
+    /// `row_identity`.
+    fn no_identity_result_json() -> &'static str {
+        r#"{
+            "report_id": "spend-by-repo",
+            "generated_at": 1000.0,
+            "window": [0.0, 1000.0],
+            "columns": ["repo", "issue", "title"],
+            "rows": [
+                {"repo": "myrepo", "issue": 7, "title": "Zulu target issue"}
+            ],
+            "notes": []
+        }"#
+    }
+
+    fn board_data() -> BoardData {
+        BoardData {
+            open_issues: vec![
+                OpenIssue {
+                    repo_name: "myrepo".to_string(),
+                    number: 7,
+                    title: "Zulu target issue".to_string(),
+                    body: String::new(),
+                    labels: vec![],
+                    state: "open".to_string(),
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+                OpenIssue {
+                    repo_name: "myrepo".to_string(),
+                    number: 9,
+                    title: "Alpha decoy issue".to_string(),
+                    body: String::new(),
+                    labels: vec![],
+                    state: "open".to_string(),
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+            ],
+            ..BoardData::default()
+        }
+    }
+
+    fn reports_app(result_json: &str) -> CoordApp {
+        let mut app = make_app_with_reports(board_data(), catalogue_json(), Some(result_json));
+        app.active_view = SidebarView::Reports;
+        app.rebuild_board_sidebar();
+        app
+    }
+
+    // ── row identity resolution ──────────────────────────────────────────
+
+    #[test]
+    fn row_identity_reads_the_columns_the_catalogue_declared() {
+        let app = reports_app(completed_result_json());
+        assert_eq!(
+            app.reports_row_identity(0),
+            Some(("myrepo".to_string(), 7)),
+            "the first displayed row's declared repo/issue cells"
+        );
+        assert_eq!(app.reports_row_identity(1), Some(("myrepo".to_string(), 9)));
+    }
+
+    #[test]
+    fn row_identity_is_none_for_a_report_that_declares_none() {
+        // The whole point of the design: gating is an optional-field check,
+        // not a `match` on the report id. Same rows, same columns — only the
+        // catalogue declaration differs, and that alone decides.
+        let app = reports_app(no_identity_result_json());
+        assert_eq!(app.reports_row_identity(0), None);
+        assert!(app.reports_row_context_target(0).is_none());
+    }
+
+    #[test]
+    fn row_identity_follows_the_current_sort_order() {
+        // A right-click resolves the row under the CURSOR. After sorting by
+        // Title ascending the two rows swap, so display index 0 must now be
+        // #9 ("Alpha…") — resolving against the daemon's own row order here
+        // would silently jump to the wrong issue.
+        let mut app = reports_app(completed_result_json());
+        assert!(app.reports_sort_by_column(2), "column 2 is Title");
+        assert_eq!(app.reports_row_identity(0), Some(("myrepo".to_string(), 9)));
+        assert_eq!(app.reports_row_identity(1), Some(("myrepo".to_string(), 7)));
+    }
+
+    #[test]
+    fn row_identity_is_none_past_the_end_of_the_rows() {
+        let app = reports_app(completed_result_json());
+        assert_eq!(app.reports_row_identity(2), None);
+    }
+
+    #[test]
+    fn a_declared_column_the_rows_do_not_carry_resolves_to_nothing() {
+        // Belt-and-braces against a daemon whose declaration and rows have
+        // drifted: no menu, rather than a menu that jumps to issue 0.
+        let mut app = reports_app(completed_result_json());
+        if let Some(result) = app.reports_result.as_mut() {
+            for row in &mut result.rows {
+                if let Some(obj) = row.as_object_mut() {
+                    obj.remove("issue");
+                }
+            }
+        }
+        assert_eq!(app.reports_row_identity(0), None);
+    }
+
+    #[test]
+    fn an_issue_cell_that_is_not_a_positive_number_resolves_to_nothing() {
+        use serde_json::json;
+        for bad in [json!(0), json!(-3), json!("not-a-number"), json!(null)] {
+            assert_eq!(
+                CoordApp::reports_issue_cell_number(&bad),
+                None,
+                "{bad:?} must not resolve to an issue number"
+            );
+        }
+        // Tolerant where it costs nothing: a number that round-tripped
+        // through a float, and a `#`-prefixed string.
+        assert_eq!(CoordApp::reports_issue_cell_number(&json!(2454.0)), Some(2454));
+        assert_eq!(CoordApp::reports_issue_cell_number(&json!("#2454")), Some(2454));
+    }
+
+    // ── the menu itself ──────────────────────────────────────────────────
+
+    #[test]
+    fn the_row_menu_is_exactly_one_navigation_item() {
+        let app = reports_app(completed_result_json());
+        let items = app.context_menu_items_for_report_row("myrepo", 7);
+        assert_eq!(items.len(), 1, "one item — nothing that needs row content");
+        assert_eq!(items[0].action_id.as_deref(), Some("report-row-view-on-board"));
+        assert!(!items[0].disabled, "a resolved row always has somewhere to go");
+    }
+
+    // ── TuiDriver: the real right-click, end to end ──────────────────────
+
+    /// A real right-click on a result row offers "View on Board".
+    #[test]
+    fn tuidriver_report_row_right_click_shows_view_on_board() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = reports_app(completed_result_json());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+        driver.render();
+
+        let (x, y) = driver.find("Zulu target issue").unwrap_or_else(|| {
+            panic!("the result row must render:\n{}", driver.screen())
+        });
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+
+        let menu = driver.screen();
+        assert!(
+            menu.contains("View on Board"),
+            "#2454: right-clicking a Reports result row must offer \
+             'View on Board':\n{menu}"
+        );
+    }
+
+    /// Right-click a row → "View on Board" → the Board is showing THAT row's
+    /// issue.
+    ///
+    /// Driven twice, once per row, because that is the assertion that
+    /// actually pins "the clicked row's identity was used": both titles are
+    /// on screen after the jump either way (the reveal expands the repo's
+    /// tree), so the *distinguishing* evidence is the detail pane's own
+    /// `myrepo #N` heading — and proving it tracks whichever row was clicked
+    /// is strictly stronger than proving one row doesn't appear.
+    #[test]
+    fn tuidriver_report_row_view_on_board_lands_on_the_clicked_row() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        fn jump_from(row_title: &str) -> String {
+            let app = reports_app(completed_result_json());
+            let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+            driver.render();
+
+            let (x, y) = driver.find(row_title).unwrap_or_else(|| {
+                panic!("result row {row_title:?} must render:\n{}", driver.screen())
+            });
+            driver.dispatch(UiEvent::MouseDown {
+                widget: None,
+                button: MouseButton::Right,
+                position: Point::new(x, y),
+                modifiers: Modifiers::default(),
+            });
+            assert!(
+                driver.screen().contains("View on Board"),
+                "the row menu must be open before Enter:\n{}",
+                driver.screen()
+            );
+            // "View on Board" is the menu's only item, so it already has
+            // keyboard focus — Enter activates it. (Clicking the label needs
+            // the fractional-anchor nudge the Queue tests document; there is
+            // nothing this test gains from re-exercising that.)
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.screen()
+        }
+
+        let target = jump_from("Zulu target issue");
+        assert!(
+            target.contains("BOARD"),
+            "#2454: 'View on Board' must switch to the Board view:\n{target}"
+        );
+        assert!(
+            target.contains("myrepo #7"),
+            "#2454: the Board detail pane must be showing the CLICKED row's \
+             issue:\n{target}"
+        );
+        assert!(
+            !target.contains("myrepo #9"),
+            "#2454: …and not the other row's:\n{target}"
+        );
+
+        let decoy = jump_from("Alpha decoy issue");
+        assert!(
+            decoy.contains("myrepo #9"),
+            "#2454: clicking the OTHER row must land on the OTHER issue — the \
+             jump follows the row under the cursor, not a fixed one:\n{decoy}"
+        );
+        assert!(
+            !decoy.contains("myrepo #7"),
+            "#2454: …and not the first row's:\n{decoy}"
+        );
+    }
+
+    /// The generic gate, driven for real: a report whose catalogue entry
+    /// declares no `row_identity` opens no menu at all — the right-click is
+    /// a silent no-op, not an empty or all-inert menu.
+    #[test]
+    fn tuidriver_report_row_right_click_opens_no_menu_without_row_identity() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = reports_app(no_identity_result_json());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+        driver.render();
+
+        let before = driver.screen();
+        let (x, y) = driver.find("Zulu target issue").unwrap_or_else(|| {
+            panic!("the result row must render:\n{before}")
+        });
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+
+        let after = driver.screen();
+        assert!(
+            !after.contains("View on Board"),
+            "#2454: a report that declares no `row_identity` must offer no \
+             row menu:\n{after}"
+        );
+        assert_eq!(
+            before, after,
+            "#2454: …and the right-click must change nothing at all"
+        );
+    }
+
+    // ── the jump primitive ───────────────────────────────────────────────
+
+    #[test]
+    fn jump_to_board_opens_a_pinned_board_document_tab() {
+        // #2454 design question: tab or plain focus? A tab — mirroring
+        // #2449's "View in Pipeline", so the two navigation verbs in the
+        // same menu behave the same way and neither clobbers a preview tab.
+        let mut app = reports_app(completed_result_json());
+        app.jump_to_board("myrepo", 7);
+
+        assert_eq!(app.active_view, SidebarView::Board);
+        assert_eq!(
+            app.board_doc_tabs().active_key(),
+            Some(&("myrepo".to_string(), 7u64)),
+            "the jump must open the target issue's Board document tab"
+        );
+        assert!(
+            !app.board_doc_tabs().is_preview(0),
+            "pinned, not a preview — a preview tab would be clobbered by the \
+             next single click elsewhere"
+        );
+    }
+
+    #[test]
+    fn jump_to_board_is_open_or_activate_not_open_again() {
+        let mut app = reports_app(completed_result_json());
+        app.jump_to_board("myrepo", 7);
+        app.jump_to_board("myrepo", 9);
+        app.jump_to_board("myrepo", 7);
+        assert_eq!(
+            app.board_doc_tabs().tabs().len(),
+            2,
+            "re-jumping to an already-open issue must ACTIVATE its tab, not \
+             stack a duplicate: {:?}",
+            app.board_doc_tabs().tabs()
+        );
+        assert_eq!(
+            app.board_doc_tabs().active_key(),
+            Some(&("myrepo".to_string(), 7u64))
+        );
+    }
+
+    #[test]
+    fn jump_to_board_opens_no_tab_for_an_issue_that_is_not_on_the_board() {
+        // Falls back to #2016's plain `select_issue` body rather than pinning
+        // a tab that could only ever render a fallback document.
+        let mut app = reports_app(completed_result_json());
+        app.jump_to_board("myrepo", 4242);
+        assert_eq!(app.active_view, SidebarView::Board);
+        assert!(
+            app.board_doc_tabs().tabs().is_empty(),
+            "no dead tab for an issue the board has never heard of"
+        );
+    }
+
+    #[test]
+    fn jump_to_board_works_without_the_board_having_been_visited() {
+        // `board_issues_cache` is only built by a rebuild, and a session that
+        // has gone straight to Reports has never had one. Without
+        // `jump_to_board`'s own rebuild this would silently land nowhere.
+        let mut app = make_app_with_reports(
+            board_data(),
+            catalogue_json(),
+            Some(completed_result_json()),
+        );
+        app.active_view = SidebarView::Reports;
+        app.jump_to_board("myrepo", 7);
+        assert_eq!(
+            app.board_doc_tabs().active_key(),
+            Some(&("myrepo".to_string(), 7u64))
+        );
+    }
 }

@@ -46,6 +46,7 @@ from coord.reports import (
     detect_prior_activity,
     fetch_audit_window,
     find_decision,
+    fold_completed,
     fold_decisions,
     fold_drive_queue_status,
     fold_issue_activity,
@@ -54,6 +55,7 @@ from coord.reports import (
     resolve_params,
     resolve_queue_outcomes_window,
     result_to_csv,
+    run_completed,
     run_decisions,
     run_drive_queue_status,
     run_queue_outcomes,
@@ -1395,14 +1397,14 @@ class TestFindDecision:
 class TestCatalogue:
     def test_the_registered_reports(self) -> None:
         assert set(REPORTS) == {
-            "issue-activity", "drive-queue-status", "decisions", "usage",
-            "queue-outcomes",
+            "issue-activity", "completed", "drive-queue-status", "decisions",
+            "usage", "queue-outcomes",
         }
 
     def test_catalogue_carries_full_param_metadata(self) -> None:
         cat = catalogue()
         assert [r["id"] for r in cat["reports"]] == [
-            "decisions", "drive-queue-status", "issue-activity",
+            "completed", "decisions", "drive-queue-status", "issue-activity",
             "queue-outcomes", "usage",
         ]
         rep = next(r for r in cat["reports"] if r["id"] == "issue-activity")
@@ -1566,7 +1568,7 @@ class TestCli:
         assert result.exit_code == 0, result.output
         body = json.loads(result.output)
         assert [r["id"] for r in body["reports"]] == [
-            "decisions", "drive-queue-status", "issue-activity",
+            "completed", "decisions", "drive-queue-status", "issue-activity",
             "queue-outcomes", "usage",
         ]
 
@@ -2025,7 +2027,7 @@ class TestDaemonEndpoints:
         assert resp.status_code == 200
         body = resp.json()
         assert [r["id"] for r in body["reports"]] == [
-            "decisions", "drive-queue-status", "issue-activity",
+            "completed", "decisions", "drive-queue-status", "issue-activity",
             "queue-outcomes", "usage",
         ]
         rep = next(r for r in body["reports"] if r["id"] == "issue-activity")
@@ -4006,3 +4008,297 @@ class TestQueueOutcomesChart:
         blob = json.dumps(result.to_dict()["chart"])
         assert "data" not in blob
         assert "values" not in blob
+
+
+# ── #2454: the `completed` report ──────────────────────────────────────────
+
+#: A round window with plenty of room either side of the fixture timestamps.
+C_END = 10_000.0
+C_START = 0.0
+
+
+def _completed_issues() -> list[dict]:
+    return [
+        {"repo_name": "myrepo", "number": 7, "title": "Closed one", "state": "closed"},
+        {"repo_name": "myrepo", "number": 9, "title": "Merged, still open", "state": "open"},
+        {"repo_name": "myrepo", "number": 11, "title": "Still in flight", "state": "open"},
+        {"repo_name": "other", "number": 13, "title": "Another repo", "state": "closed"},
+    ]
+
+
+def _completed_assignments() -> list[dict]:
+    return [
+        # Two legs on #7 — STARTED is the FIRST dispatch, ENDED the LAST finish.
+        {"repo_name": "myrepo", "issue_number": 7, "dispatched_at": 100.0, "finished_at": 200.0},
+        {"repo_name": "myrepo", "issue_number": 7, "dispatched_at": 150.0, "finished_at": 250.0},
+        {"repo_name": "myrepo", "issue_number": 11, "dispatched_at": 900.0, "finished_at": None},
+        {"repo_name": "other", "issue_number": 13, "dispatched_at": 50.0, "finished_at": 300.0},
+        # Same issue NUMBER in a different repo — must not contribute to
+        # myrepo#7's timestamps.
+        {"repo_name": "other", "issue_number": 7, "dispatched_at": 1.0, "finished_at": 9999.0},
+    ]
+
+
+def _completed_merge_queue() -> list[dict]:
+    return [
+        {"repo_name": "myrepo", "issue_number": 9, "state": "merged", "last_attempt": 400.0},
+        # A non-merged row for an issue that is otherwise NOT done — must not
+        # promote #11 into the report.
+        {"repo_name": "myrepo", "issue_number": 11, "state": "pending", "last_attempt": 950.0},
+    ]
+
+
+def _fold_completed(window=(C_START, C_END), **kw) -> ReportResult:
+    return fold_completed(
+        _completed_issues(),
+        _completed_assignments(),
+        _completed_merge_queue(),
+        window,
+        generated_at=C_END,
+        **kw,
+    )
+
+
+class TestCompletedFold:
+    def test_columns_are_the_wire_contract(self) -> None:
+        result = _fold_completed()
+        assert result.report_id == "completed"
+        assert result.columns == ["repo", "issue", "title", "started_at", "ended_at"]
+        assert [m.id for m in result.column_meta] == result.columns
+
+    def test_only_closed_or_merged_issues_appear(self) -> None:
+        rows = _fold_completed().rows
+        assert [(r["repo"], r["issue"]) for r in rows] == [
+            ("myrepo", 9),   # merged at 400
+            ("other", 13),   # finished at 300
+            ("myrepo", 7),   # finished at 250
+        ]
+
+    def test_an_open_issue_whose_merge_queue_row_says_merged_is_done(self) -> None:
+        """`pipeline_lifecycle_section` rule 3 — the PR closed it via
+        `fixes #N` before the brain synced the GitHub close."""
+        row = next(r for r in _fold_completed().rows if r["issue"] == 9)
+        assert row["ended_at"] == 400.0
+
+    def test_a_pending_merge_queue_row_does_not_make_an_issue_done(self) -> None:
+        assert all(r["issue"] != 11 for r in _fold_completed().rows)
+
+    def test_started_is_the_first_dispatch_and_ended_the_last_finish(self) -> None:
+        row = next(r for r in _fold_completed().rows if r["issue"] == 7)
+        assert row["started_at"] == 100.0
+        assert row["ended_at"] == 250.0
+
+    def test_timestamps_are_scoped_by_coord_local_repo(self) -> None:
+        """other#7's assignments must not leak into myrepo#7's row."""
+        row = next(
+            r for r in _fold_completed().rows
+            if r["repo"] == "myrepo" and r["issue"] == 7
+        )
+        assert row["ended_at"] == 250.0
+
+    def test_a_merged_timestamp_wins_over_assignment_finished_at(self) -> None:
+        result = fold_completed(
+            [{"repo_name": "myrepo", "number": 7, "title": "t", "state": "closed"}],
+            [{"repo_name": "myrepo", "issue_number": 7,
+              "dispatched_at": 10.0, "finished_at": 20.0}],
+            [{"repo_name": "myrepo", "issue_number": 7,
+              "state": "merged", "last_attempt": 55.0}],
+            (C_START, C_END),
+            generated_at=C_END,
+        )
+        assert result.rows[0]["ended_at"] == 55.0
+
+    def test_the_window_is_applied_to_ended_not_started(self) -> None:
+        rows = _fold_completed(window=(260.0, C_END)).rows
+        # #7 ended at 250 — outside; #13 (300) and #9 (400) are inside even
+        # though #13 STARTED at 50, well before the window.
+        assert sorted(r["issue"] for r in rows) == [9, 13]
+
+    def test_rows_come_back_newest_ended_first(self) -> None:
+        ends = [r["ended_at"] for r in _fold_completed().rows]
+        assert ends == sorted(ends, reverse=True)
+
+    def test_repo_filter_restricts_to_one_coord_local_repo(self) -> None:
+        rows = _fold_completed(repo="other").rows
+        assert [(r["repo"], r["issue"]) for r in rows] == [("other", 13)]
+
+    def test_an_issue_with_no_end_timestamp_is_dropped_and_noted(self) -> None:
+        result = fold_completed(
+            [{"repo_name": "myrepo", "number": 7, "title": "t", "state": "closed"}],
+            [],
+            [],
+            (C_START, C_END),
+            generated_at=C_END,
+        )
+        assert result.rows == []
+        assert any("no end timestamp" in n for n in result.notes)
+
+    def test_an_unknown_repo_filter_says_so_rather_than_looking_empty(self) -> None:
+        result = _fold_completed(repo="acme/myrepo")
+        assert result.rows == []
+        assert any("coord-local repo name" in n for n in result.notes)
+
+    def test_a_clean_window_produces_no_notes(self) -> None:
+        assert _fold_completed().notes == []
+
+    def test_the_result_is_json_serialisable(self) -> None:
+        json.dumps(_fold_completed().to_dict())
+
+
+class TestCompletedRunner:
+    def test_since_and_until_bound_the_window(self) -> None:
+        seen: list[tuple] = []
+
+        def source():
+            seen.append(())
+            return (
+                _completed_issues(),
+                _completed_assignments(),
+                _completed_merge_queue(),
+            )
+
+        result = run_completed(since="1h", until="400", source=source)
+        assert seen, "the source seam must actually be used"
+        assert result.window == (400.0 - 3600.0, 400.0)
+        # myrepo#9 merged exactly at the window end.
+        assert any(r["issue"] == 9 for r in result.rows)
+
+    def test_an_empty_until_means_now(self) -> None:
+        result = run_completed(
+            since="1h", now=C_END, source=lambda: ([], [], [])
+        )
+        assert result.window == (C_END - 3600.0, C_END)
+
+    def test_run_report_routes_to_it_with_defaults(self) -> None:
+        result = run_report(
+            "completed", {}, source=lambda: ([], [], []), now=C_END
+        )
+        assert result.report_id == "completed"
+        assert result.window == (C_END - 86400.0, C_END)
+
+    def test_a_bad_since_is_a_clean_error(self) -> None:
+        with pytest.raises(ReportError) as exc:
+            resolve_params(REPORTS["completed"], {"since": "banana"})
+        assert "since" in str(exc.value)
+
+
+class TestCompletedAgainstTheRealSchema:
+    """The `source` seam above lets every rule be tested without a DB — which
+    is exactly why the *default* source needs its own test: its three SELECTs
+    name real columns of `coord/db.py`'s schema, and a typo there would only
+    ever surface at runtime, on the daemon."""
+
+    def _seed(self, coord_db) -> None:
+        with coord_db:
+            coord_db.execute(
+                "INSERT INTO issues (repo_name, number, title, state) "
+                "VALUES ('api', 1629, 'Closed and done', 'closed')"
+            )
+            coord_db.execute(
+                "INSERT INTO issues (repo_name, number, title, state) "
+                "VALUES ('api', 1630, 'Still open', 'open')"
+            )
+            coord_db.execute(
+                "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+                "issue_number, issue_title, status, dispatched_at, finished_at) "
+                "VALUES ('a1', 'precision', 'api', 1629, 'Closed and done', 'done', "
+                "1000.0, 2000.0)"
+            )
+            coord_db.execute(
+                "INSERT INTO merge_queue (assignment_id, repo_name, repo_github, "
+                "branch, target_branch, issue_number, issue_title, state, last_attempt) "
+                "VALUES ('a1', 'api', 'acme/api', 'b', 'main', 1629, "
+                "'Closed and done', 'merged', 2500.0)"
+            )
+
+    def test_the_default_source_reads_the_real_tables(self, coord_db) -> None:
+        self._seed(coord_db)
+        result = run_completed(since="7d", until="3000", repo="api")
+        assert [r["issue"] for r in result.rows] == [1629]
+        row = result.rows[0]
+        assert row["repo"] == "api"
+        assert row["title"] == "Closed and done"
+        assert row["started_at"] == 1000.0
+        # The merged merge_queue row wins over the assignment's finished_at.
+        assert row["ended_at"] == 2500.0
+
+    def test_it_runs_through_the_cli(self, coord_db) -> None:
+        self._seed(coord_db)
+        result = CliRunner().invoke(
+            main,
+            ["report", "run", "completed", "--param", "until=3000",
+             "--param", "since=7d", "--json"],
+        )
+        assert result.exit_code == 0, result.output
+        body = json.loads(result.output)
+        assert body["report_id"] == "completed"
+        assert [r["issue"] for r in body["rows"]] == [1629]
+
+    def test_it_runs_through_the_daemon_route(self, report_client, rw_db) -> None:
+        # `rw_db`, not `coord_db` — the ASGI worker thread runs the handler,
+        # and the autouse `:memory:` conn is thread-bound (see that fixture).
+        self._seed(rw_db)
+        resp = report_client.get("/report/completed?until=3000&since=7d")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["report_id"] == "completed"
+        assert [r["issue"] for r in body["rows"]] == [1629]
+
+
+class TestCompletedCatalogue:
+    def test_completed_is_a_real_catalogue_entry(self) -> None:
+        ids = [r["id"] for r in catalogue()["reports"]]
+        assert "completed" in ids
+
+    def test_its_params_mirror_issue_activitys(self) -> None:
+        rep = next(r for r in catalogue()["reports"] if r["id"] == "completed")
+        assert rep["title"] == "Completed"
+        assert rep["description"]
+        params = {p["id"]: p for p in rep["params"]}
+        assert set(params) == {"since", "until", "repo"}
+        assert params["since"]["choices"] == ["1h", "6h", "24h", "3d", "7d"]
+        assert params["since"]["default"] == "24h"
+        assert params["since"]["free_form"] is True
+        assert params["until"]["kind"] == "text"
+        assert params["repo"]["default"] == ""
+
+    def test_it_is_exportable_as_csv_like_every_other_report(self) -> None:
+        text = result_to_csv(_fold_completed())
+        # The header row is the `column_meta` LABELS (the shared serializer's
+        # rule), and the values stay raw epochs — not display strings.
+        assert "Repo,Issue,Title,Started,Ended" in text
+        assert 'myrepo,9,"Merged, still open",,400.0' in text
+
+
+class TestRowIdentity:
+    """#2454: the catalogue declares which columns name a `(repo, issue)`, so
+    a client can offer per-row navigation without a per-report `match`."""
+
+    def test_completed_and_issue_activity_declare_one(self) -> None:
+        by_id = {r["id"]: r for r in catalogue()["reports"]}
+        for report_id in ("completed", "issue-activity"):
+            assert by_id[report_id]["row_identity"] == {
+                "repo_column": "repo",
+                "issue_column": "issue",
+            }
+
+    def test_the_declared_columns_actually_exist_in_the_rows(self) -> None:
+        """A declaration naming a column the rows don't carry would produce a
+        menu item that can never resolve."""
+        row = _fold_completed().rows[0]
+        identity = REPORTS["completed"].row_identity
+        assert identity is not None
+        assert identity.repo_column in row
+        assert identity.issue_column in row
+
+    def test_reports_without_a_per_row_issue_declare_none(self) -> None:
+        by_id = {r["id"]: r for r in catalogue()["reports"]}
+        # `usage` can be grouped by repo, `decisions` rows are cards, and
+        # `queue-outcomes` rows are per-period aggregates whose `issues`
+        # column is a LIST — none has a single `(repo, issue)`.
+        for report_id in ("usage", "decisions", "queue-outcomes", "drive-queue-status"):
+            assert by_id[report_id]["row_identity"] is None
+
+    def test_the_key_is_always_present_so_a_client_can_rely_on_it(self) -> None:
+        for rep in catalogue()["reports"]:
+            assert "row_identity" in rep
