@@ -64,6 +64,14 @@ impl CoordApp {
     /// Retracting first is what makes `Ctrl-W x` a pure pane-close rather
     /// than "close a tab AND close the pane" — see the call site in
     /// `dispatch_handle` for why the close upstream is speculative.
+    ///
+    /// **Text-input surfaces win.** This latch is resolved near the top of
+    /// `dispatch_handle`, ahead of the Board filter box (`board_search`) and
+    /// the inline chat composer (`inject_chat`) — so without the guard below
+    /// a literal `v`/`s`/`w`/`x` the user typed into one of those fields
+    /// would be eaten as a pane chord instead of reaching the field. Both
+    /// are checked explicitly because neither is a "blocking modal":
+    /// `any_blocking_modal_active()` covers neither.
     pub(crate) fn resolve_board_pane_chord(
         &mut self,
         key: &Key,
@@ -76,6 +84,8 @@ impl CoordApp {
             || modifiers.alt
             || self.any_blocking_modal_active()
             || self.issue_finder.is_some()
+            || self.board_search.focused
+            || self.inject_chat.is_some()
         {
             return None;
         }
@@ -85,25 +95,40 @@ impl CoordApp {
             // to renegotiate the binding, but bound to nothing in ms-65 —
             // still consumed here so it can't leak through as a bare `s`.
             Key::Char('s') | Key::Char('S') => {
-                self.retract_board_pane_chord(undo);
+                self.consume_board_pane_chord(undo);
                 return Some(Reaction::Redraw);
             }
             Key::Char('w') | Key::Char('W') => {
-                self.retract_board_pane_chord(undo);
+                self.consume_board_pane_chord(undo);
                 self.focus_next_board_pane();
                 return Some(Reaction::Redraw);
             }
             Key::Char('x') | Key::Char('X') => {
-                self.retract_board_pane_chord(undo);
+                self.consume_board_pane_chord(undo);
                 self.close_focused_board_pane();
                 return Some(Reaction::Redraw);
             }
             _ => return None,
         };
         debug_assert!(split_right);
-        self.retract_board_pane_chord(undo);
+        self.consume_board_pane_chord(undo);
         self.split_board_pane_right();
         Some(Reaction::Redraw)
+    }
+
+    /// Accept a §9 pane chord: retract the speculative `Ctrl-W` close (if
+    /// there was one) **and** disarm #605's own `Ctrl-W` leader.
+    ///
+    /// The leader matters because it is the *other* arming site: with zero
+    /// tabs open in the focused pane, §4's close arm never fires and
+    /// `handle_ctrl_w_leader` is what set both `ctrl_w_pending` and the §9
+    /// latch. `resolve_board_pane_chord` runs ahead of the leader's Step 2
+    /// and returns early, so without this clear `ctrl_w_pending` would stay
+    /// `true` after the chord and the leader's "any other key cancels"
+    /// branch would silently swallow the user's *next* keystroke.
+    fn consume_board_pane_chord(&mut self, undo: Option<BoardPaneChordUndo>) {
+        self.ctrl_w_pending = false;
+        self.retract_board_pane_chord(undo);
     }
 
     /// Put back what the speculative `Ctrl-W` close destroyed, and re-reveal

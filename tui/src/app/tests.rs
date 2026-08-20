@@ -49916,6 +49916,13 @@ Milestone tracking issue.
     // (top/bottom) are inverted, and that a wrong guess compiles and
     // type-checks. `divider_cells` below is what catches that.
 
+    /// A prefix of the Board sidebar filter's placeholder text
+    /// (`"Filter issues… (#4 = number only)"`, truncated by the 35-column
+    /// sidebar). Rendered only while the filter is EMPTY, so its
+    /// disappearance is a black-box proof that a keystroke reached the
+    /// field rather than being swallowed upstream.
+    const BOARD_FILTER_PLACEHOLDER: &str = "Filter issu";
+
     /// Every painted `║` cell as `(col, row)` pairs.
     fn divider_cells<A: quadraui::AppLogic>(
         d: &quadraui::tui::testing::TuiDriver<A>,
@@ -50299,6 +50306,121 @@ Milestone tracking issue.
             painted_tab_count(&driver),
             1,
             "#2283 §4: `Ctrl-W` `Ctrl-W` closes two tabs:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #2288 review (blocking finding): the one-shot §9 pane-chord latch is
+    /// resolved near the TOP of `dispatch_handle` — ahead of the Board
+    /// filter box's own `Key::Char(_)` arm — so it must decline while that
+    /// filter has focus. Without the guard, a literal `v` the user typed
+    /// into the search field silently splits the panel and never reaches
+    /// the field.
+    #[test]
+    fn a_pane_chord_key_typed_into_the_focused_board_filter_reaches_the_filter() {
+        let mut driver = doc_tabs_driver(&[101, 102], 120, 40);
+        driver.press(Key::Char('/'));
+        driver.render();
+        assert!(
+            driver.screen_contains(BOARD_FILTER_PLACEHOLDER),
+            "precondition: `/` focuses the Board filter, which renders its \
+             placeholder while empty:\n{}",
+            driver.screen()
+        );
+
+        driver.ctrl_char('w');
+        driver.press(Key::Char('v'));
+        driver.render();
+
+        assert!(
+            divider_cells(&driver).is_empty(),
+            "#2288 review: a `v` typed into the FOCUSED Board filter must not \
+             be eaten by the §9 pane-chord latch — no split may happen:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains(BOARD_FILTER_PLACEHOLDER),
+            "#2288 review: the `v` must land in the filter box (its \
+             placeholder is replaced by the typed text):\n{}",
+            driver.screen()
+        );
+    }
+
+    /// The same guard from the other side: with a split already on screen,
+    /// an `x` typed into the focused Board filter must not close a pane.
+    #[test]
+    fn a_pane_chord_key_typed_into_the_focused_board_filter_does_not_close_a_pane() {
+        let mut driver = split_board_driver();
+        // Give the new pane a tab of its own, so §9's "closing the last tab
+        // in a pane collapses it" rule can't be what removes the divider —
+        // the bare `Ctrl-W` below closes one of the OTHER pane's two tabs.
+        let (x, y) = driver
+            .find("#103  Race condition")
+            .expect("the sidebar row for #103");
+        driver.click(x, y);
+        driver.render();
+        // Move focus back onto the pane holding two tabs, so the bare
+        // `Ctrl-W` below takes §4's close arm — the one that arms the §9
+        // latch this test guards.
+        driver.ctrl_char('w');
+        driver.press(Key::Char('w'));
+        driver.render();
+        let col = divider_column(&driver);
+
+        driver.press(Key::Char('/'));
+        driver.render();
+        assert!(
+            driver.screen_contains(BOARD_FILTER_PLACEHOLDER),
+            "precondition: `/` focuses the Board filter even while split:\n{}",
+            driver.screen()
+        );
+
+        driver.ctrl_char('w');
+        driver.press(Key::Char('x'));
+        driver.render();
+
+        assert_eq!(
+            divider_column(&driver),
+            col,
+            "#2288 review: an `x` typed into the FOCUSED Board filter must not \
+             be eaten by the §9 pane-chord latch — the split must survive:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains(BOARD_FILTER_PLACEHOLDER),
+            "#2288 review: the `x` must land in the filter box:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #2288 review (blocking finding, second half): resolving a §9 pane
+    /// chord must also disarm #605's `Ctrl-W` leader.
+    ///
+    /// With **zero** tabs open the leader — not §4's close arm — is what
+    /// armed the §9 latch, and `resolve_board_pane_chord` returns before the
+    /// leader's own Step 2 ever runs. Leaving `ctrl_w_pending` set therefore
+    /// made the leader's "any other key cancels" branch silently swallow the
+    /// keystroke immediately after the chord.
+    #[test]
+    fn a_resolved_pane_chord_disarms_the_ctrl_w_leader() {
+        let mut driver = doc_tabs_driver(&[], 120, 40);
+        driver.ctrl_char('w');
+        driver.press(Key::Char('v'));
+        driver.render();
+        assert!(
+            !divider_cells(&driver).is_empty(),
+            "precondition: `Ctrl-W v` splits a zero-tab Board panel too:\n{}",
+            driver.screen()
+        );
+
+        // The very next keystroke must reach the app.
+        driver.press(Key::Char('?'));
+        driver.render();
+        assert!(
+            driver.screen_contains("Ctrl-W v"),
+            "#2288 review: the key after a resolved pane chord must not be \
+             eaten by a still-armed #605 `Ctrl-W` leader — `?` must open the \
+             help overlay:\n{}",
             driver.screen()
         );
     }
