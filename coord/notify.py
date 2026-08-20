@@ -2127,6 +2127,35 @@ def _persist_review_findings(assignment_id: str, verdict: str, body: str) -> Non
         )
 
 
+def _fetch_raw_log_text_by_id(
+    assignment_id: str, log_path: str | None, host: str | None,
+) -> str | None:
+    """Shared local-file-then-agent-fetch raw-text primitive.
+
+    Tries *log_path* on the local filesystem first (cheap, no network); when
+    that's absent or unreadable (the worker ran on a remote agent whose log
+    isn't on this filesystem), falls back to fetching it via the agent's
+    ``/logs/<id>`` endpoint at *host*. Returns ``None`` when neither source
+    yields text — every caller here is best-effort by design.
+    """
+    if log_path:
+        try:
+            return Path(log_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+    if host:
+        try:
+            resp = httpx.get(
+                f"http://{host}:{AGENT_PORT}/logs/{assignment_id}",
+                timeout=15.0,
+            )
+            resp.raise_for_status()
+            return resp.text
+        except (httpx.HTTPError, httpx.TimeoutException):
+            return None
+    return None
+
+
 def _fetch_raw_log_text(transition: Transition, entry: dict) -> str | None:
     """Best-effort raw log text for #1956/#1348 diagnostics.
 
@@ -2139,23 +2168,112 @@ def _fetch_raw_log_text(transition: Transition, entry: dict) -> str | None:
     must never be the reason ``coord notify`` raises.
     """
     log_path = entry.get("log_path")
+    host = _agent_host(transition.machine_name)
+    return _fetch_raw_log_text_by_id(transition.assignment_id, log_path, host)
+
+
+def _capture_cost_and_tokens_for_review(
+    assignment_id: str,
+    *,
+    log_path: str | None,
+    host: str | None,
+    provider_name: str | None = None,
+) -> bool:
+    """#2476: best-effort cost/token capture for a review row, local-log-
+    first with a remote-agent-fetch fallback.
+
+    ``post_transition``'s ``_capture_cost`` is the ONLY place cost/tokens get
+    captured for a review that completes through the direct
+    ``detect_transitions`` path — but investigation of #2476 found the
+    majority of review completions actually get their GitHub comment posted
+    later, by :func:`post_orphaned_review_findings` (run_drain's step 4,
+    which runs on every ~60s drain tick, not just as manual cleanup): that
+    function does its own independent ``/status`` poll and local-then-remote
+    log fallback to recover the VERDICT, but until now never captured
+    cost/tokens at all. Once that row is marked ``notified``/
+    ``review_posted_at``, nothing ever revisits it — so a review rescued by
+    the orphaned-findings path was permanently stuck at ``cost_usd IS NULL``
+    even though the exact same log :func:`post_orphaned_review_findings`
+    just successfully parsed the verdict from also has a perfectly good
+    ``total_cost_usd`` in it.
+
+    Mirrors :func:`_capture_cost`'s log-parse-then-persist logic (same
+    :func:`coord.usage.parse_usage_from_log`, same
+    ``update_assignment_cost``/``update_assignment_tokens`` writers) so this
+    is not a new capture mechanism — just the existing one, reachable from a
+    second call site. Never raises; returns True iff something was
+    persisted.
+    """
+    from coord.state import update_assignment_cost, update_assignment_tokens  # noqa: PLC0415
+    from coord.usage import parse_usage_from_log  # noqa: PLC0415
+
+    parsed = None
     if log_path:
         try:
-            return Path(log_path).read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            pass
-    host = _agent_host(transition.machine_name)
-    if host:
-        try:
-            resp = httpx.get(
-                f"http://{host}:{AGENT_PORT}/logs/{transition.assignment_id}",
-                timeout=15.0,
+            parsed = parse_usage_from_log(Path(log_path), provider_name=provider_name)
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "_capture_cost_and_tokens_for_review: local parse failed for %s: %s",
+                assignment_id, exc,
             )
-            resp.raise_for_status()
-            return resp.text
-        except (httpx.HTTPError, httpx.TimeoutException):
-            return None
-    return None
+            parsed = None
+
+    if parsed is None and host:
+        text = _fetch_raw_log_text_by_id(assignment_id, None, host)
+        if text:
+            import tempfile  # noqa: PLC0415
+
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".log", delete=True
+                ) as tf:
+                    tf.write(text)
+                    tf.flush()
+                    parsed = parse_usage_from_log(
+                        Path(tf.name), provider_name=provider_name
+                    )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_capture_cost_and_tokens_for_review: remote parse failed "
+                    "for %s: %s", assignment_id, exc,
+                )
+                parsed = None
+
+    if parsed is None:
+        return False
+
+    wrote = False
+    if parsed.total_cost_usd and parsed.total_cost_usd > 0:
+        try:
+            update_assignment_cost(assignment_id, parsed.total_cost_usd)
+            wrote = True
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "_capture_cost_and_tokens_for_review: failed to persist cost "
+                "for %s: %s", assignment_id, exc,
+            )
+
+    token_total = (
+        parsed.input_tokens + parsed.output_tokens
+        + parsed.cache_creation_tokens + parsed.cache_read_tokens
+    )
+    if token_total > 0:
+        try:
+            update_assignment_tokens(
+                assignment_id,
+                input_tokens=parsed.input_tokens,
+                output_tokens=parsed.output_tokens,
+                cache_creation_tokens=parsed.cache_creation_tokens,
+                cache_read_tokens=parsed.cache_read_tokens,
+            )
+            wrote = True
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "_capture_cost_and_tokens_for_review: failed to persist "
+                "tokens for %s: %s", assignment_id, exc,
+            )
+
+    return wrote
 
 
 def _warn_missing_review_verdict(
@@ -2832,6 +2950,20 @@ def post_orphaned_review_findings(
         for row in rows:
             aid = row["assignment_id"]
             log_path = log_by_id.get(aid)
+
+            # #2476: capture cost/tokens for this row too. This is the ONLY
+            # place a review whose verdict is being recovered here (rather
+            # than through the direct detect_transitions → post_transition
+            # path, which already calls `_capture_cost`) ever gets a chance
+            # at cost/token capture — once `posted`/`mark_notified` below
+            # lands, nothing ever revisits this row. Independent of whether
+            # findings parsing succeeds: a row whose body can't be recovered
+            # can still have its cost recovered from the same log.
+            _capture_cost_and_tokens_for_review(
+                aid, log_path=log_path, host=machine.host,
+                provider_name=row.get("provider_name"),
+            )
+
             findings = None
             # Try local file first (cheap) — works when notify runs on the
             # same host as the agent. Falls back to fetching via HTTP so the

@@ -3248,6 +3248,13 @@ def load_done_reviews_needing_post(repo_name: str | None = None) -> list[dict]:
                         "review_of_assignment_id": a.get("review_of_assignment_id"),
                         "review_target": a.get("review_target"),
                         "status": a.get("status"),
+                        # #2476: threaded through to
+                        # coord.notify._capture_cost_and_tokens_for_review so
+                        # post_orphaned_review_findings' cost/token capture
+                        # resolves the right Provider instead of always
+                        # assuming claude (mirrors the #1710 provider_name
+                        # threading everywhere else cost is parsed).
+                        "provider_name": a.get("provider_name"),
                     })
             return results
         except Exception:  # noqa: BLE001 — daemon unreachable → local fallback
@@ -3273,6 +3280,80 @@ def _load_done_reviews_needing_post_local(repo_name: str | None = None) -> list[
             "SELECT * FROM assignments "
             "WHERE type='review' AND status='done' AND review_posted_at IS NULL "
             "ORDER BY finished_at",
+        ).fetchall()
+    return [_row_to_dispatched_dict(row) for row in rows]
+
+
+def load_review_assignments_missing_cost(repo_name: str | None = None) -> list[dict]:
+    """#2476: return terminal review assignments whose cost was never
+    captured (``cost_usd IS NULL OR cost_usd = 0``).
+
+    Feeds ``coord backfill-review-cost`` — the one-shot repair for the
+    already-lost data the #2476 capture gap left behind. Unlike
+    :func:`load_done_reviews_needing_post` this is NOT scoped to
+    ``status='done'``/``review_posted_at IS NULL`` — a review can be
+    terminal (``done``/``failed``/``advisory``) with a perfectly good
+    verdict already posted and STILL be missing cost, since the capture gap
+    is independent of whether the findings post succeeded. Excludes
+    ``running``/``pending``/``finalizing`` rows: a still-in-flight or
+    not-yet-promoted review has no final cost to recover yet — the live
+    capture path (or a later backfill run) is the right place for those,
+    not a one-shot repair racing an in-progress worker.
+
+    Optionally filtered to a single repo by *repo_name*. Returns dicts in
+    the same shape as :func:`load_done_reviews_needing_post` (including
+    ``provider_name`` for :func:`coord.notify._capture_cost_and_tokens_for_review`).
+
+    **Daemon-aware:** mirrors :func:`load_done_reviews_needing_post` — reads
+    the ``GET /board`` payload when a ``board_service`` is configured so a
+    thin client sees the real candidates instead of an empty local table.
+    """
+    svc = _board_service()
+    if svc is not None:
+        try:
+            from coord.client import fetch_board_payload  # noqa: PLC0415
+
+            payload = fetch_board_payload(svc)
+            results: list[dict] = []
+            for a in payload.get("assignments", []):
+                if (
+                    a.get("type") == "review"
+                    and a.get("status") not in ("running", "pending", "finalizing")
+                    and not (a.get("cost_usd") or 0)
+                    and (repo_name is None or a.get("repo_name") == repo_name)
+                ):
+                    results.append({
+                        "assignment_id": a.get("assignment_id"),
+                        "machine_name": a.get("machine_name", ""),
+                        "repo_name": a.get("repo_name", ""),
+                        "repo_github": a.get("repo_github"),
+                        "issue_number": a.get("issue_number", 0),
+                        "issue_title": a.get("issue_title", ""),
+                        "status": a.get("status"),
+                        "provider_name": a.get("provider_name"),
+                    })
+            return results
+        except Exception:  # noqa: BLE001 — daemon unreachable → local fallback
+            pass
+    return _load_review_assignments_missing_cost_local(repo_name=repo_name)
+
+
+def _load_review_assignments_missing_cost_local(repo_name: str | None = None) -> list[dict]:
+    """Local-DB read for :func:`load_review_assignments_missing_cost`."""
+    conn = get_connection()
+    where = (
+        "type='review' AND status NOT IN ('running', 'pending', 'finalizing') "
+        "AND (cost_usd IS NULL OR cost_usd = 0)"
+    )
+    if repo_name:
+        rows = conn.execute(
+            f"SELECT * FROM assignments WHERE {where} AND repo_name=? "
+            "ORDER BY finished_at",
+            (repo_name,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            f"SELECT * FROM assignments WHERE {where} ORDER BY finished_at",
         ).fetchall()
     return [_row_to_dispatched_dict(row) for row in rows]
 

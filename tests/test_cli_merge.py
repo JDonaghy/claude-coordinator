@@ -3466,3 +3466,119 @@ class TestMergeSweepsSiblingsEndToEnd:
             f"expected HUMAN_REQUIRED, got {rows['a-309'].state!r} — the "
             "retry-cap escalation was dropped on the floor"
         )
+
+
+class TestBackfillReviewCost:
+    """#2476: `coord backfill-review-cost` — one-shot repair for review rows
+    the completion-capture gap left at cost_usd IS NULL/0."""
+
+    def _record_review(self, assignment_id: str, *, status: str = "done") -> None:
+        from coord.models import Assignment
+        from coord.state import get_connection, record_dispatched_assignment
+
+        assignment = Assignment(
+            assignment_id=assignment_id,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=42,
+            issue_title="[review] Fix the thing",
+            briefing="review briefing",
+            type="review",
+            review_target="99",
+            dispatched_at=1000.0,
+        )
+        record_dispatched_assignment(assignment=assignment, repo_github="acme/api")
+        conn = get_connection()
+        conn.execute(
+            "UPDATE assignments SET status=?, finished_at=1234.0 "
+            "WHERE assignment_id=?",
+            (status, assignment_id),
+        )
+        conn.commit()
+
+    def test_recovers_cost_from_local_log(
+        self, config_file: Path, coord_dir: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """A review row with cost_usd NULL and a local log carrying
+        total_cost_usd is recovered — same writers the live path uses."""
+        import json
+
+        self._record_review("bf1")
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        monkeypatch.setattr("coord.usage.LOGS_DIR", logs_dir)
+        (logs_dir / "bf1.log").write_text(
+            json.dumps({
+                "type": "result", "subtype": "success", "result": "done",
+                "total_cost_usd": 2.5, "num_turns": 4, "duration_ms": 9999,
+                "session_id": "s", "input_tokens": 10, "output_tokens": 20,
+            }) + "\n",
+            encoding="utf-8",
+        )
+
+        result = CliRunner().invoke(
+            main, ["backfill-review-cost", "--config", str(config_file)]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Recovered cost/tokens for 1 assignment(s)" in result.output
+
+        from coord.state import get_connection
+        row = get_connection().execute(
+            "SELECT cost_usd, input_tokens, output_tokens "
+            "FROM assignments WHERE assignment_id='bf1'"
+        ).fetchone()
+        assert row["cost_usd"] == 2.5
+        assert row["input_tokens"] == 10
+        assert row["output_tokens"] == 20
+
+    def test_reports_still_missing_when_log_unavailable(
+        self, config_file: Path, coord_dir: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """A row whose log is gone (no local file, agent unreachable) is
+        reported as still-missing rather than silently dropped — the
+        residual gap must stay visible."""
+        self._record_review("bf2")
+        monkeypatch.setattr("coord.usage.LOGS_DIR", tmp_path / "no-such-logs-dir")
+
+        result = CliRunner().invoke(
+            main, ["backfill-review-cost", "--config", str(config_file)]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Recovered cost/tokens for 0 assignment(s)" in result.output
+        assert "1 assignment(s) still missing" in result.output
+        assert "bf2" in result.output
+
+        from coord.state import get_connection
+        row = get_connection().execute(
+            "SELECT cost_usd FROM assignments WHERE assignment_id='bf2'"
+        ).fetchone()
+        assert row["cost_usd"] is None
+
+    def test_no_candidates_message(
+        self, config_file: Path, coord_dir: Path,
+    ) -> None:
+        """An empty backlog prints a clear message instead of an empty report."""
+        result = CliRunner().invoke(
+            main, ["backfill-review-cost", "--config", str(config_file)]
+        )
+        assert result.exit_code == 0, result.output
+        assert "No review assignments with missing cost/tokens found." in result.output
+
+    def test_already_costed_row_is_not_a_candidate(
+        self, config_file: Path, coord_dir: Path,
+    ) -> None:
+        """A review row that already has cost_usd set is never re-touched —
+        safe to re-run against a repo that's already been backfilled."""
+        self._record_review("bf3")
+        from coord.state import get_connection
+        conn = get_connection()
+        conn.execute("UPDATE assignments SET cost_usd=1.0 WHERE assignment_id='bf3'")
+        conn.commit()
+
+        result = CliRunner().invoke(
+            main, ["backfill-review-cost", "--config", str(config_file)]
+        )
+        assert result.exit_code == 0, result.output
+        assert "No review assignments with missing cost/tokens found." in result.output
