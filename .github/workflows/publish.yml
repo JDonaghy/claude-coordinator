@@ -1,9 +1,25 @@
 name: Release (wheel + coord-tui binaries)
 
 # #1242 (PKG-6): ONE `v*` tag produces ONE GitHub Release carrying the whole
-# system at one version — the PyPI wheel (with the React webapp bundled
-# inside it and the `[server]` extra declared), the coord-tui binaries, and
-# generated release notes.
+# system at one version — the PyPI wheel (with the `[server]` extra
+# declared), the coord-tui binaries, and generated release notes.
+#
+# #2009 (epic #2002): "the whole system" no longer includes the phone webapp.
+# It used to: `build-wheel` ran `npm ci && npm run build` in
+# `coord/dashboard/webapp/` and MANIFEST.in force-included the resulting
+# `dist/` into the wheel (#758), so `pip install code-coordinator` shipped a
+# servable bundle. That source now lives in the `coord-web` repo, so there
+# is nothing here to build and the wheel carries no bundle — `verify-assets`
+# is passed `--no-webapp` to assert that deliberately rather than by
+# accident. A built bundle reaches a daemon host the way
+# docs/ADR_COORD_WEB_DIST.md (#2004) settled: `coord-web-dist-build.sh` on
+# its own ~10-minute timer publishes `~/coord-web-dist`, which `coord web
+# --dist` serves. That path is decoupled from this workflow ON PURPOSE — a
+# webapp fix must not wait for a PyPI release — so a wheel with no bundle is
+# the intended steady state, not a regression. `coord web` with no bundle
+# anywhere says so loudly (a startup warning, an in-page banner, and an
+# `X-Coord-Webapp-Bundle: missing` response header) instead of silently
+# serving the legacy single-file dashboard.
 #
 # What this replaced, and why it mattered:
 #
@@ -57,7 +73,7 @@ on:
     inputs:
       dry_run_tag:
         description: >-
-          Dry-run version tag. Builds the wheel (webapp and all) and every
+          Dry-run version tag. Builds the wheel and every
           coord-tui target, verifies each is stamped with this version and
           that the complete asset set is present — then STOPS. No PyPI
           upload, no GitHub Release, no tag pushed. This is how you validate
@@ -228,22 +244,19 @@ jobs:
       # `packaging` for scripts/verify_release_wheel.py's PEP 440 comparison.
       - run: pip install build packaging
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-      # Must precede `python -m build`: the bundle is gitignored and
-      # force-included via MANIFEST.in, so a wheel built without it is valid
-      # but serves an empty `coord web`.
-      - name: Build React webapp
-        working-directory: coord/dashboard/webapp
-        run: npm ci && npm run build
-
+      # #2009: no Node, and no `npm ci && npm run build` step, because there
+      # is no `coord/dashboard/webapp/` to build — see this file's header.
       - run: python -m build
 
-      - name: Verify the wheel is stamped with the tag (+ [server] extra + webapp)
+      # `--no-webapp` is the assertion, not a waiver: it says "this wheel is
+      # expected to carry no coord/dashboard/webapp/dist/, and every OTHER
+      # check still has to pass". Dropping the flag would fail the release on
+      # a missing bundle; dropping the whole step would stop checking the
+      # version stamp and the `[server]` extra too.
+      - name: Verify the wheel is stamped with the tag (+ [server] extra)
         env:
           TAG: ${{ needs.plan.outputs.tag }}
-        run: python scripts/verify_release_wheel.py --tag "$TAG" --dist dist
+        run: python scripts/verify_release_wheel.py --tag "$TAG" --dist dist --no-webapp
 
       - uses: actions/upload-artifact@v4
         with:

@@ -36,8 +36,9 @@
 # together only if the fix is "widen the agent's PATH here," not "make
 # the probe search harder while the worker still can't find the tool."
 #
-# #1678: the `browser` capability (Playwright acceptance suites, e.g.
-# `coord/dashboard/webapp` -> `npm run test:e2e`) needs `node`/`npm` here
+# #1678: the `browser` capability (Playwright acceptance suites, e.g. the
+# `coord-web` repo's `npm run test:e2e` — in this repo at
+# `coord/dashboard/webapp` until #2009) needs `node`/`npm` here
 # too, but Node must NOT be added the way ~/.cargo/bin was. nvm installs
 # into a version-stamped directory (~/.nvm/versions/node/vX.Y.Z/bin), so a
 # literal entry on the PATH line below would break silently at the next

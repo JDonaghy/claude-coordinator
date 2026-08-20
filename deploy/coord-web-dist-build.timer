@@ -8,14 +8,17 @@
 # dellserver, every single one logging "up to date ... nothing to build",
 # which is what buried the host journal (#2122's own investigation was
 # slowed by exactly this noise). This unit does not exist to react to every
-# commit on `main` — only to ones that touch coord/dashboard/webapp/, and
-# #2122 measured that directly against this repo's own history:
+# commit on `main` — only to ones that touch the webapp, and #2122
+# measured that directly against this repo's own history (back when the
+# webapp still lived here as coord/dashboard/webapp/; #2009 moved it to the
+# `coord-web` repo, which changes WHICH repo is polled, not the cadence
+# arithmetic below — if anything a dedicated repo's merge rate is lower):
 #
 #   - ALL merges to main: median gap ~41min, but bursts land seconds apart
 #     (some measured 7s apart) — polling that tightly buys nothing, since a
 #     burst still resolves to one `origin/main` SHA by the time any one
 #     tick runs.
-#   - Merges that touch coord/dashboard/webapp/ specifically — the only
+#   - Merges that touch the webapp specifically — the only
 #     ones this unit's build is *for* — over the trailing 30 days: ~1/day,
 #     median gap ~14.3h, and the SHORTEST gap between two such merges in
 #     that entire window was ~39min.
@@ -40,8 +43,8 @@
 #      detected and the new invocation exits 0 immediately, exactly like
 #      coord-drive-queue's tick.
 #
-# A build that actually runs (something under coord/dashboard/webapp/**
-# merged) takes on the order of tens of seconds; that run and the next may
+# A build that actually runs (something merged in `coord-web`)
+# takes on the order of tens of seconds; that run and the next may
 # overlap the flock, in which case the next fire simply retries 10 minutes
 # later.
 #

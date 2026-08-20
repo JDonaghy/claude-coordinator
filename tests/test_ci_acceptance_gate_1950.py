@@ -1,39 +1,45 @@
-"""#1950: the sealed oracle-loop acceptance suite (tests/acceptance/ms-NN/,
-`npm run test:acceptance` / playwright.acceptance.config.ts) was run by no
-automatic gate anywhere — `coord acceptance run`/`record` only fires while a
-milestone is actively being driven, so a slice that goes red after its
-milestone closes (ms-51 at #1547, silently, through #1548/#1550/#1551/#1818)
-is never re-checked.
+"""#1950: the sealed oracle-loop acceptance suite (tests/acceptance/ms-NN/)
+was run by no automatic gate anywhere — `coord acceptance run`/`record` only
+fires while a milestone is actively being driven, so a slice that goes red
+after its milestone closes (ms-51 at #1547, silently, through
+#1548/#1550/#1551/#1818) is never re-checked.
 
-This is the regression guard for the fix: `.github/workflows/acceptance-
-web.yml` (originally an `acceptance` job inside `test.yml` — see #2389
-below) runs the sealed suite whenever anything it covers changes (see that
-job's own header comment for why CI rather than
-scripts/coord-test-runner.sh). Parsing the real workflow file — not a
-fixture — means this test fails the moment someone removes/disables/
-neuters that job, which is exactly the silent-regression class #1950
-reported (the evidence in that issue was "no workflow in
-.github/workflows/ references test:acceptance" — grep, not judgement).
+This is the regression guard for the fix: each of this repo's sealed routes
+must be wired to a workflow that runs it whenever anything it covers changes.
+Parsing the real workflow files — not fixtures — means these tests fail the
+moment someone removes/disables/neuters a gate, which is exactly the
+silent-regression class #1950 reported (the evidence in that issue was "no
+workflow in .github/workflows/ references test:acceptance" — grep, not
+judgement).
 
-#2180 update: the `acceptance` job's own step no longer runs `npm run
-test:acceptance` directly — it runs THROUGH `coord acceptance run --all
---ci` (#2164), which shells out to the same underlying `npm run
-test:acceptance` command via `.github/coord-ci-acceptance.yml`'s
-web-playwright route. The regression this test guards against is unchanged
-(the sealed suite silently stops running), so the needle moves to the
-wrapper invocation; a second test (`test_acceptance_job_uses_the_2164_ci_
-wrapper_not_the_raw_driver`) pins the specific `--all --ci` contract #2180's
-own acceptance criteria require ("through coord acceptance run --all --ci,
-not the raw driver command").
+#2180 update: a route's CI step no longer runs its raw driver command
+directly — it runs THROUGH `coord acceptance run --all --ci` (#2164), which
+shells out to the same underlying command via
+`.github/coord-ci-acceptance.yml`. The regression guarded against is
+unchanged (the sealed suite silently stops running); the needle just moves to
+the wrapper invocation, and `--all --ci` is pinned specifically because
+#2180's acceptance criteria require it ("through coord acceptance run --all
+--ci, not the raw driver command").
 
-#2389 update: the `acceptance` job moved out of `test.yml` into its own
-`acceptance-web.yml`, `paths:`-gated to `coord/dashboard/webapp/**` /
-`tests/acceptance/**` — it was unconditionally installing Node + a real
-Chromium on every push/PR regardless of what changed, including pure-Rust
-`tui/` diffs, mirroring the `paths:` gating `cargo-test.yml` already has for
-the tui-tuidriver route. `ACCEPTANCE_WORKFLOW_PATH` (not `WORKFLOW_PATH`) is
-what every acceptance-job test below now parses; `WORKFLOW_PATH` (`test.yml`)
-still backs the `test`/`e2e` job assertions, which did not move.
+#2389 update: the web-playwright `acceptance` job moved out of `test.yml`
+into its own `paths:`-gated `acceptance-web.yml`.
+
+#2009 update (epic #2002) — THE WEB-PLAYWRIGHT HALF OF THIS FILE MOVED, IT
+WAS NOT DELETED. The webapp left this repo for `coord-web`, taking ms-51 and
+its Playwright config with it (docs/ADR_COORD_WEB_ACCEPTANCE_SUITE.md,
+#2007), so `acceptance-web.yml`, the `e2e` job, and the
+`coord/dashboard/webapp/**` route in `.github/coord-ci-acceptance.yml` are
+all gone from here. Every assertion that parsed them (browser install,
+Playwright cache, install retries, bounded timeout, paths gating) is now
+`coord-web`'s CI's to make about `coord-web`'s CI, where the files those
+assertions describe actually live.
+
+What this file keeps is everything #1950 protects that is still IN this
+repo — the cli-pytest and tui-tuidriver routes — plus two new guards
+(`test_no_workflow_gates_a_webapp_route_that_no_longer_exists`,
+`test_ci_acceptance_config_has_no_webapp_route`) so the deletion cannot be
+half-undone into the worst state of all: a job or route that looks like a
+gate, is named like a gate, and covers a path that cannot appear in a diff.
 """
 
 from __future__ import annotations
@@ -44,9 +50,9 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "test.yml"
-ACCEPTANCE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "acceptance-web.yml"
 CARGO_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "cargo-test.yml"
 CI_ACCEPTANCE_CONFIG_PATH = REPO_ROOT / ".github" / "coord-ci-acceptance.yml"
+WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 
 
 def _load_workflow(path: Path = WORKFLOW_PATH) -> dict:
@@ -75,79 +81,44 @@ def _step_runs(steps: list[dict], needle: str) -> dict | None:
     return None
 
 
-def test_acceptance_job_exists_and_runs_the_sealed_suite() -> None:
-    workflow = _load_workflow(ACCEPTANCE_WORKFLOW_PATH)
-    steps = _job_steps(workflow, "acceptance", ACCEPTANCE_WORKFLOW_PATH)
+def test_cli_pytest_route_runs_through_the_2164_ci_wrapper() -> None:
+    """The cli-pytest sealed route (ms-37) is the #1950 guard that stayed in
+    this repo. `--all --ci` is #2180's acceptance contract: the raw `pytest
+    tests/acceptance` it wraps would never honour a manifest's `expected_red:`
+    registry, so a slice authored red by design would fail the job exactly
+    like a real regression and force `--force-merge` (#2164's whole reason
+    for existing)."""
+    workflow = _load_workflow()
+    steps = _job_steps(workflow, "test")
     test_step = _step_runs(steps, "coord acceptance run")
     assert test_step is not None, (
-        "no step in the 'acceptance' job runs `coord acceptance run` — "
-        "this is the exact bug #1950 reported (the sealed suite run by no "
-        "automatic gate anywhere)"
+        "no step in the 'test' job runs `coord acceptance run` — this is the "
+        "exact bug #1950 reported (the sealed suite run by no automatic gate "
+        "anywhere)"
     )
-
-
-def test_acceptance_job_does_not_neuter_a_red_result() -> None:
-    """A gate that swallows its own failure isn't a gate (#1950 item 3's
-    "a gate that has never failed is not a gate", #1544 §5). Guards against
-    the job being kept in name only via `continue-on-error: true` on the
-    step (or the whole job) — the same "green screenshot" failure mode
-    #1950 describes, just relocated from "never runs" to "runs but can't
-    fail"."""
-    workflow = _load_workflow(ACCEPTANCE_WORKFLOW_PATH)
-    jobs = workflow.get("jobs") or {}
-    job = jobs.get("acceptance")
-    assert job is not None
-    assert job.get("continue-on-error") is not True, (
-        "the 'acceptance' job has continue-on-error: true at the job level "
-        "— a red sealed suite would no longer fail CI"
-    )
-    steps = job.get("steps") or []
-    test_step = _step_runs(steps, "coord acceptance run")
-    assert test_step is not None
-    assert test_step.get("continue-on-error") is not True, (
-        "the `coord acceptance run` step has continue-on-error: true — "
-        "a red sealed suite would no longer fail the job"
-    )
-
-
-def test_acceptance_job_uses_the_2164_ci_wrapper_not_the_raw_driver() -> None:
-    """#2180's own acceptance criterion: 'Each repo's CI executes its sealed
-    acceptance suite through `coord acceptance run --all --ci`, not the raw
-    driver command.' A step that ran `npm run test:acceptance` directly (the
-    pre-#2180 shape) would never honour a manifest's `expected_red:`
-    registry — a sealed slice authored red by design would fail this job
-    exactly like any other red result, forcing `--force-merge` (#2164's
-    whole reason for existing)."""
-    workflow = _load_workflow(ACCEPTANCE_WORKFLOW_PATH)
-    steps = _job_steps(workflow, "acceptance", ACCEPTANCE_WORKFLOW_PATH)
-    test_step = _step_runs(steps, "coord acceptance run")
-    assert test_step is not None
     run = test_step["run"]
     assert "--all" in run, f"acceptance step doesn't pass --all: {run!r}"
     assert "--ci" in run, f"acceptance step doesn't pass --ci: {run!r}"
     assert "--repo claude-coordinator" in run, (
         f"acceptance step doesn't scope to this repo: {run!r}"
     )
-    # The raw driver command must not appear directly in the WORKFLOW step —
-    # it's meant to live only inside .github/coord-ci-acceptance.yml's
-    # web-playwright route, invoked BY the wrapper, not instead of it.
-    assert "npm run test:acceptance" not in run, (
-        "the acceptance step still runs `npm run test:acceptance` directly "
-        f"alongside the wrapper — that bypasses expected_red: {run!r}"
+    assert test_step.get("continue-on-error") is not True, (
+        "the `coord acceptance run` step has continue-on-error: true — a red "
+        "sealed suite would no longer fail the job, and a gate that cannot "
+        "fail is not a gate (#1950 item 3)"
     )
 
 
-def test_ci_acceptance_config_exists_and_resolves_all_three_routes() -> None:
+def test_ci_acceptance_config_resolves_both_remaining_routes() -> None:
     """.github/coord-ci-acceptance.yml is what every `coord acceptance run
     --all --ci` step in CI points `--config` at (the real
     ~/.coord/coordinator.yml is outside this repo and unreachable from a
-    runner). Parse it with the SAME loader coord.cli uses, and confirm all
-    three in-repo routes (#1125: coord/dashboard/webapp/** -> web-playwright,
-    coord/** -> cli-pytest, tui/** -> tui-tuidriver) resolve — a typo'd
-    `match:` glob or a missing route would silently make some CI step's
-    `--for-path` resolve to nothing (a loud `sys.exit(1)`, but only ever
-    discovered by watching that job actually go red in CI, not by this
-    faster/local check)."""
+    runner). Parse it with the SAME loader coord.cli uses, and confirm both
+    remaining in-repo routes (#1125: coord/** -> cli-pytest, tui/** ->
+    tui-tuidriver) resolve — a typo'd `match:` glob or a missing route would
+    silently make some CI step's `--for-path` resolve to nothing (a loud
+    `sys.exit(1)`, but only ever discovered by watching that job actually go
+    red in CI, not by this faster/local check)."""
     assert CI_ACCEPTANCE_CONFIG_PATH.exists(), (
         f"{CI_ACCEPTANCE_CONFIG_PATH} is missing — every `coord acceptance "
         "run --all --ci --config .github/coord-ci-acceptance.yml` step in "
@@ -156,12 +127,8 @@ def test_ci_acceptance_config_exists_and_resolves_all_three_routes() -> None:
     from coord.config import load as load_coord_config
 
     cfg = load_coord_config(str(CI_ACCEPTANCE_CONFIG_PATH))
-    webapp = cfg.acceptance.driver_for(
-        "claude-coordinator", "coord/dashboard/webapp/src/App.tsx"
-    )
     cli = cfg.acceptance.driver_for("claude-coordinator", "coord/cli.py")
     tui = cfg.acceptance.driver_for("claude-coordinator", "tui/src/main.rs")
-    assert webapp is not None and webapp.kind == "web-playwright"
     assert cli is not None and cli.kind == "cli-pytest"
     assert tui is not None and tui.kind == "tui-tuidriver"
     # #2164's --all always resolves the `{ms}` template to None (scope="all"
@@ -172,11 +139,59 @@ def test_ci_acceptance_config_exists_and_resolves_all_three_routes() -> None:
     # named `tests/acceptance/{ms}` here and crash outright. Every route in
     # this CI-only config must be written to already cover its whole
     # accumulated suite without needing a substitution.
-    for driver in (webapp, cli, tui):
+    for driver in (cli, tui):
         assert "{ms}" not in driver.run, (
             f"{driver.kind} route's run command still references {{ms}}, "
             f"which --all leaves unsubstituted and literal: {driver.run!r}"
         )
+
+
+def test_ci_acceptance_config_has_no_webapp_route() -> None:
+    """#2009: `coord/dashboard/webapp/**` cannot appear in a diff against
+    this repo any more, so a route matching it is worse than useless.
+
+    `driver_for()` is FIRST-match, not most-specific-match (#1540), and that
+    glob is a strict subset of `coord/**` — so a re-added webapp route sits
+    above the cli-pytest one and shadows it for any path it matches. Combined
+    with a `run:` command that `cd`s into a directory this repo no longer
+    has, the failure would be a CI step exiting non-zero for a reason with
+    nothing to do with the change under test."""
+    from coord.config import load as load_coord_config
+
+    cfg = load_coord_config(str(CI_ACCEPTANCE_CONFIG_PATH))
+    resolved = cfg.acceptance.driver_for(
+        "claude-coordinator", "coord/dashboard/webapp/src/App.tsx"
+    )
+    # It may resolve (coord/** matches that path too) — it must simply not
+    # resolve to the web driver, i.e. no webapp-specific route survives.
+    assert resolved is None or resolved.kind != "web-playwright", (
+        "a web-playwright route is back in .github/coord-ci-acceptance.yml, "
+        "shadowing coord/** for paths this repo cannot contain (#2009)"
+    )
+
+
+def test_no_workflow_gates_a_webapp_route_that_no_longer_exists() -> None:
+    """#2009: no workflow may be `paths:`-gated to, or `cd` into, the deleted
+    webapp tree.
+
+    A `paths:` filter naming a path that can never change is a job that never
+    runs — indistinguishable in the Actions UI from a job that runs and
+    passes, which is precisely the "green screenshot" shape #1950 is about.
+    Asserted over EVERY workflow file rather than a named list, so a new one
+    can't reintroduce it."""
+    offenders = []
+    for path in sorted(WORKFLOWS_DIR.glob("*.yml")):
+        text = path.read_text()
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            # Skip prose: several workflows explain the removal on purpose.
+            if line.lstrip().startswith("#"):
+                continue
+            if "coord/dashboard/webapp" in line:
+                offenders.append(f"{path.name}:{lineno}: {line.strip()}")
+    assert not offenders, (
+        "workflow(s) still reference the deleted webapp tree (#2009):\n"
+        + "\n".join(offenders)
+    )
 
 
 def test_non_acceptance_test_job_excludes_the_sealed_suite() -> None:
@@ -214,142 +229,4 @@ def test_cargo_test_workflow_runs_the_tui_sealed_suite_through_the_wrapper() -> 
     assert "--all" in run and "--ci" in run, (
         f"cargo-test.yml's acceptance step doesn't use the #2164 CI "
         f"wrapper contract: {run!r}"
-    )
-
-
-def test_acceptance_job_installs_coord_cli_on_path() -> None:
-    """playwright.acceptance.config.ts's `webServer` shells out to `coord
-    web --fixture ... --dist dist` (#1818) — without `coord` resolvable on
-    PATH the webServer never boots and every spec fails with a webServer
-    timeout instead of a real (or real-absence-of) assertion failure. Same
-    requirement `e2e` already has for `live-update-fixture.spec.ts`
-    (#1551)."""
-    workflow = _load_workflow(ACCEPTANCE_WORKFLOW_PATH)
-    steps = _job_steps(workflow, "acceptance", ACCEPTANCE_WORKFLOW_PATH)
-    install_step = _step_runs(steps, "pip install")
-    assert install_step is not None, (
-        "the 'acceptance' job never installs the `coord` CLI (`pip install "
-        "-e \".[dev]\"`) — playwright.acceptance.config.ts's webServer "
-        "needs `coord` on PATH to boot the fixture-backed dashboard"
-    )
-
-
-def test_acceptance_job_installs_a_real_browser() -> None:
-    workflow = _load_workflow(ACCEPTANCE_WORKFLOW_PATH)
-    steps = _job_steps(workflow, "acceptance", ACCEPTANCE_WORKFLOW_PATH)
-    browser_step = _step_runs(steps, "playwright install")
-    assert browser_step is not None, (
-        "the 'acceptance' job never runs `npx playwright install` — "
-        "chromium (or whichever project(s) playwright.acceptance.config.ts "
-        "declares) won't be present to actually run the suite"
-    )
-
-
-def test_acceptance_workflow_is_paths_gated_to_webapp_changes() -> None:
-    """#2389: this job used to live in `test.yml` with no `paths:` filter at
-    all, so it ran unconditionally on every push/PR — including a pure-Rust
-    `tui/` diff with nothing to do with the webapp — always installing
-    Node + a real Chromium first. Mirrors `cargo-test.yml`'s own `paths:`
-    gate for the tui-tuidriver route."""
-    workflow = _load_workflow(ACCEPTANCE_WORKFLOW_PATH)
-    # YAML 1.1's bareword parsing turns the `on:` key into the boolean
-    # `True`, not the string "on" — see `_load_workflow`'s docstring.
-    on = workflow.get(True) or workflow.get("on") or {}
-    for trigger in ("push", "pull_request"):
-        paths = (on.get(trigger) or {}).get("paths") or []
-        assert "coord/dashboard/webapp/**" in paths, (
-            f"acceptance-web.yml's {trigger!r} trigger isn't paths-gated to "
-            f"coord/dashboard/webapp/**: {paths!r}"
-        )
-
-
-def test_acceptance_job_caches_playwright_browsers() -> None:
-    """#2393: neither `acceptance` nor `e2e` cached the Playwright browser
-    binary, so every single CI run re-downloaded ~300MB of Chromium from
-    Playwright's CDN from scratch — full exposure to any network hiccup on
-    that path, every time, not just occasionally. Confirmed live
-    2026-08-18: this hung 3 separate PRs' worth of runs in one afternoon.
-    A cache hit skips the download-heavy `install --with-deps` entirely in
-    favor of the apt-only `install-deps`."""
-    workflow = _load_workflow(ACCEPTANCE_WORKFLOW_PATH)
-    steps = _job_steps(workflow, "acceptance", ACCEPTANCE_WORKFLOW_PATH)
-    cache_step = next(
-        (s for s in steps if (s.get("uses") or "").startswith("actions/cache")),
-        None,
-    )
-    assert cache_step is not None, (
-        "the 'acceptance' job has no actions/cache step for Playwright's "
-        "browser binaries — every run re-downloads Chromium from scratch"
-    )
-    assert cache_step.get("with", {}).get("path") == "~/.cache/ms-playwright", (
-        f"cache step doesn't target Playwright's browser cache dir: "
-        f"{cache_step.get('with')!r}"
-    )
-    # The full (network-heavy) install must be conditioned on a cache MISS —
-    # otherwise the cache exists but is never actually consulted.
-    install_step = _step_runs(steps, "playwright install chromium --with-deps")
-    assert install_step is not None
-    assert "cache-hit != 'true'" in (install_step.get("if") or ""), (
-        "the full `playwright install --with-deps` step isn't gated on a "
-        f"cache miss, so the cache added above is never actually used: "
-        f"{install_step.get('if')!r}"
-    )
-
-
-def test_acceptance_job_retries_playwright_install_on_transient_hangs() -> None:
-    """#2393 follow-up, confirmed live 2026-08-18: caching alone doesn't help
-    a cache-miss run (the very first run on a branch, or any run after a
-    `@playwright/test` version bump) — and PR #2392's own first CI run hit
-    exactly that, hanging the full 20-minute job budget on one install
-    attempt with nothing to fall back on. The install must instead be
-    wrapped in a bounded per-attempt timeout with more than one attempt, so
-    a transient CDN/mirror hang fails fast and gets retried instead of
-    burning the whole job timeout on a single stuck attempt."""
-    workflow = _load_workflow(ACCEPTANCE_WORKFLOW_PATH)
-    steps = _job_steps(workflow, "acceptance", ACCEPTANCE_WORKFLOW_PATH)
-    install_step = _step_runs(steps, "playwright install chromium --with-deps")
-    assert install_step is not None
-    run = install_step["run"]
-    assert "timeout " in run, (
-        f"the cache-miss install step has no per-attempt timeout, so one "
-        f"stuck attempt can still consume the entire job budget: {run!r}"
-    )
-    assert "for attempt in" in run and "1 2 3" in run, (
-        f"the cache-miss install step doesn't actually loop over multiple "
-        f"attempts — a single attempt is exactly what hung 4 separate times "
-        f"on 2026-08-18: {run!r}"
-    )
-
-
-def test_e2e_job_retries_playwright_install_on_transient_hangs() -> None:
-    """Same fix, same reason, as the 'acceptance' job's version above — the
-    `e2e` job (test.yml) hit the identical hang on 2026-08-18 and got the
-    identical caching fix in #2393, so it needs the identical retry
-    follow-up too."""
-    workflow = _load_workflow()
-    steps = _job_steps(workflow, "e2e")
-    install_step = _step_runs(steps, "playwright install chromium --with-deps")
-    assert install_step is not None
-    run = install_step["run"]
-    assert "timeout " in run, (
-        f"e2e's cache-miss install step has no per-attempt timeout: {run!r}"
-    )
-    assert "for attempt in" in run and "1 2 3" in run, (
-        f"e2e's cache-miss install step doesn't loop over multiple attempts: {run!r}"
-    )
-
-
-def test_acceptance_job_has_a_bounded_timeout() -> None:
-    """#2389: a job with no `timeout-minutes` defaults to GitHub's 360-minute
-    ceiling — confirmed live 2026-08-18, `npx playwright install chromium`
-    hung 34+ minutes with no automatic recovery. A bounded timeout doesn't
-    prevent a hang, but it guarantees one can't silently occupy a runner (and
-    keep a PR looking "still checking") for hours."""
-    workflow = _load_workflow(ACCEPTANCE_WORKFLOW_PATH)
-    jobs = workflow.get("jobs") or {}
-    job = jobs.get("acceptance") or {}
-    timeout = job.get("timeout-minutes")
-    assert isinstance(timeout, int) and 0 < timeout <= 60, (
-        f"'acceptance' job's timeout-minutes is {timeout!r} — expected a "
-        "small positive bound, not GitHub's implicit 360-minute default"
     )

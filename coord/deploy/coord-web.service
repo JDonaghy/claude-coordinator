@@ -15,7 +15,8 @@
 #   mkdir -p ~/.config/systemd/user
 #   cp deploy/coord-web.service ~/.config/systemd/user/
 #   loginctl enable-linger "$USER"          # survive logout / reboot
-#   # First build the dist dir BEFORE starting the service — the assets
+#   # First build the dist dir BEFORE starting the service (and make sure
+#   # ~/src/coord-web exists for it to build from — #2009) — the assets
 #   # Mount/SPA catch-all routes are registered once at process start, so
 #   # they need something to point at (see coord-web-dist-build.sh):
 #   ~/.local/bin/coord-web-dist-build.sh
@@ -33,24 +34,27 @@
 #     the daemon: $COORD_CONFIG → ~/.coord/coordinator.yml → ./coordinator.yml).
 #   - ~/.coord/coord.db exists (this box owns it).
 #   - ~/coord-web-dist exists — a symlink that coord-web-dist-build.sh /
-#     .timer keep pointed at a fresh build of coord/dashboard/webapp from
-#     merged main (#1543; see deploy/coord-web-dist-build.sh's header for the
-#     full mechanism). This is intentionally decoupled from ~/.coord-venv: a
-#     merged webapp PR goes live within ~1 minute via that timer, with no
-#     `pip install`, no PyPI release, and no restart of coord-web,
-#     coord-agent, or coord-serve.
+#     .timer keep pointed at a fresh build of the `coord-web` repo's merged
+#     main (#1543; #2009 moved that source out of this repo — see
+#     deploy/coord-web-dist-build.sh's header for the full mechanism). This
+#     is intentionally decoupled from ~/.coord-venv: a merged webapp PR goes
+#     live within ~10 minutes via that timer, with no `pip install`, no PyPI
+#     release, and no restart of coord-web, coord-agent, or coord-serve.
 #
-#     #1543 CORRECTION (2026-08-04): earlier revisions of this file said
-#     ~/.coord-venv's wheel bundles the built webapp (#758, landed
-#     2026-08-03) and that upgrading the venv was how a webapp change went
-#     live. That is still TRUE of the wheel, but is no longer how this unit
-#     serves the webapp — the --dist override below reads from
-#     ~/coord-web-dist instead, specifically so shipping a webapp change
-#     does not require upgrading the venv that coord-agent/coord-serve also
-#     run from. If ~/coord-web-dist is ever missing (fresh install before
-#     the first build, or the timer disabled), --dist falls back to the
-#     bundled coord/dashboard/webapp/dist inside the venv, same legacy
-#     fallback as before.
+#     #1543 CORRECTION (2026-08-04), amended by #2009 (2026-08-20):
+#     earlier revisions of this file said ~/.coord-venv's wheel bundles the
+#     built webapp (#758) and that upgrading the venv was how a webapp
+#     change went live. #1543 already made that not how this unit serves
+#     the webapp (the --dist override below reads ~/coord-web-dist
+#     instead). #2009 finished the job: the wheel bundles NOTHING now, so
+#     ~/coord-web-dist is not merely preferred, it is the ONLY source of a
+#     bundle on this host. If it is missing (fresh install before the first
+#     build, or the timer disabled) there is no bundle to fall back to at
+#     all: `coord web` serves the LEGACY single-file dashboard and says so
+#     loudly — a startup warning in this unit's journal, a banner in the
+#     page, and `X-Coord-Webapp-Bundle: missing` on GET /. Confirm with
+#     `curl -sI localhost:7434 | grep -i webapp-bundle` after any change to
+#     the build timer.
 #
 # Reach it from a phone on the tailnet: http://<dellserver-host>:7434
 # (same-origin API, so the phone needs no config; Add to Home Screen installs

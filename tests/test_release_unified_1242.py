@@ -243,9 +243,33 @@ class TestUnifiedReleaseWorkflow:
             "that check is the only thing standing between a shallow clone and "
             "an immutable PyPI upload of the wrong version"
         )
-        # The bundle is gitignored and force-included; building the wheel
-        # without it yields a valid package that serves an empty `coord web`.
-        assert "npm run build" in runs
+        # #2009: the wheel no longer carries a webapp bundle — the source
+        # moved to the `coord-web` repo, so there is nothing here to `npm run
+        # build`. `--no-webapp` is what keeps the REST of the verifier
+        # (version stamp, `[server]` extra) blocking the release: dropping
+        # the flag would fail every release on the now-permanently-absent
+        # bundle, and dropping the step would stop checking anything.
+        assert "npm run build" not in runs, (
+            "publish.yml is trying to build a React bundle from source this "
+            "repo no longer has (#2009) — the webapp lives in coord-web"
+        )
+        assert "--no-webapp" in runs, (
+            "publish.yml must pass --no-webapp now that the wheel carries no "
+            "bundle, or every release fails on a deliberately-absent artifact"
+        )
+
+    def test_publish_workflow_installs_no_node_toolchain(self) -> None:
+        """#2009: nothing in the release path builds JavaScript any more.
+
+        A leftover `actions/setup-node` would be the harmless-looking half of
+        a re-added webapp build step, and the expensive half (`npm ci`
+        against a missing directory) fails loudly enough to not need a test.
+        """
+        steps = _load(PUBLISH_YML)["jobs"]["build-wheel"]["steps"]
+        uses = [step.get("uses", "") for step in steps]
+        assert not [u for u in uses if u.startswith("actions/setup-node")], (
+            f"build-wheel still sets up Node with nothing to build: {uses}"
+        )
 
     def test_tui_workflow_uploads_the_asset_names_coord_tui_update_expects(self) -> None:
         from coord.tui_release import asset_filename

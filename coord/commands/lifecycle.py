@@ -382,15 +382,15 @@ def done(config_path: Path) -> None:
     default=None,
     envvar="COORD_WEB_DIST",
     help=(
-        "#1543: serve the built React webapp from this directory instead of "
-        "the one bundled inside the installed package "
-        "(coord/dashboard/webapp/dist). Resolves flag > $COORD_WEB_DIST. "
-        "Lets a build hook keep a checkout's dist/ in sync with merged main "
-        "and have it go live here without touching ~/.coord-venv, so a "
-        "webapp change never upgrades coord-agent/coord-serve's shared "
-        "venv or needs a PyPI release. Missing/empty falls back to the "
-        "legacy single-file dashboard, same as the bundled default. See "
-        "docs/PHONE_WEBAPP.md."
+        "#1543: serve the built coord-web bundle from this directory. "
+        "Resolves flag > $COORD_WEB_DIST > ~/coord-web-dist (the symlink "
+        "coord-web-dist-build.sh publishes). #2009: there is no longer a "
+        "bundle vendored inside the installed package to fall back to — the "
+        "webapp lives in the coord-web repo and reaches a host only via "
+        "that build script, deliberately decoupled from ~/.coord-venv so a "
+        "webapp change needs no PyPI release. Missing/empty still serves "
+        "the legacy single-file dashboard, but says so loudly. See "
+        "docs/ADR_COORD_WEB_DIST.md."
     ),
 )
 def web(
@@ -404,7 +404,12 @@ def web(
     # #1237: function-local + guarded — see _start_agent_server for why.
     with server_extra_guard("web"):
         import uvicorn
-        from coord.dashboard.server import build_app, dist_has_bundle
+        from coord.dashboard.server import (
+            WEBAPP_DIST,
+            build_app,
+            dist_has_bundle,
+            webapp_bundle_missing_message,
+        )
         from coord.dashboard.terminal import resolve_web_token
 
     fixture = None
@@ -437,27 +442,30 @@ def web(
     token = resolve_web_token(token)
     app = build_app(cfg, token=token, fixture=fixture, dist_path=dist_path)
     click.echo(f"coord web: dashboard at http://{bind_host}:{bind_port}")
-    if dist_path is not None:
-        # #2003: this used to unconditionally claim "serving webapp bundle
-        # from {dist_path}" even when that path was missing or empty — the
-        # server itself silently falls back to the legacy single-file
-        # dashboard in that case (build_app / index()), so the operator saw
-        # a success message for what was actually a silent regression to the
-        # legacy UI. Share the exact predicate build_app's index() route uses
-        # (dist_has_bundle) so this message can never drift from what
-        # actually gets served (#2096: two surfaces answering the same
-        # question must call the same function).
-        if dist_has_bundle(dist_path):
-            click.echo(f"  serving webapp bundle from {dist_path} (#1543)")
-        else:
-            click.echo(
-                f"  warning: --dist {dist_path} has no index.html (missing "
-                "or empty directory) — falling back to the legacy "
-                "single-file dashboard, NOT the bundle you pointed at. "
-                "Check the path / the build hook that populates it "
-                "(#2003).",
-                err=True,
-            )
+    # #2003: this used to unconditionally claim "serving webapp bundle from
+    # {dist_path}" even when that path was missing or empty — the server
+    # itself falls back to the legacy single-file dashboard in that case
+    # (build_app / index()), so the operator saw a success message for what
+    # was actually a regression to the legacy UI. Share the exact predicate
+    # build_app's index() route uses (dist_has_bundle) so this message can
+    # never drift from what actually gets served (#2096: two surfaces
+    # answering the same question must call the same function).
+    #
+    # #2009: the check no longer hinges on `--dist` being passed. It used to,
+    # because without the flag the fallback was the bundle vendored in the
+    # wheel — present on any normal install, so "no bundle" was a dev-only
+    # state not worth a warning. That bundle is gone with the webapp's move
+    # to the coord-web repo, so a bare `coord web` is now the case MOST
+    # likely to have nothing to serve, and the one that most needs to say so.
+    resolved_dist = dist_path if dist_path is not None else WEBAPP_DIST
+    if dist_has_bundle(resolved_dist):
+        click.echo(f"  serving webapp bundle from {resolved_dist} (#1543)")
+    else:
+        flag = f"--dist {dist_path} " if dist_path is not None else ""
+        click.echo(
+            f"  warning: {flag}{webapp_bundle_missing_message(resolved_dist)}",
+            err=True,
+        )
     if fixture is not None:
         click.echo(
             f"  fixture mode: seeded board from {fixture_path} — reads are "

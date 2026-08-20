@@ -52,6 +52,40 @@ def _no_board_service(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_webapp_bundle(monkeypatch, tmp_path):
+    """#2009: never let the HOST's live webapp bundle change a test's answer.
+
+    ``coord.dashboard.server.WEBAPP_DIST`` used to default to a path inside
+    the installed package (``coord/dashboard/webapp/dist``), which was absent
+    in any checkout where nobody had run ``npm run build`` — so most tests
+    were isolated from it by accident, and only ``tests/test_dashboard.py``
+    bothered to patch it explicitly.
+
+    That accident is gone. The webapp moved to the ``coord-web`` repo, so the
+    default is now ``~/coord-web-dist`` — the symlink
+    ``coord-web-dist-build.sh`` publishes, which *does* exist on exactly the
+    machines most likely to run this suite (the daemon host, a dev box with
+    the timer installed). Without this fixture, ``build_app()`` on those
+    machines registers the SPA static routes and serves the real bundle's
+    ``index.html`` at ``/``, while the same test on a CI runner serves the
+    legacy dashboard — a green-here/red-there split that has nothing to do
+    with the code under test.
+
+    Tests that care about bundle behaviour patch ``WEBAPP_DIST`` themselves
+    (or pass ``dist_path=``); that runs after this autouse fixture, so it
+    wins — same convention as ``_no_board_service`` above.
+    """
+    try:
+        import coord.dashboard.server as _server
+    except ImportError:
+        # The dashboard lives behind the optional `[server]` extra (#1237);
+        # a client-only install has no dashboard to isolate.
+        return
+
+    monkeypatch.setattr(_server, "WEBAPP_DIST", tmp_path / "absent-webapp-dist")
+
+
+@pytest.fixture(autouse=True)
 def _no_agent_health_probe(monkeypatch):
     """#904: default the reviewer /health pre-filter to fail-open (``None``)
     so tests that don't pass ``health_checker=`` to ``dispatch_review``

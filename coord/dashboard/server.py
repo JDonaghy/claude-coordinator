@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
+from html import escape as _html_escape
 from pathlib import Path
 
 import httpx
@@ -55,11 +57,63 @@ from coord.openapi import (
 from coord.pipeline import PipelineView
 from coord.state import list_drive_queue, load_proposals
 
+logger = logging.getLogger(__name__)
+
 DASHBOARD_DIR = Path(__file__).parent
-# Built React webapp lives here after `npm run build` inside coord/dashboard/webapp/.
-# When this directory is absent the server falls back to the legacy index.html so
-# that existing behaviour (and the test suite) is completely unaffected.
-WEBAPP_DIST = DASHBOARD_DIR / "webapp" / "dist"
+
+#: Where a built ``coord-web`` bundle lives when nobody says otherwise.
+#:
+#: #2009 (epic #2002): this used to be ``DASHBOARD_DIR / "webapp" / "dist"``
+#: — a path *inside the installed package*, populated by ``npm run build``
+#: in ``coord/dashboard/webapp/`` and vendored into the wheel by MANIFEST.in
+#: (#758). That directory no longer exists in this repo or in the wheel: the
+#: webapp moved to its own ``coord-web`` repo, so pointing the default at a
+#: package-internal path would guarantee a permanent miss and route every
+#: install straight to the legacy fallback with nothing to fix.
+#:
+#: The default is now the ONE place a built bundle is ever published on a
+#: host, per docs/ADR_COORD_WEB_DIST.md (#2004): the symlink
+#: ``deploy/coord-web-dist-build.sh`` atomically repoints at each release it
+#: health-checks. ``deploy/coord-web.service`` still passes that path
+#: explicitly via ``--dist``, so on the daemon host this default is belt and
+#: braces; it is load-bearing for a bare ``coord web`` (a fresh
+#: ``pip install code-coordinator``, a dev box, CI).
+#:
+#: Kept byte-identical to
+#: ``coord.health.checks.deploy_lane_facts._DEFAULT_WEBAPP_DIST``, which
+#: grades the same bundle's staleness — the two are pinned together by
+#: tests/test_dashboard.py::TestWebappBundleMissingSignal. Deliberately NOT
+#: imported from there: that module pulls in the whole health registry, and
+#: this one must stay importable by ``coord web`` alone.
+DEFAULT_WEBAPP_DIST = "~/coord-web-dist"
+WEBAPP_DIST = Path(DEFAULT_WEBAPP_DIST).expanduser()
+
+#: Response header on ``GET /`` naming the bundle actually being served, or
+#: the literal ``missing``. The machine-readable half of the #2009 "no
+#: bundle must not be silent" rule — ``curl -sI localhost:7434`` answers
+#: "am I looking at the real webapp or the legacy fallback?" without a human
+#: having to recognise the difference by eye.
+WEBAPP_BUNDLE_HEADER = "X-Coord-Webapp-Bundle"
+WEBAPP_BUNDLE_MISSING = "missing"
+
+
+def webapp_bundle_missing_message(dist_path: Path) -> str:
+    """Why there's no bundle at *dist_path*, and what to do about it.
+
+    One string, shared by all three surfaces that have to say this (#2096:
+    two surfaces answering the same question must call the same function):
+    the startup log line in :func:`build_app`, the in-page banner
+    :func:`build_app`'s ``index`` route injects into the legacy dashboard,
+    and ``coord web``'s CLI output (coord/commands/lifecycle.py).
+    """
+    return (
+        f"no coord-web bundle at {dist_path} - serving the LEGACY "
+        "single-file dashboard, not the phone webapp. Since #2009 the "
+        "webapp lives in the coord-web repo and is delivered by "
+        "coord-web-dist-build.sh, which publishes ~/coord-web-dist; point "
+        "`coord web --dist PATH` (or $COORD_WEB_DIST) at a built bundle, or "
+        "run that build script on this host. See docs/ADR_COORD_WEB_DIST.md."
+    )
 
 
 def dist_has_bundle(dist_path: Path) -> bool:
@@ -75,6 +129,40 @@ def dist_has_bundle(dist_path: Path) -> bool:
     epic #2096).
     """
     return (dist_path / "index.html").exists()
+
+
+def legacy_index_html(dist_path: Path) -> str:
+    """The legacy single-file dashboard, carrying a "no bundle" banner.
+
+    #2009: falling back to the legacy UI used to be *invisible* — the same
+    200 with plausible-looking HTML whether the phone webapp was being
+    served or not. That was survivable while the bundle shipped inside the
+    wheel (absence meant "you skipped `npm run build`", a dev-only state).
+    Post-split the bundle arrives on its own timer from a different repo, so
+    absence now means a delivery lane is broken, and a broken delivery lane
+    that renders as a working page is exactly the class of silent staleness
+    this fleet keeps getting burned by (the `~/.coord-cli-venv` incident).
+
+    The banner is injected rather than baked into ``index.html`` so the
+    legacy dashboard stays byte-for-byte itself whenever a bundle IS
+    present but something else routes here.
+    """
+    html = (DASHBOARD_DIR / "index.html").read_text()
+    banner = (
+        '<div id="coord-webapp-bundle-missing" role="alert" style="'
+        "background:#7f1d1d;color:#fee2e2;padding:10px 14px;"
+        "border-bottom:2px solid #ef4444;"
+        'font:13px/1.5 system-ui,-apple-system,sans-serif">'
+        "<strong>No coord-web bundle.</strong> "
+        f"{_html_escape(webapp_bundle_missing_message(dist_path))}"
+        "</div>"
+    )
+    marker = "<body>"
+    if marker in html:
+        return html.replace(marker, marker + banner, 1)
+    # No <body> to anchor to (a hand-edited or minified index.html) — still
+    # emit the banner rather than dropping the signal on the floor.
+    return banner + html
 
 
 # How often (seconds) the background poller queries agent servers.
@@ -711,13 +799,17 @@ def build_app(
     on this is still testing the real contract.  ``None`` (the default) is the
     ordinary live dashboard, byte-for-byte as before.
 
-    ``dist_path`` (#1543): override where the built React webapp is read
-    from — ``coord web --dist PATH`` / ``$COORD_WEB_DIST``. Lets the bundle
-    be served from outside the installed package (e.g. a checkout a build
-    hook keeps in sync with merged ``main``) so a webapp change goes live
-    without upgrading ``~/.coord-venv`` — see docs/PHONE_WEBAPP.md. ``None``
-    (the default) keeps the historical behaviour of serving
-    ``coord/dashboard/webapp/dist`` from inside the installed package.
+    ``dist_path`` (#1543): where the built ``coord-web`` bundle is read from
+    — ``coord web --dist PATH`` / ``$COORD_WEB_DIST``. ``None`` (the
+    default) falls back to :data:`WEBAPP_DIST`, which since #2009 is
+    ``~/coord-web-dist`` (what ``coord-web-dist-build.sh`` publishes) rather
+    than a path inside the installed package — the webapp is no longer
+    vendored into the wheel because its source is no longer in this repo.
+    Either way, resolving to a directory with no ``index.html`` still serves
+    the legacy single-file dashboard rather than erroring, but no longer
+    does so silently: a warning is logged here, ``GET /`` carries
+    ``X-Coord-Webapp-Bundle: missing`` and an in-page banner, and ``coord
+    web`` prints the same message at startup.
     """
     attacher: SessionAttacher = session_attacher or TmuxSessionAttacher()
     _fixture = fixture
@@ -726,6 +818,14 @@ def build_app(
     # `patch("coord.dashboard.server.WEBAPP_DIST", ...)` keep working when
     # dist_path is left unset (the CLI default).
     webapp_dist = Path(dist_path) if dist_path is not None else WEBAPP_DIST
+    if not dist_has_bundle(webapp_dist):
+        # #2009: one WARNING at startup, so a host whose bundle lane is
+        # broken says so in the journal (`journalctl --user -u coord-web`)
+        # even when nobody is looking at the page. Not an exception: the
+        # board dashboard, the API and the terminal bridge are all still
+        # fully functional without a webapp bundle, and refusing to start
+        # would take those down to protest a missing frontend.
+        logger.warning("coord web: %s", webapp_bundle_missing_message(webapp_dist))
 
     def _read_board():
         """The board for this request — seeded fixture or the live DB/daemon.
@@ -910,11 +1010,21 @@ def build_app(
         _sessions_executor.shutdown(wait=False, cancel_futures=True)
 
     async def index(request: Request) -> HTMLResponse:
-        # Serve the built React webapp when available; fall back to the legacy
-        # single-file dashboard so existing behaviour is entirely unchanged.
-        spa_index = webapp_dist / "index.html"
-        html = spa_index.read_text() if dist_has_bundle(webapp_dist) else (DASHBOARD_DIR / "index.html").read_text()
-        return HTMLResponse(html)
+        # Serve the built coord-web bundle when there is one; otherwise fall
+        # back to the legacy single-file dashboard — but SAY SO (#2009), in
+        # the page and in a response header. `dist_has_bundle` is re-checked
+        # per request rather than cached from build time so a bundle that
+        # appears (or vanishes) under a long-lived `coord web` is reflected
+        # without a restart, matching how the timer publishes.
+        if dist_has_bundle(webapp_dist):
+            return HTMLResponse(
+                (webapp_dist / "index.html").read_text(),
+                headers={WEBAPP_BUNDLE_HEADER: str(webapp_dist)},
+            )
+        return HTMLResponse(
+            legacy_index_html(webapp_dist),
+            headers={WEBAPP_BUNDLE_HEADER: WEBAPP_BUNDLE_MISSING},
+        )
 
     async def api_board(request: Request) -> JSONResponse:
         board = _read_board()
@@ -2271,12 +2381,12 @@ def build_app(
             ),
         ])
 
-    # ── Static file serving for the built React webapp ─────────────────────
-    # Only activated when the resolved dist dir exists (i.e. after
-    # `npm run build`, into either coord/dashboard/webapp/dist/ or the
-    # --dist/COORD_WEB_DIST override — #1543). When absent the routes list
-    # is unchanged and the legacy dashboard serves normally — no
-    # test-suite impact.
+    # ── Static file serving for the built coord-web bundle ────────────────
+    # Only activated when the resolved dist dir exists — either WEBAPP_DIST
+    # (`~/coord-web-dist`, published by coord-web-dist-build.sh) or the
+    # --dist/$COORD_WEB_DIST override (#1543). When absent the routes list
+    # is unchanged and the legacy dashboard serves normally, with the #2009
+    # "no bundle" banner/header from `index` above — no test-suite impact.
     if webapp_dist.exists():
         # /assets/ — Vite hashed JS/CSS bundles (immutable; safe to cache).
         _assets = webapp_dist / "assets"
