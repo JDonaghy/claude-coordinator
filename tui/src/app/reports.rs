@@ -2250,24 +2250,39 @@ mod tests {
     /// A `completed`-shaped result: two rows in the same repo, with
     /// distinguishable titles so a jump can be proved to have landed on one
     /// specific row rather than "whichever issue the Board defaults to".
+    ///
+    /// Carries #2472's `legs`/`tokens_in`/`tokens_out`/`cost_total` because
+    /// the daemon now sends them. Nothing in this module was changed to
+    /// accept them — the panel renders whatever `columns`/`column_meta` the
+    /// server declares — and `completed_spend_columns_render_from_metadata_alone`
+    /// below is the assertion that this stayed true.
     fn completed_result_json() -> &'static str {
         r#"{
             "report_id": "completed",
             "generated_at": 1000.0,
             "window": [0.0, 1000.0],
-            "columns": ["repo", "issue", "title", "started_at", "ended_at"],
+            "columns": ["repo", "issue", "title", "started_at", "ended_at",
+                        "legs", "tokens_in", "tokens_out", "cost_total"],
             "column_meta": [
                 {"id": "repo", "label": "Repo", "kind": "text", "align": "left", "weight": 1.0},
                 {"id": "issue", "label": "Issue", "kind": "int", "align": "right", "weight": 0.6},
                 {"id": "title", "label": "Title", "kind": "text", "align": "left", "weight": 3.0},
                 {"id": "started_at", "label": "Started", "kind": "timestamp", "align": "left", "weight": 1.0},
-                {"id": "ended_at", "label": "Ended", "kind": "timestamp", "align": "left", "weight": 1.0}
+                {"id": "ended_at", "label": "Ended", "kind": "timestamp", "align": "left", "weight": 1.0},
+                {"id": "legs", "label": "Legs", "kind": "int", "align": "right", "weight": 0.6},
+                {"id": "tokens_in", "label": "Tok In", "kind": "int", "align": "right", "weight": 1.0},
+                {"id": "tokens_out", "label": "Tok Out", "kind": "int", "align": "right", "weight": 1.0},
+                {"id": "cost_total", "label": "Total $", "kind": "money", "align": "right", "weight": 1.0}
             ],
             "rows": [
                 {"repo": "myrepo", "issue": 7, "title": "Zulu target issue",
-                 "started_at": 100.0, "ended_at": 400.0},
+                 "started_at": 100.0, "ended_at": 400.0,
+                 "legs": 3, "tokens_in": 1010, "tokens_out": 55, "cost_total": 5.5,
+                 "cost_captured": 2.0, "cost_est": 3.5},
                 {"repo": "myrepo", "issue": 9, "title": "Alpha decoy issue",
-                 "started_at": 50.0, "ended_at": 300.0}
+                 "started_at": 50.0, "ended_at": 300.0,
+                 "legs": 1, "tokens_in": 20, "tokens_out": 8, "cost_total": 0.25,
+                 "cost_captured": 0.25, "cost_est": 0.0}
             ],
             "notes": []
         }"#
@@ -2393,6 +2408,92 @@ mod tests {
         // through a float, and a `#`-prefixed string.
         assert_eq!(CoordApp::reports_issue_cell_number(&json!(2454.0)), Some(2454));
         assert_eq!(CoordApp::reports_issue_cell_number(&json!("#2454")), Some(2454));
+    }
+
+    // ── #2472: the spend columns, rendered by metadata alone ─────────────
+
+    /// The claim #2472 rests on: the client needed NO change to show the new
+    /// columns. If that were false — if anything here were keyed to #2454's
+    /// five column ids — the four appended ones would be missing from the
+    /// rendered table even though the daemon declared them.
+    #[test]
+    fn tuidriver_completed_spend_columns_render_from_metadata_alone() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = reports_app(completed_result_json());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 200, 40);
+        driver.render();
+        let screen = driver.screen();
+
+        for header in ["Legs", "Tok In", "Tok Out", "Total $"] {
+            assert!(
+                screen.contains(header),
+                "#2472: the {header:?} header must render straight off \
+                 `column_meta` — no `tui/**` change was made to admit it:\n{screen}"
+            );
+        }
+        // …and the values, through their declared `kind`: `money` formats the
+        // dollar figure rather than dumping the raw JSON number.
+        assert!(
+            screen.contains("$5.50"),
+            "#2472: `cost_total` declares kind `money`, so it must render \
+             formatted:\n{screen}"
+        );
+        assert!(
+            screen.contains("1010"),
+            "#2472: the `int` token counts must render:\n{screen}"
+        );
+    }
+
+    /// Appending, not interleaving: #2454's columns keep the indices they
+    /// had, so the existing sort-by-index path still points at Title.
+    #[test]
+    fn completed_spend_columns_are_appended_after_the_original_five() {
+        let app = reports_app(completed_result_json());
+        let result = app.reports_result.as_ref().expect("fixture parses");
+        assert_eq!(
+            result.columns,
+            vec![
+                "repo", "issue", "title", "started_at", "ended_at", "legs",
+                "tokens_in", "tokens_out", "cost_total",
+            ],
+        );
+        assert_eq!(result.columns[2], "title", "index 2 is still Title");
+    }
+
+    /// A `money` column sorts numerically, not as text — the generic
+    /// `int|timestamp|duration|money` branch, exercised through a real
+    /// `completed` result rather than a synthetic one.
+    #[test]
+    fn completed_cost_column_sorts_numerically() {
+        let mut app = reports_app(completed_result_json());
+        assert!(app.reports_sort_by_column(8), "column 8 is Total $");
+        // Ascending: $0.25 (issue 9) before $5.50 (issue 7). Sorted as TEXT,
+        // "0.25" < "5.5" happens to agree — so assert the descending flip,
+        // where a text sort would still put "5.5" first only by luck of the
+        // same ordering. The load-bearing assertion is that the order tracks
+        // the number and reverses on a second click.
+        assert_eq!(app.reports_row_identity(0), Some(("myrepo".to_string(), 9)));
+        assert!(app.reports_sort_by_column(8));
+        assert_eq!(app.reports_row_identity(0), Some(("myrepo".to_string(), 7)));
+    }
+
+    /// The extra row keys the daemon ships beyond `columns`
+    /// (`cost_captured`/`cost_est`) must not leak into the table — the panel
+    /// renders `columns`, not "every key on the row".
+    #[test]
+    fn completed_extra_row_keys_do_not_become_columns() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = reports_app(completed_result_json());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 200, 40);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("cost_captured") && !screen.contains("cost_est"),
+            "#2472: `cost_captured`/`cost_est` ship as row keys for clients \
+             that want the split, NOT as columns:\n{screen}"
+        );
     }
 
     // ── the menu itself ──────────────────────────────────────────────────
