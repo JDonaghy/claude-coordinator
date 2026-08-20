@@ -215,10 +215,11 @@ class ClaudeProvider(Provider):
             "--system-prompt", system_prompt,
             "--allowedTools", allowed_tools,
             "--permission-mode", permission_mode,
-            # #1445: see the matching comment in default_worker_command —
-            # workers must not inherit the host checkout's project/local
-            # Claude Code settings.
-            "--setting-sources", "user",
+            # #1445 / #2462: see the matching comment in
+            # default_worker_command — workers must not inherit the host
+            # checkout's project/local Claude Code settings, hooks, or
+            # .mcp.json MCP servers. `--bare` closes all of those at once.
+            "--bare",
         ]
         if effective_model:
             argv.extend(["--model", effective_model])

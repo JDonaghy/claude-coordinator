@@ -3901,13 +3901,16 @@ def _base_checkout_write_guard_tools(repo_path: str) -> list[str]:
 # editing coordinator.yml/coord.db) silently also blocked every worker's own
 # worktree under `~/.coord/worktrees/<id>/`, burning a full $5.23 session
 # that reasoned, designed, and only discovered at the very end that it could
-# not save anything. `default_worker_command`'s `--setting-sources user`
-# (above) closes off the specific mechanism (workers no longer load
-# project/local settings at all), but this preflight check is kept as a
-# defense-in-depth: it also catches a blanket deny rule living in the
-# machine's *user*-level settings (`~/.claude/settings.json`, still loaded)
-# and plain OS-level write failures (read-only mount, wrong ownership, full
-# disk) that have nothing to do with Claude Code at all.
+# not save anything. `default_worker_command`'s `--bare` (above, #2462;
+# originally the narrower `--setting-sources user`) closes off the specific
+# mechanism for headless workers — they no longer load *any* Claude Code
+# settings.json (user, project, or local) — but this preflight check is kept
+# as a defense-in-depth: it still catches a blanket deny rule living in the
+# machine's *user*-level settings (`~/.claude/settings.json`) that would
+# affect the human-attended interactive PTY path (which intentionally keeps
+# the default setting sources, see the comment in `default_worker_command`),
+# and it catches plain OS-level write failures (read-only mount, wrong
+# ownership, full disk) that have nothing to do with Claude Code at all.
 _DENY_PATTERN_RE = re.compile(r"^(Edit|Write)\(//(.+)\)$")
 
 
@@ -3977,11 +3980,13 @@ def find_blocking_deny_rule(
     """Scan Claude Code settings files for a deny rule blocking *worktree_path*.
 
     Defaults to scanning just the machine's user-level settings
-    (``~/.claude/settings.json``) — the one settings source a worker still
-    loads after the ``--setting-sources user`` restriction in
-    :func:`default_worker_command`; a checkout-local
-    ``.claude/settings.local.json`` can no longer reach a worker at all, so
-    it is intentionally not scanned here.
+    (``~/.claude/settings.json``). Since #2462, headless workers run with
+    ``--bare`` and load no Claude Code settings.json at all (user, project,
+    or local) — this file matters for the human-attended interactive PTY
+    path (:class:`coord.providers.claude_pty.ClaudePtyProvider`), which
+    intentionally keeps the default setting sources; a checkout-local
+    ``.claude/settings.local.json`` can no longer reach a headless worker at
+    all either way, so it is intentionally not scanned here.
 
     Returns a human-readable ``"'<pattern>' in <file>"`` message for the
     first matching rule found, or ``None`` when no scanned file carries one
@@ -4204,8 +4209,8 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         "--system-prompt", system_prompt,
         "--allowedTools", allowed_tools,
         "--permission-mode", "acceptEdits",
-        # #1445: a worker must not inherit whatever project/local Claude Code
-        # settings the host's checkout happens to carry — e.g. a
+        # #1445 / #2462: a worker must not inherit whatever project/local
+        # Claude Code settings the host's checkout happens to carry — e.g. a
         # `.claude/settings.local.json` deny rule the OPERATOR added for
         # their own interactive session in that checkout (meant to protect
         # ~/.coord/coordinator.yml etc from an interactive session, but
@@ -4216,17 +4221,40 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         # has no .claude/ dir of its own (it's untracked/gitignored there),
         # so a deny rule that never touches the worktree's working directory
         # still blocked Edit/Write calls from a `claude -p` session cwd'd
-        # into that worktree. Restricting to "user" means a worker's
-        # permission profile is fully controlled by the --allowedTools /
-        # --disallowedTools / --permission-mode flags in this function (and
-        # its own hard-coded system prompt), not by the checkout's
-        # settings.json / settings.local.json. This is the headless/
-        # `claude -p` path only — the human-attended interactive PTY path
-        # (coord.providers.claude_pty.ClaudePtyProvider) intentionally keeps
-        # the default sources so an operator's own `coord init`-configured
-        # convenience allow-list still applies to a session they're
-        # attached to and watching.
-        "--setting-sources", "user",
+        # into that worktree.
+        #
+        # `--setting-sources user` (the original #1445 fix) only closed this
+        # for *settings.json* — a checkout's `.claude/hooks/` and `.mcp.json`
+        # are governed separately and kept loading regardless, so a
+        # never-trusted repo's hooks would still run and its MCP servers
+        # would still connect in every worker session, because a `-p`
+        # session shows neither the workspace-trust dialog nor the
+        # per-server MCP approval prompt that would normally gate that (see
+        # code.claude.com/docs/en/headless.md). `--bare` is the flag that
+        # closes all three sources (settings, hooks, .mcp.json) at once, plus
+        # LSP/plugin-sync/CLAUDE.md auto-discovery — none of which a headless
+        # worker should be picking up from the target repo's own checkout
+        # either. A worker's permission profile is fully controlled by the
+        # --allowedTools / --disallowedTools / --permission-mode flags in
+        # this function (and its own hard-coded system prompt); it needs no
+        # MCP servers (no spec.type grants the `Agent` tool, so `--agents`
+        # is unneeded too) and no `--settings`.
+        #
+        # AUTH CAVEAT: per Claude Code's own docs, `--bare` "never reads
+        # OAuth credentials or the system keychain" — only `ANTHROPIC_API_KEY`
+        # (env, inherited via `_worker_subprocess_env`) or an `apiKeyHelper`
+        # supplied via `--settings` authenticate. This is a behavior change
+        # for any fleet machine whose worker auth today comes from
+        # `claude setup-token` / `CLAUDE_CODE_OAUTH_TOKEN` or an interactive
+        # `claude login` (the pattern docs/CONTROL_CENTER.md §14 documents for
+        # per-person subscription auth) rather than an API key — such a
+        # machine must switch to `ANTHROPIC_API_KEY` (or an `apiKeyHelper`)
+        # for headless dispatch to keep authenticating. This is the
+        # headless/`claude -p` path only — the human-attended interactive PTY
+        # path (coord.providers.claude_pty.ClaudePtyProvider) intentionally
+        # keeps the default sources, so OAuth/keychain login still works for
+        # a session an operator is attached to and watching.
+        "--bare",
     ]
     if spec.model:
         argv.extend(["--model", spec.model])

@@ -1533,11 +1533,12 @@ def test_default_worker_command_mock_author_not_sealed() -> None:
 # ── #1445: worktree-writability preflight ───────────────────────────────────
 
 
-def test_default_worker_command_restricts_setting_sources_to_user() -> None:
+def test_default_worker_command_uses_bare_mode() -> None:
     """A worker must not inherit the host checkout's project/local Claude
-    Code settings (e.g. a `.claude/settings.local.json` deny rule) — see
-    #1445. --setting-sources user means only the machine's own user-level
-    settings apply; project/local (the checkout) are never loaded."""
+    Code settings, hooks, or .mcp.json MCP servers — see #1445 and #2462.
+    `--bare` closes all three sources at once; the narrower
+    `--setting-sources user` (the original #1445 fix) only closed settings.json
+    and left hooks/.mcp.json loading from a never-trusted repo."""
     spec = AssignmentSpec(
         repo_name="api",
         repo_path="/tmp/repo",
@@ -1546,12 +1547,11 @@ def test_default_worker_command_restricts_setting_sources_to_user() -> None:
         briefing="b",
     )
     argv = default_worker_command(spec)
-    assert "--setting-sources" in argv
-    idx = argv.index("--setting-sources")
-    assert argv[idx + 1] == "user"
+    assert "--bare" in argv
+    assert "--setting-sources" not in argv
 
 
-def test_default_worker_command_restricts_setting_sources_for_plan_type() -> None:
+def test_default_worker_command_uses_bare_mode_for_plan_type() -> None:
     """Same restriction applies to every spec.type, not just 'work' — all of
     them are headless dispatches that must not depend on host checkout
     state."""
@@ -1564,9 +1564,8 @@ def test_default_worker_command_restricts_setting_sources_for_plan_type() -> Non
         type="plan",
     )
     argv = default_worker_command(spec)
-    assert "--setting-sources" in argv
-    idx = argv.index("--setting-sources")
-    assert argv[idx + 1] == "user"
+    assert "--bare" in argv
+    assert "--setting-sources" not in argv
 
 
 def test_deny_pattern_blocks_path_matches_blanket_prefix() -> None:
