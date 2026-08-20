@@ -71,6 +71,13 @@ impl ShellApp for CoordApp {
                     backend.draw_list(sidebar_rect, &self.machines_list(true));
                 }
                 SidebarView::Pipeline => {
+                    // #2452: stash the tree's painted geometry the same way
+                    // the Board arm above does — `scroll_pipeline_selection_
+                    // into_view` runs on the event path (no `Backend`
+                    // handle), so this render-then-act stash is its only
+                    // source for the metrics its scroll-offset math needs.
+                    self.last_pipeline_sidebar_geom
+                        .set(Some((sidebar_rect, lh, backend.msv_metrics().header_size)));
                     self.pipeline_sidebar.render(backend, sidebar_rect);
                 }
                 SidebarView::Settings => {

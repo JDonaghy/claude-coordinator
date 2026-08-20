@@ -2216,6 +2216,18 @@ pub struct CoordApp {
     /// shapes (epic rows sit at path len 2 *or* 3 depending on the section
     /// and whether it's milestone-grouped).
     pipeline_epic_row_keys: std::collections::HashMap<(usize, TreePath), (String, u64)>,
+    /// #2452: row shape of the last `rebuild_pipeline_sidebar` pass, indexed
+    /// by sidebar section — mirrors `board_section_rows` exactly (same
+    /// `(TreePath, is_header)` shape, same reason: `SidebarSystem` exposes no
+    /// `rows()` getter, so `reveal_pipeline_active_doc`'s scroll-into-view has
+    /// no other way to work out how far down the panel a given row sits).
+    pipeline_section_rows: Vec<Vec<(TreePath, bool)>>,
+    /// #2452: the Pipeline sidebar tree's last-painted geometry —
+    /// `(rect, line_height, msv_header_size)`. Mirrors `last_sidebar_geom`
+    /// (Board's own copy); kept separate because the two panels paint on
+    /// mutually exclusive frames (`active_view` is one or the other) and a
+    /// shared cell would go stale the instant the user switches panels.
+    last_pipeline_sidebar_geom: std::cell::Cell<Option<(Rect, f32, f32)>>,
     /// Tracked issues for the Pipeline panel (loaded asynchronously via gh).
     pipeline_issues: Vec<PipelineIssue>,
     /// Selected issue index into `pipeline_issues`, if any.
@@ -3804,6 +3816,8 @@ impl CoordApp {
             pipeline_milestone_expanded: std::collections::HashMap::new(),
             pipeline_epic_expanded: std::collections::HashMap::new(),
             pipeline_epic_row_keys: std::collections::HashMap::new(),
+            pipeline_section_rows: Vec::new(),
+            last_pipeline_sidebar_geom: std::cell::Cell::new(None),
             pipeline_issues: Vec::new(),
             pipeline_sel: None,
             pipeline_status: None,
@@ -5944,14 +5958,22 @@ impl CoordApp {
     /// - `milestone_key` — `"<n>"` for numbered milestones (e.g. `"5"`), or
     ///   `"no-milestone"` for unassigned issues.
     /// - `display_title` — milestone title or `"No milestone"`.
-    /// - `issues` — `Vec<(flat_idx, &IssueGroup)>` in board order with the
-    ///   `board_search` filter applied.
+    /// - `issues` — `Vec<(flat_idx, &IssueGroup)>` in board order, with the
+    ///   `board_search` filter applied when `apply_search` is `true`.
     ///
     /// Sorted: named milestones by number ASC, `"No milestone"` last.
+    ///
+    /// #2452: `apply_search` exists for exactly one caller —
+    /// `board_selected_issue_unfiltered` — see its doc comment for why a
+    /// stored tree path can only be safely re-resolved against the SAME
+    /// (unfiltered) coordinate space it was set against, never against
+    /// whatever `board_search` happens to hold NOW. Every other call site
+    /// passes `true`, preserving this function's exact prior behaviour.
     fn board_milestones_for_repo<'a>(
         &'a self,
         issues: &'a [(String, Vec<IssueGroup>)],
         repo: &str,
+        apply_search: bool,
     ) -> Vec<(String, String, Vec<(usize, &'a IssueGroup)>)> {
         let flat: &[IssueGroup] = match issues.iter().find(|(r, _)| r == repo) {
             Some((_, v)) => v,
@@ -5964,7 +5986,7 @@ impl CoordApp {
         > = std::collections::BTreeMap::new();
 
         for (flat_idx, g) in flat.iter().enumerate() {
-            if !self.board_search.matches(g.issue_number, &g.issue_title) {
+            if apply_search && !self.board_search.matches(g.issue_number, &g.issue_title) {
                 continue;
             }
             match g.milestone_number {
@@ -6088,7 +6110,13 @@ impl CoordApp {
         self.board_issues_cache = self.issues_by_repo();
         let grouped = &self.board_issues_cache;
 
-        let prev_selection = self.board_selected_issue();
+        // #2452: `board_selected_issue_unfiltered`, not `board_selected_
+        // issue` — every FILTER keystroke handler mutates `board_search`
+        // BEFORE calling this rebuild, so the OLD sidebar's stored path
+        // must be resolved against the UNFILTERED grouping to name the
+        // issue it actually pointed at; see that method's doc comment for
+        // the silent-wrong-issue failure mode this avoids.
+        let prev_selection = self.board_selected_issue_unfiltered();
         let prev_panel_scroll = self.board_sidebar.panel_scroll();
 
         // Save per-section collapse state keyed by section name.
@@ -6242,7 +6270,7 @@ impl CoordApp {
                 // Compute milestone-grouped data for this repo.
                 // milestones holds &IssueGroup refs; it must be dropped before
                 // any &mut self borrow (sidebar mutations) below.
-                let milestones = self.board_milestones_for_repo(grouped, repo);
+                let milestones = self.board_milestones_for_repo(grouped, repo, true);
 
                 let total: usize = milestones.iter().map(|(_, _, v)| v.len()).sum();
 
@@ -6775,7 +6803,7 @@ impl CoordApp {
         let milestone_idx = path[0] as usize;
         let issue_idx = path[1] as usize;
         let repo = self.board_repo_names.get(section - offset)?;
-        let milestones = self.board_milestones_for_repo(&self.board_issues_cache, repo);
+        let milestones = self.board_milestones_for_repo(&self.board_issues_cache, repo, true);
         let (_, _, group_issues) = milestones.get(milestone_idx)?;
         let (flat_idx, _) = group_issues.get(issue_idx)?;
         let (_, all_issues) = self.board_issues_cache.iter().find(|(r, _)| r == repo)?;
@@ -6803,6 +6831,63 @@ impl CoordApp {
         let group = self.board_selected_issue_group()?;
         let repo = self.board_active_repo()?;
         Some((repo.to_string(), group.issue_number))
+    }
+
+    /// #2452: like `board_selected_issue`, but resolves the sidebar's stored
+    /// tree path against the UNFILTERED milestone grouping — "what issue
+    /// does this path identify, independent of whatever `board_search`
+    /// happens to hold right now".
+    ///
+    /// `board_selected_issue`'s filter-sensitive resolution is correct for
+    /// its many other callers (context menu targeting, the `P` purge guard,
+    /// notify/retry) — they only ever run against the tree as it is
+    /// CURRENTLY painted, and the stored path was set under that SAME
+    /// paint's filter, so re-resolving it through the current filter is
+    /// self-consistent there.
+    ///
+    /// `rebuild_board_sidebar`'s previous-selection capture is the one
+    /// exception: every Board FILTER keystroke handler (`events.rs`)
+    /// mutates `board_search` and THEN calls `rebuild_board_sidebar` — so by
+    /// the time that capture runs, the OLD sidebar's stored path was set
+    /// under the filter as it was BEFORE this keystroke, but `board_search`
+    /// already holds the NEW query. Resolving that stale path through the
+    /// new (smaller) filtered grouping can silently name a DIFFERENT issue
+    /// that happens to now occupy the same `[milestone_idx, issue_idx]`
+    /// coordinates — e.g. the row that WAS selected drops out of the
+    /// filtered view, and whatever slides up into its slot gets "restored"
+    /// in its place instead. Resolving against the unfiltered grouping
+    /// avoids that: the coordinate space doesn't shift out from under the
+    /// path just because a keystroke changed the filter.
+    fn board_selected_issue_unfiltered(&self) -> Option<(String, u64)> {
+        let section = self.board_sidebar.active_section()?;
+        let offset = self.board_repo_offset();
+        if section < offset {
+            return None;
+        }
+        let path = self.board_sidebar.selected_path(section)?;
+        if path.len() < 2 {
+            return None;
+        }
+        let milestone_idx = path[0] as usize;
+        let issue_idx = path[1] as usize;
+        let repo = self.board_repo_names.get(section - offset)?;
+        let milestones =
+            self.board_milestones_for_repo(&self.board_issues_cache, repo, false);
+        let (_, _, group_issues) = milestones.get(milestone_idx)?;
+        let (flat_idx, _) = group_issues.get(issue_idx)?;
+        let (_, all_issues) = self.board_issues_cache.iter().find(|(r, _)| r == repo)?;
+        let epic_group = all_issues.get(*flat_idx)?;
+        // #1270 parity with `board_selected_issue_group`: a 3rd path segment
+        // means "nested epic child" only when `epic_group` actually has a
+        // child at that index.
+        if path.len() >= 3 {
+            let child_idx = path[2] as usize;
+            let children = self.epic_child_rows_for(repo, epic_group.issue_number);
+            if let Some(child_number) = children.get(child_idx).map(|c| c.number) {
+                return Some((repo.clone(), child_number));
+            }
+        }
+        Some((repo.clone(), epic_group.issue_number))
     }
 
     // ── #2285 (ms-65 §5): per-tab detail sub-state ───────────────────────
@@ -7514,7 +7599,7 @@ impl CoordApp {
     fn expand_board_milestone_for(&mut self, repo: &str, number: u64) {
         let milestone_key = {
             let cache = &self.board_issues_cache;
-            let milestones = self.board_milestones_for_repo(cache, repo);
+            let milestones = self.board_milestones_for_repo(cache, repo, true);
             milestones
                 .iter()
                 .find(|(_, _, group_issues)| {
@@ -7690,12 +7775,45 @@ impl CoordApp {
     }
 
     /// Try to select a specific issue in the sidebar by repo and issue number.
+    ///
+    /// #2452: every exit that fails to resolve `(repo, issue_number)` to a
+    /// row in the CURRENT (possibly `board_search`-filtered) tree explicitly
+    /// clears whatever row is already highlighted in the *target repo's own*
+    /// section, via `clear_board_tree_selection`, instead of silently
+    /// leaving it stand — same "explicit no-selection" fix
+    /// `rebuild_pipeline_sidebar` applies for the identical Pipeline-side
+    /// bug. This matters most for `reveal_board_active_doc`, whose own
+    /// preceding `rebuild_board_sidebar` pass may already have restored a
+    /// *different*, still-matching issue's selection in some OTHER,
+    /// currently-focused section before this call runs — Board's sidebar is
+    /// a multi-section accordion where every repo section keeps its own
+    /// selection independent of which section currently has keyboard focus,
+    /// so the not-found path must operate on `section_idx` (the target
+    /// repo's own section), never on whatever `active_section()` happens to
+    /// be at call time, or it would both leave the target repo's section
+    /// showing stale/no feedback AND wipe out an unrelated section's
+    /// perfectly valid selection. Every other call site (`select_issue` is
+    /// only ever used to jump to a specific issue: the issue finder's Board
+    /// fallback, Queue's "View on Board", the Kanban card click, and
+    /// `rebuild_board_sidebar`'s own previous-selection restore) already
+    /// wants "not found" to mean "nothing is selected in that repo's
+    /// section", so generalizing costs nothing.
     fn select_issue(&mut self, repo: &str, issue_number: u64) {
         let offset = self.board_repo_offset();
         // Find the repo's section index.
         let cache_idx = match self.board_repo_names.iter().position(|r| r == repo) {
             Some(i) => i,
-            None => return,
+            None => {
+                // #2452: `repo` has no section in the sidebar at all —
+                // `board_repo_names` is built from the UNFILTERED board
+                // cache (`rebuild_board_sidebar`), so this only happens when
+                // the repo genuinely has zero board issues, never as a
+                // `board_search` side effect. There is no section to move
+                // focus to or to clear, so leave whatever section is
+                // currently focused/selected untouched rather than clearing
+                // an unrelated repo's valid selection.
+                return;
+            }
         };
         let section_idx = cache_idx + offset;
         // Clone to avoid borrow conflicts.
@@ -7703,7 +7821,7 @@ impl CoordApp {
         // #410: milestone > issue bucketing — must stay in sync with
         // `board_milestones_for_repo` and `rebuild_board_sidebar`
         // so the path this function produces matches what the click handler resolves to.
-        let milestones = self.board_milestones_for_repo(&cache, repo);
+        let milestones = self.board_milestones_for_repo(&cache, repo, true);
         for (milestone_idx, (_, _, group_issues)) in milestones.iter().enumerate() {
             for (issue_idx, (_, g)) in group_issues.iter().enumerate() {
                 if g.issue_number == issue_number {
@@ -7730,6 +7848,28 @@ impl CoordApp {
                 }
             }
         }
+        // #2452: not found under `board_search` in the target repo's own
+        // section (filtered out, or otherwise absent). Move keyboard focus
+        // to that section — mirroring the "found" branches above, so the
+        // visible/focused section always agrees with the active document —
+        // and clear ITS selection explicitly by index, never by reading back
+        // whatever `active_section()` was before this call.
+        self.board_sidebar.set_active_section(Some(section_idx));
+        self.clear_board_tree_selection(section_idx);
+    }
+
+    /// #2452: clear whatever row is highlighted in sidebar `section`,
+    /// without touching `board_search`. Takes an explicit section index
+    /// rather than deriving one from `active_section()` — Board's sidebar is
+    /// a multi-section accordion where every repo section keeps its own
+    /// selection independent of keyboard focus, so deriving the section from
+    /// `active_section()` would silently clear the wrong repo's selection on
+    /// a multi-repo board whenever the target repo isn't the one currently
+    /// focused. The shared tail every `select_issue` not-found exit funnels
+    /// through, always after `set_active_section(Some(section))` so focus
+    /// and clearing agree on the same section.
+    fn clear_board_tree_selection(&mut self, section: usize) {
+        self.board_sidebar.set_selected_path(section, None);
     }
 
     /// Clamp `machine_scroll` so that `machine_sel` is inside the visible window.

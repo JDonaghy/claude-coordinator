@@ -22804,6 +22804,125 @@
         assert_ne!(app.pipeline_sel, Some(epic_idx), "must not snap to the epic parent");
     }
 
+    /// Review fix (blocking finding, iteration 1): `capture_pipeline_
+    /// selection_id` and `rebuild_pipeline_sidebar`'s tail sync block used
+    /// to give an open Pipeline document tab priority over the tree's ACTUAL
+    /// selection unconditionally — not just for the "target hidden by
+    /// filter" case #2452 was meant to fix. That reintroduced the
+    /// #1197/#1199 regression for untracked nested epic-child rows:
+    /// selecting such a row deliberately leaves `pipeline_sel = None` (the
+    /// row stays visually selected, detail pane shows the "no issue"
+    /// placeholder), but the moment ANY Pipeline doc tab was open elsewhere,
+    /// capture would silently return the tab's issue instead of the child's,
+    /// and the tail block would force `pipeline_sel` onto the tab's issue —
+    /// even though the highlighted row is the untracked child, not the tab.
+    /// `pipeline_sel` drives both the detail pane AND every per-issue
+    /// action, so this would silently redirect actions at the wrong issue.
+    #[test]
+    fn open_doc_tab_elsewhere_does_not_outrank_a_selected_untracked_nested_child() {
+        let data = BoardData {
+            pipeline_tracked_labels: vec!["coord".to_string()],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            open_issues: vec![
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 100,
+                    title: "Epic tracker".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string(), "epic".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+                // Untracked child — forced out of `pipeline_issues` below
+                // (the only production cause of `resolve_nested_child_index`
+                // returning `None`; see its doc comment).
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 102,
+                    title: "Untracked child".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec![],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+                // A totally unrelated tracked issue — its Pipeline doc tab
+                // is the one that must NOT outrank the child selection below.
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 200,
+                    title: "Unrelated issue".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+            ],
+            epic_children: vec![EpicChildren {
+                repo_name: "api".to_string(),
+                tracking_issue: 100,
+                children: vec![EpicChild { number: 102, state: "open".to_string() }],
+            }],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = app.pipeline_issues_from_cache();
+        // Force #102 out of `pipeline_issues` — simulating a child that
+        // isn't independently tracked (nesting itself still comes from
+        // `self.data.epic_children`, unaffected by this).
+        app.pipeline_issues.retain(|i| i.number != 102);
+        app.rebuild_pipeline_sidebar(None);
+
+        // Open a Pipeline doc tab for the unrelated issue #200.
+        app.open_pipeline_doc_tab(("acme/api".to_string(), 200), true);
+
+        // Now select the untracked nested child row (#102) — a deliberate,
+        // legitimate action unrelated to the open doc tab.
+        let (section, path, sel) = app
+            .locate_pipeline_selection("acme/api", 102)
+            .expect("the nested child row is still rendered for display");
+        assert_eq!(sel, None, "precondition: #102 isn't independently tracked");
+        app.pipeline_sidebar.set_active_section(Some(section));
+        app.pipeline_sidebar.set_selected_path(section, Some(path));
+        app.pipeline_sel = app.selected_pipeline_index();
+        assert_eq!(
+            app.pipeline_sel, None,
+            "sanity: pipeline_sel is None for the untracked child, even \
+             though its row is visually selected"
+        );
+
+        // Fix: capture must return the CHILD's own id — the tree's actual
+        // selection — never the unrelated open doc tab's.
+        let captured = app.capture_pipeline_selection_id();
+        assert_eq!(
+            captured,
+            Some(("acme/api".to_string(), 102)),
+            "fix: a deliberately-selected untracked nested child must win \
+             over an unrelated open doc tab, got {captured:?}"
+        );
+
+        // And a subsequent rebuild triggered by something unrelated to the
+        // child selection (e.g. the periodic refresh, or a filter keystroke
+        // in a totally different section) must not silently snap
+        // `pipeline_sel` onto the doc tab's issue (#200's index).
+        app.rebuild_pipeline_sidebar(captured);
+        assert_eq!(
+            app.pipeline_sel, None,
+            "fix: pipeline_sel must stay following the untracked child \
+             (None) — not snapped onto the unrelated open doc tab #200"
+        );
+        let section = app
+            .pipeline_sidebar
+            .active_section()
+            .expect("a state section is still active");
+        assert!(
+            app.pipeline_sidebar.selected_path(section).is_some(),
+            "the nested child row itself stays visually selected"
+        );
+    }
+
     /// #1281 supersedes the pre-#1281 #1199 concern for aged-out children:
     /// a child ABSENT from `open_issues` (aged out of the sync cache, the
     /// #1031/#1032/#1033 shape) is presumed closed by
@@ -49695,6 +49814,496 @@ Milestone tracking issue.
             "#2285: Board's checkpoint/restore must touch only Board's live \
              fields — the Pipeline pane is a different scope with its own \
              records"
+        );
+    }
+
+    // ── #2452: active document tab stays selected + visible; filter is ────
+    // never auto-cleared ───────────────────────────────────────────────────
+    //
+    // Both panels already had a "reveal the active document tab's row"
+    // mechanism (`reveal_pipeline_active_doc` / `reveal_board_active_doc`),
+    // but neither accounted for its OWN panel's search filter: when the
+    // active tab's issue is hidden by the filter, the failure mode wasn't
+    // "no selection" — it was a silent, WRONG selection (whatever the
+    // rebuild's default-select-first-row or its own previous-selection
+    // restore happened to land on). These tests drive that combination —
+    // an active filter PLUS a tab-activation/reveal call — which none of
+    // `pipeline_filter_hides_non_matching_issues`, `board_fuzzy_search_
+    // hides_non_matching_issues`, or `rebuild_pipeline_sidebar_preserves_
+    // both_selection_and_scroll` exercise.
+
+    /// Pipeline counterpart of `doc_tab_app`: same JSON-seeded board, but
+    /// also expands the Pipeline "New" section's `no-milestone` group for
+    /// every seeded repo (#857 collapses it by default — `doc_tab_app`
+    /// already does the equivalent expand for Board's own milestone map,
+    /// this just applies the same courtesy to Pipeline's SEPARATE map) and
+    /// rebuilds the Pipeline sidebar so the freshly-expanded rows actually
+    /// emit.
+    fn pipeline_doc_tab_app(board_json: &str) -> CoordApp {
+        let mut app = doc_tab_app(board_json);
+        let mut repos: Vec<String> = Vec::new();
+        for pi in &app.pipeline_issues {
+            let key = CoordApp::pipeline_repo_key(pi).to_string();
+            if !repos.contains(&key) {
+                repos.push(key);
+            }
+        }
+        for repo in repos {
+            app.pipeline_milestone_expanded.insert(
+                ("new".to_string(), repo, "no-milestone".to_string()),
+                true,
+            );
+        }
+        app.rebuild_pipeline_sidebar(None);
+        app
+    }
+
+    /// Acceptance #1 (Pipeline half), including the off-screen case that
+    /// closes the Pipeline/Board parity gap this issue calls out:
+    /// `reveal_pipeline_active_doc` previously only restored whatever
+    /// scroll position was already there. Mirrors Board's own
+    /// `activating_a_doc_tab_scrolls_its_offscreen_sidebar_row_into_view`
+    /// (#2282 §2f) row for row.
+    #[test]
+    fn activating_a_pipeline_doc_tab_scrolls_its_offscreen_sidebar_row_into_view() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let issues: Vec<String> = (101..=130)
+            .map(|n| {
+                format!(
+                    r#"{{"repo_name": "claude-coordinator", "number": {n}, "title": "Task number {n}", "state": "open", "labels": ["coord"]}}"#
+                )
+            })
+            .collect();
+        let json = format!(r#"{{"issues": [{}]}}"#, issues.join(","));
+
+        let mut app = pipeline_doc_tab_app(&json);
+        app.active_view = SidebarView::Pipeline;
+        app.open_pipeline_doc_tab(("claude-coordinator".to_string(), 130), true);
+        app.open_pipeline_doc_tab(("claude-coordinator".to_string(), 101), true);
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 20);
+        driver.render();
+        assert!(
+            driver.screen_contains("▸ #101"),
+            "#101 is the active Pipeline document, selected near the top:\n{}",
+            driver.screen(),
+        );
+        // Precondition, or the assertion below is vacuous: #130's SIDEBAR
+        // row (number padded to `#{:<5}`, hence the double space — distinct
+        // from its single-spaced tab label) starts off-screen.
+        assert!(
+            !driver.screen_contains("#130  Task"),
+            "precondition: #130's Pipeline sidebar row starts OFF-SCREEN:\n{}",
+            driver.screen(),
+        );
+
+        let (x, y) = driver
+            .find("#130 Task number 130")
+            .expect("#130's Pipeline TAB is on screen even while its sidebar row is not");
+        driver.click(x, y);
+        driver.render();
+
+        assert!(
+            driver.screen_contains("▸ #130"),
+            "#2452: activating #130's Pipeline tab scrolls its sidebar row into view:\n{}",
+            driver.screen(),
+        );
+        // …and it got there by SCROLLING — the rows at the top of the tree
+        // (still on screen a frame ago) have left the viewport.
+        assert!(
+            !driver.screen_contains("#101  Task"),
+            "#101's Pipeline sidebar row scrolled off — the panel really moved:\n{}",
+            driver.screen(),
+        );
+    }
+
+    /// Acceptance #2 (Pipeline half): typing a filter that hides the
+    /// currently ACTIVE document tab's issue must leave the tree with NO
+    /// row selected — never snapped onto some other, unrelated row — and
+    /// must never touch the typed filter text itself.
+    ///
+    /// Types the query character by character (not one `set_value` call)
+    /// because the fix's tricky part is staying correct across EVERY
+    /// intermediate rebuild, not just the final one: `pipeline_sel` itself
+    /// goes to `None` the moment the FIRST keystroke hides the row, and a
+    /// naive re-capture keyed off `pipeline_sel` would then "forget" the
+    /// active tab existed on the very next keystroke — see
+    /// `capture_pipeline_selection_id`'s #2452 note for the failure mode
+    /// this guards against.
+    ///
+    /// Drives typing directly through `pipeline_search.insert_char` +
+    /// `rebuild_pipeline_sidebar(None)` — the exact per-keystroke sequence
+    /// `events.rs`'s Pipeline FILTER arms run — rather than through
+    /// `TuiDriver`: `driver_with_shell` wraps `CoordApp` in an opaque
+    /// `impl AppLogic` shell adapter, so `driver.app()` can't expose
+    /// `CoordApp`'s own fields (`pipeline_search`, `pipeline_sidebar`,
+    /// `pipeline_sel`) for the state assertions this test needs; screen text
+    /// alone can't distinguish "no row selected" from "some row selected but
+    /// not highlighted differently on screen".
+    #[test]
+    fn typing_pipeline_filter_that_hides_active_tab_clears_tree_selection_not_the_filter() {
+        let mut app = make_pipeline_app();
+        app.open_pipeline_doc_tab(("acme/api".to_string(), 42), true);
+        assert_eq!(
+            app.pipeline_sel,
+            Some(0),
+            "precondition: #42 (index 0) is the active document, selected"
+        );
+        let section = app
+            .pipeline_sidebar
+            .active_section()
+            .expect("precondition: a state section is active");
+        assert!(
+            app.pipeline_sidebar.selected_path(section).is_some(),
+            "precondition: #42's row is selected before typing"
+        );
+
+        // "Mystery" matches only #99's title — #42 (the active tab) drops
+        // out of the filtered tree partway through, well before the query
+        // is complete.
+        app.pipeline_search.focused = true;
+        for ch in "Mystery".chars() {
+            app.pipeline_search.insert_char(ch);
+            app.rebuild_pipeline_sidebar(None);
+        }
+
+        assert_eq!(
+            app.pipeline_search.query, "Mystery",
+            "#2452: the typed filter text is never touched by the \
+             tab-activation invariant"
+        );
+
+        let visible_new: Vec<u64> = app
+            .pipeline_repos_for_state("new")
+            .into_iter()
+            .flat_map(|(_, idxs)| idxs)
+            .map(|i| app.pipeline_issues[i].number)
+            .collect();
+        assert!(
+            !visible_new.contains(&42),
+            "sanity: #42 is filtered out of the tree: {visible_new:?}"
+        );
+        assert!(
+            visible_new.contains(&99),
+            "sanity: #99 stays visible under the filter: {visible_new:?}"
+        );
+
+        let section = app
+            .pipeline_sidebar
+            .active_section()
+            .expect("a state section is still active (#99 keeps it non-empty)");
+        assert!(
+            app.pipeline_sidebar.selected_path(section).is_none(),
+            "#2452: no row may be selected — not #99's, not any other — \
+             while the active tab's own issue is hidden by the filter"
+        );
+        // The detail pane still follows the active TAB, not the (nonexistent)
+        // tree selection — #42's tab strip entry says it's open, so its
+        // content must not silently go blank or snap onto #99's.
+        assert_eq!(
+            app.pipeline_sel,
+            Some(0),
+            "#2452: pipeline_sel keeps following the active doc tab (#42) \
+             even though its row is hidden by the filter"
+        );
+    }
+
+    /// Acceptance #3 (Pipeline half): closing a document tab whose
+    /// NEIGHBOUR (which becomes active) is hidden by the current search
+    /// filter must land in the same explicit no-selection state as the
+    /// typing case above — not a stale one left over from before the close.
+    #[test]
+    fn closing_a_pipeline_doc_tab_onto_a_filtered_out_neighbour_leaves_no_selection() {
+        let mut app = make_pipeline_app();
+        app.open_pipeline_doc_tab(("acme/api".to_string(), 42), true);
+        app.open_pipeline_doc_tab(("other/repo".to_string(), 99), true);
+        assert_eq!(
+            app.pipeline_doc_active_key(),
+            Some(&("other/repo".to_string(), 99)),
+            "precondition: #99 (opened last) is the active tab"
+        );
+
+        // Hides #42 — the tab #99's close falls back onto — while leaving
+        // #99 itself (about to close) visible.
+        app.pipeline_search.set_value("Mystery");
+
+        let idx99 = app
+            .pipeline_doc_tabs()
+            .index_of(&("other/repo".to_string(), 99))
+            .expect("#99's tab must exist");
+        assert!(
+            app.close_pipeline_doc_tab(idx99),
+            "closing #99, the active tab"
+        );
+        assert_eq!(
+            app.pipeline_doc_active_key(),
+            Some(&("acme/api".to_string(), 42)),
+            "#42 (the only remaining tab) becomes active"
+        );
+
+        let section = app
+            .pipeline_sidebar
+            .active_section()
+            .expect("a state section is still active");
+        assert!(
+            app.pipeline_sidebar.selected_path(section).is_none(),
+            "#2452: #42 became the active tab but its row is filtered out — \
+             the tree must show no selection, not the stale #99 row that \
+             was selected before the close"
+        );
+        assert_eq!(
+            app.pipeline_search.query, "Mystery",
+            "#2452: closing the tab must not touch the typed filter"
+        );
+    }
+
+    /// Acceptance #1 (Board half): activating a Board document tab whose
+    /// issue MATCHES the current search filter selects its row — existing
+    /// coverage (`activating_a_doc_tab_scrolls_its_offscreen_sidebar_row_
+    /// into_view`) never combines this with an active filter.
+    #[test]
+    fn activating_a_board_doc_tab_selects_the_row_when_the_filter_matches_it() {
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        // Matches #102 only ("Auth token refresh bug").
+        app.board_search.set_value("Auth");
+        app.rebuild_board_sidebar();
+
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 102), true);
+
+        assert_eq!(
+            app.board_selected_issue(),
+            Some(("claude-coordinator".to_string(), 102)),
+            "#2452: the filtered-in target is selected in the tree"
+        );
+    }
+
+    /// Acceptance #2 (Board half): typing a filter that hides the currently
+    /// active tab's issue must leave the tree with no selected row, and
+    /// must never touch the typed filter text.
+    #[test]
+    fn typing_board_filter_that_hides_active_tab_clears_tree_selection_not_the_filter() {
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 101), true);
+        assert_eq!(
+            app.board_selected_issue(),
+            Some(("claude-coordinator".to_string(), 101)),
+            "precondition: #101 is selected"
+        );
+
+        // Matches #102 only — #101 (the active tab) drops out.
+        app.board_search.set_value("Auth");
+        app.rebuild_board_sidebar();
+
+        assert!(
+            app.board_selected_issue().is_none(),
+            "#2452: #101 is the active tab but filtered out — the tree \
+             must show no selection"
+        );
+        assert_eq!(
+            app.board_search.query, "Auth",
+            "#2452: the typed filter text is never touched"
+        );
+        // The detail pane still follows the active tab regardless of the
+        // tree — this already worked via `board_detail_issue_group`'s
+        // tab-first lookup (contract §2, #2285), untouched by this fix.
+        assert_eq!(
+            app.board_detail_issue_group().map(|g| g.issue_number),
+            Some(101),
+            "#2452: the detail pane keeps showing #101 (the active tab) \
+             even though its row is hidden by the filter"
+        );
+    }
+
+    /// Acceptance #3 (Board half): closing a document tab whose neighbour
+    /// (now active) is filtered out lands in the same no-selection state as
+    /// the typing case above, not a stale one.
+    #[test]
+    fn closing_a_board_doc_tab_onto_a_filtered_out_neighbour_leaves_no_selection() {
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 101), true);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 102), true);
+        assert_eq!(
+            app.board_doc_active_key(),
+            Some(&("claude-coordinator".to_string(), 102)),
+            "precondition: #102 (opened last) is the active tab"
+        );
+
+        // Hides #101 — the tab #102's close falls back onto — while leaving
+        // #102 itself (about to close) visible.
+        app.board_search.set_value("Auth");
+        app.rebuild_board_sidebar();
+
+        assert!(
+            app.close_board_doc_tab(1),
+            "closing #102 (strip index 1), the active tab"
+        );
+        assert_eq!(
+            app.board_doc_active_key(),
+            Some(&("claude-coordinator".to_string(), 101)),
+            "#101 becomes active (the tab immediately to the left)"
+        );
+        assert!(
+            app.board_selected_issue().is_none(),
+            "#2452: #101 became active but is filtered out — no stale #102 \
+             selection may stand"
+        );
+        assert_eq!(app.board_search.query, "Auth");
+    }
+
+    /// Acceptance #4: Board's Ctrl-Tab cycle (`cycle_board_doc_tab`) landing
+    /// on a filtered-out neighbour must leave no selection either — it
+    /// routes through `activate_board_doc_tab` → `reveal_board_active_doc`,
+    /// the same path the click/close cases above exercise, just reached via
+    /// wraparound instead of a click or a close.
+    #[test]
+    fn ctrl_tab_cycling_onto_a_filtered_out_board_tab_leaves_no_selection() {
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 101), true);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 102), true);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 103), true);
+        assert_eq!(
+            app.board_doc_active_key(),
+            Some(&("claude-coordinator".to_string(), 103)),
+            "precondition: #103 (opened last) is active"
+        );
+
+        // Matches #102 only — #101, the tab Ctrl-Tab wraps forward onto
+        // from #103, is hidden.
+        app.board_search.set_value("Auth");
+        app.rebuild_board_sidebar();
+
+        assert!(
+            app.cycle_board_doc_tab(true),
+            "Ctrl-Tab from #103 wraps to #101"
+        );
+        assert_eq!(
+            app.board_doc_active_key(),
+            Some(&("claude-coordinator".to_string(), 101)),
+            "cycling still activates the tab regardless of the tree filter"
+        );
+        assert!(
+            app.board_selected_issue().is_none(),
+            "#2452: #101 is now active but filtered out — no selection may stand"
+        );
+        assert_eq!(app.board_search.query, "Auth");
+    }
+
+    /// Acceptance #5 (Pipeline half): a fresh paint with no prior selection
+    /// and nothing specific being revealed still default-selects the first
+    /// row. The fix above only changes what happens when a SPECIFIC target
+    /// (`prev_sel`) fails to resolve; this is the "no target was ever
+    /// requested" case (`prev_sel` is `None`), which must be untouched.
+    #[test]
+    fn pipeline_fresh_paint_with_no_reveal_target_still_default_selects_first_row() {
+        let app = make_pipeline_app();
+        assert_eq!(
+            app.pipeline_sel
+                .and_then(|i| app.pipeline_issues.get(i))
+                .map(|i| i.number),
+            Some(42),
+            "#2452 regression: unchanged default-select-first-row behaviour"
+        );
+        let section = app.pipeline_sidebar.active_section().unwrap();
+        assert!(
+            app.pipeline_sidebar.selected_path(section).is_some(),
+            "#2452 regression: the default selection is a real row, not \
+             the explicit no-selection state introduced for the \
+             filtered-target case"
+        );
+    }
+
+    /// Acceptance #5 (Board half): same regression bar on the Board panel.
+    /// Board's own "no prior selection" default only ever activates a
+    /// SECTION (never forces a row path, unlike Pipeline's) — locked in
+    /// here so a future change to either default can't silently regress
+    /// this fix's "only touch the explicit-target-missed case" contract.
+    #[test]
+    fn board_fresh_paint_with_no_reveal_target_activates_a_section_with_no_row_selected() {
+        let app = make_app_with_assignments(vec![make_assignment_typed(
+            "running", 10, "repo-a", Some("work"),
+        )]);
+        assert!(
+            app.board_sidebar.active_section().is_some(),
+            "#2452 regression: a fresh paint still activates a section"
+        );
+        assert!(
+            app.board_selected_issue().is_none(),
+            "#2452 regression: unchanged — Board's default never \
+             force-selects a row; only an explicit `select_issue`/reveal \
+             call does that"
+        );
+    }
+
+    /// Review fix (blocking finding, iteration 1): `select_issue`'s
+    /// not-found fallback used to clear whatever section `active_section()`
+    /// happened to point at, rather than the TARGET repo's own section.
+    /// Board's sidebar is a multi-repo accordion where every repo section
+    /// keeps its own selection independent of keyboard focus, so on a
+    /// multi-repo board this both (1) left the sidebar focused on whatever
+    /// repo was browsed before instead of switching to the tab's own repo,
+    /// and (2) wiped out that unrelated, still-valid selection instead of
+    /// leaving it alone. `DOC_TAB_BOARD_JSON`-based tests can't catch this —
+    /// same repo, so target-section == active-section by construction; this
+    /// uses `DOC_TAB_TWO_REPO_JSON` to actually put two different repos in
+    /// play.
+    #[test]
+    fn activating_a_board_doc_tab_for_a_different_repo_moves_focus_and_preserves_the_other_repos_selection()
+    {
+        let mut app = doc_tab_app(DOC_TAB_TWO_REPO_JSON);
+        // Repo A (claude-coordinator, #101) starts browsed with a valid
+        // selection — simulating the user actively looking at it.
+        app.select_issue("claude-coordinator", 101);
+        assert_eq!(
+            app.board_selected_issue(),
+            Some(("claude-coordinator".to_string(), 101)),
+            "precondition: repo A's section is focused with a valid selection"
+        );
+
+        // Matches #101 ("Fix login race timeout") only — #7 ("Portal login
+        // redirect"), repo B's only issue, is filtered out. Repo A's own
+        // selection must stay valid throughout.
+        app.board_search.set_value("race");
+        app.rebuild_board_sidebar();
+        assert_eq!(
+            app.board_selected_issue(),
+            Some(("claude-coordinator".to_string(), 101)),
+            "sanity: the filter doesn't disturb repo A's own matching selection"
+        );
+
+        // Activate a Board doc tab for repo B's #7 while repo A's section is
+        // still the one with keyboard focus — exactly the cross-repo
+        // scenario `reveal_board_active_doc` hits after its own preceding
+        // `rebuild_board_sidebar` pass restores repo A's selection.
+        app.open_board_doc_tab(("coord-portal".to_string(), 7), true);
+
+        let offset = app.board_repo_offset();
+        let b_idx = app
+            .board_repo_names
+            .iter()
+            .position(|r| r == "coord-portal")
+            .expect("coord-portal has a section");
+        let a_idx = app
+            .board_repo_names
+            .iter()
+            .position(|r| r == "claude-coordinator")
+            .expect("claude-coordinator has a section");
+
+        assert_eq!(
+            app.board_sidebar.active_section(),
+            Some(b_idx + offset),
+            "fix: reveal must move keyboard focus to the target repo B's \
+             OWN section, not leave repo A's section focused"
+        );
+        assert!(
+            app.board_sidebar.selected_path(b_idx + offset).is_none(),
+            "fix: repo B's section shows no selection since #7 is filtered out"
+        );
+        assert!(
+            app.board_sidebar.selected_path(a_idx + offset).is_some(),
+            "fix: repo A's still-valid selection must survive a doc-tab \
+             reveal for an unrelated repo B — the not-found fallback must \
+             never clear a section other than the target's own"
         );
     }
 

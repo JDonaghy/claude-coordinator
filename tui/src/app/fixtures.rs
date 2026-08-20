@@ -100,6 +100,8 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         pipeline_milestone_expanded: std::collections::HashMap::new(),
         pipeline_epic_expanded: std::collections::HashMap::new(),
         pipeline_epic_row_keys: std::collections::HashMap::new(),
+        pipeline_section_rows: Vec::new(),
+        last_pipeline_sidebar_geom: std::cell::Cell::new(None),
         pipeline_issues: Vec::new(),
         pipeline_sel: None,
         pipeline_status: None,

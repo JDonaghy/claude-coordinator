@@ -5574,7 +5574,7 @@ impl CoordApp {
                                 if let Some(repo) = self.board_repo_names.get(repo_idx).cloned() {
                                     let milestone_idx = path[0] as usize;
                                     let cache = self.board_issues_cache.clone();
-                                    let milestones = self.board_milestones_for_repo(&cache, &repo);
+                                    let milestones = self.board_milestones_for_repo(&cache, &repo, true);
                                     if let Some((m_key, _, group_issues)) =
                                         milestones.get(milestone_idx)
                                     {
@@ -5635,7 +5635,7 @@ impl CoordApp {
                                 if let Some(repo) = self.board_repo_names.get(repo_idx).cloned() {
                                     let milestone_idx = path[0] as usize;
                                     let cache = self.board_issues_cache.clone();
-                                    let milestones = self.board_milestones_for_repo(&cache, &repo);
+                                    let milestones = self.board_milestones_for_repo(&cache, &repo, true);
                                     if let Some((m_key, _, group_issues)) =
                                         milestones.get(milestone_idx)
                                     {
@@ -5717,7 +5717,7 @@ impl CoordApp {
                             let repo_idx = section - offset;
                             if let Some(repo) = self.board_repo_names.get(repo_idx).cloned() {
                                 let cache = self.board_issues_cache.clone();
-                                let milestones = self.board_milestones_for_repo(&cache, &repo);
+                                let milestones = self.board_milestones_for_repo(&cache, &repo, true);
                                 let milestone_idx = path[0] as usize;
                                 if let Some((m_key, _, group_issues)) =
                                     milestones.get(milestone_idx)
