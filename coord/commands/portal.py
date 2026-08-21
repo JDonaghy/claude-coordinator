@@ -31,6 +31,8 @@ follow-up); this is the "fail loud instead of running wrong" half.
 
 from __future__ import annotations
 
+import datetime
+import getpass
 import json
 
 import click
@@ -42,6 +44,13 @@ from coord.portal_bridge import (
     SUBMISSION_STATUSES,
     client_from_config,
 )
+
+
+def _actor() -> str:
+    try:
+        return getpass.getuser()
+    except Exception:  # noqa: BLE001 — no passwd entry in some containers
+        return "unknown"
 
 
 def _refuse_if_thin_client(cmd_name: str) -> None:
@@ -192,6 +201,87 @@ def portal_push(config_path, submission_id: str, revision: int, status: str) -> 
         f"rejected: {submission_id}@{revision} -> {status} ({result.reason})", fg="red"
     )
     raise SystemExit(1)
+
+
+# ── #2507: milestone ↔ portal submission linkage ────────────────────────────
+
+
+@portal_group.command("link")
+@_CONFIG_OPTION
+@click.argument("repo")
+@click.argument("milestone_number", type=int)
+@click.argument("submission_id", required=False)
+def portal_link(
+    config_path, repo: str, milestone_number: int, submission_id: str | None
+) -> None:
+    """Record, or read, one milestone's portal submission_id link (#2507).
+
+    With SUBMISSION_ID: link REPO's milestone MILESTONE_NUMBER to it.
+    Operator-run — submission creation is driven by the portal's own intake
+    flow, not by coord, so there is currently no automatic way for coord to
+    learn a submission exists at all.
+
+    Without SUBMISSION_ID: report the current link, mirroring `coord gate-a`'s
+    read/write dual-mode shape.
+
+    Nothing downstream resolves this automatically yet — PDR-3's auto-push
+    and PDR-4's verdict consumer (the epic's later legs, #2506) are what will
+    read it once they exist.
+    """
+    _refuse_if_thin_client("link")
+
+    from coord import portal_store  # noqa: PLC0415
+    from coord.audit import record_audit  # noqa: PLC0415
+
+    cfg = _load_config(config_path)
+    repo_cfg = cfg.repo(repo)
+    if repo_cfg is None:
+        click.secho(f"error: unknown repo {repo!r}", fg="red")
+        raise SystemExit(2)
+
+    if submission_id is None:
+        link = portal_store.get_milestone_link(
+            repo_name=repo_cfg.name, milestone_number=milestone_number
+        )
+        if link is None:
+            click.echo(f"{repo_cfg.name} ms-{milestone_number}: not linked")
+            raise SystemExit(1)
+        when = datetime.datetime.fromtimestamp(
+            link.linked_at, tz=datetime.timezone.utc
+        ).strftime("%Y-%m-%d %H:%M UTC")
+        click.echo(
+            f"{repo_cfg.name} ms-{milestone_number}: "
+            f"submission_id={link.submission_id} "
+            f"(linked by {link.actor or 'unknown'} at {when})"
+        )
+        return
+
+    link = portal_store.link_milestone(
+        repo_name=repo_cfg.name,
+        milestone_number=milestone_number,
+        submission_id=submission_id,
+        actor=_actor(),
+    )
+    record_audit(
+        tier="business",
+        category="portal",
+        event_type="portal_link",
+        actor=link.actor,
+        summary=(
+            f"linked {repo_cfg.name} ms-{milestone_number} to portal "
+            f"submission {submission_id}"
+        ),
+        repo=repo_cfg.name,
+        details={
+            "milestone_number": milestone_number,
+            "submission_id": submission_id,
+        },
+    )
+    click.secho(
+        f"linked: {repo_cfg.name} ms-{milestone_number} -> "
+        f"submission_id={submission_id}",
+        fg="green",
+    )
 
 
 # ── #1982: the sync loop's operator surface ─────────────────────────────────

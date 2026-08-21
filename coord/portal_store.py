@@ -762,3 +762,135 @@ def note_error(error: str) -> None:
 
 def clear_error() -> None:
     _update_sync_state(last_error="")
+
+
+# ── #2507: milestone ↔ portal submission linkage ────────────────────────────
+#
+# Every table above is part of the sync bridge's own SQLite schema
+# (``coord.db``'s ``_ensure_schema``) and, per the module docstring, is
+# deliberately daemon-host-only. The link between a coord milestone and a
+# portal ``submission_id`` is a DIFFERENT kind of fact — nothing here creates
+# or drives it (the portal's own intake flow does, out of coord's sight) —
+# but it still needs the same durability and the same "read anywhere, write
+# on the daemon host" story, so it is persisted through
+# :mod:`coord.state`'s ``portal_links`` board_meta seam (same shape as
+# ``coord.gate_a``'s ``GateAApproval`` / ``gate_a_approvals``) rather than a
+# fifth table here. This is the domain half — :mod:`coord.state` only knows
+# plain dicts, this is where the dict shape is pinned down and given a
+# tolerant decoder.
+#
+# Consumers: PDR-3's auto-push (resolve a milestone's outbox destination) and
+# PDR-4's verdict consumer (resolve an inbound portal event back to a
+# milestone) both need exactly this lookup and have nowhere else to get it
+# (#2507 — confirmed by grep, ``submission_id`` appeared in neither
+# ``coord/config.py``, ``coord/milestone*.py``, nor ``coord/gate_a.py``
+# before this).
+
+_LINK_SCHEMA = 1
+
+
+@dataclass(frozen=True)
+class PortalLink:
+    """One durable ``(repo_name, milestone_number)`` → portal ``submission_id``
+    mapping, set by an operator with ``coord portal link`` once a submission
+    exists on the portal side.
+    """
+
+    repo_name: str
+    milestone_number: int
+    submission_id: str
+    linked_at: float = 0.0
+    actor: str = ""
+    schema: int = _LINK_SCHEMA
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "repo_name": self.repo_name,
+            "milestone_number": self.milestone_number,
+            "submission_id": self.submission_id,
+            "linked_at": self.linked_at,
+            "actor": self.actor,
+            "schema": self.schema,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> "PortalLink | None":
+        """Tolerant decode — ``None`` for anything this build can't read.
+
+        Same posture as :meth:`coord.gate_a.GateAApproval.from_dict`: a
+        record written by a newer schema, or a corrupt one, degrades to "no
+        link recorded" rather than crashing a caller that resolves one
+        milestone at a time.
+        """
+        if not isinstance(raw, dict):
+            return None
+        if int(raw.get("schema", _LINK_SCHEMA) or _LINK_SCHEMA) != _LINK_SCHEMA:
+            return None
+        repo_name = raw.get("repo_name")
+        if not isinstance(repo_name, str) or not repo_name:
+            return None
+        milestone_number = _as_int_or_none(raw.get("milestone_number"))
+        if milestone_number is None:
+            return None
+        submission_id = raw.get("submission_id")
+        if not isinstance(submission_id, str) or not submission_id:
+            return None
+        return cls(
+            repo_name=repo_name,
+            milestone_number=milestone_number,
+            submission_id=submission_id,
+            linked_at=float(raw.get("linked_at") or 0.0),
+            actor=str(raw.get("actor") or ""),
+        )
+
+
+def _as_int_or_none(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def link_milestone(
+    *,
+    repo_name: str,
+    milestone_number: int,
+    submission_id: str,
+    actor: str = "",
+    now: float | None = None,
+) -> PortalLink:
+    """Record (or overwrite) the portal submission_id for one milestone.
+
+    Overwrite, not append: there is exactly one live submission_id per
+    milestone, matching :func:`coord.state.save_gate_a_approval`'s semantics
+    for the same reason. Relinking is expected — an operator fixing a typo'd
+    submission_id, or correcting an id entered against the wrong milestone —
+    not an error case.
+    """
+    from coord import state  # noqa: PLC0415
+
+    record = PortalLink(
+        repo_name=repo_name,
+        milestone_number=int(milestone_number),
+        submission_id=submission_id,
+        linked_at=time.time() if now is None else now,
+        actor=actor,
+    )
+    state.save_portal_link(record.to_dict())
+    return record
+
+
+def get_milestone_link(*, repo_name: str, milestone_number: int) -> PortalLink | None:
+    """The current portal link for one milestone, or ``None`` if unlinked."""
+    from coord import state  # noqa: PLC0415
+
+    raw = state.get_portal_link(repo_name=repo_name, milestone_number=milestone_number)
+    return PortalLink.from_dict(raw) if raw is not None else None
+
+
+def list_milestone_links() -> list[PortalLink]:
+    """Every recorded milestone ↔ submission link."""
+    from coord import state  # noqa: PLC0415
+
+    links = [PortalLink.from_dict(raw) for raw in state.list_portal_links()]
+    return [link for link in links if link is not None]

@@ -3843,6 +3843,104 @@ def _load_gate_a_approvals_raw(conn: sqlite3.Connection) -> list[dict]:
     return [d for d in data if isinstance(d, dict)]
 
 
+# ── #2507: milestone ↔ portal submission linkage ────────────────────────────
+#
+# One JSON record per ``(repo_name, milestone_number)`` under the
+# ``portal_links`` board_meta key — the same seam and the same
+# whole-list-rewrite shape as ``gate_a_approvals`` above (the row count is
+# "milestones actually linked to a portal submission", i.e. single digits,
+# and one board read answers "does this milestone have a submission_id").
+#
+# Unlike ``gate_a_approvals``, this is deliberately LOCAL ONLY — no
+# ``_route_write``/``_board_service`` daemon routing. The rest of the portal
+# bridge's durable state (:mod:`coord.portal_store`'s four ``portal_*``
+# tables) has no daemon proxy either: every state-touching ``coord portal``
+# command is a daemon-host command, run over ``ssh``, and refuses outright on
+# a thin client (``coord.commands.portal._refuse_if_thin_client``, #2336).
+# This mapping follows that already-established rule — read/write via
+# ``coord portal link`` on the daemon host — rather than inventing a second
+# I/O story for one record type. Giving the whole bridge real cross-machine
+# routing is Option A in #2336, left for a follow-up.
+#
+# The domain shape (``PortalLink``, tolerant ``from_dict``) lives in
+# :mod:`coord.portal_store`, which calls the functions below the same way
+# :mod:`coord.gate_a` calls :func:`save_gate_a_approval` /
+# :func:`get_gate_a_approval` — this module only knows about plain dicts.
+
+
+def save_portal_link(record: dict) -> None:
+    """Upsert one milestone's portal ``submission_id`` link.
+
+    Keyed on ``(repo_name, milestone_number)``; an existing link for that
+    pair is replaced wholesale — relinking a milestone to a different
+    ``submission_id`` is a plain overwrite, matching
+    :func:`save_gate_a_approval`'s semantics for the same reason (exactly one
+    live link per milestone).
+    """
+    _save_portal_link_local(record)
+
+
+def _save_portal_link_local(record: dict) -> None:
+    repo_name = record.get("repo_name")
+    milestone_number = record.get("milestone_number")
+    if not isinstance(repo_name, str) or not repo_name or milestone_number is None:
+        raise ValueError("portal link needs repo_name + milestone_number")
+    milestone_number = int(milestone_number)
+    record = {**record, "milestone_number": milestone_number}
+
+    conn = get_connection()
+    with conn:
+        links = _load_portal_links_raw(conn)
+        key = (repo_name, milestone_number)
+        remaining = [
+            link for link in links
+            if (link.get("repo_name"), _as_int(link.get("milestone_number"))) != key
+        ]
+        remaining.append(record)
+        conn.execute(
+            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
+            "('portal_links', ?)",
+            (json.dumps(remaining),),
+        )
+
+
+def list_portal_links() -> list[dict]:
+    """Every recorded milestone ↔ submission link (local DB only)."""
+    conn = get_connection()
+    return _load_portal_links_raw(conn)
+
+
+def get_portal_link(*, repo_name: str, milestone_number: int) -> dict | None:
+    """One milestone's portal link, or ``None`` if nobody has recorded one.
+
+    Local-DB only, like :func:`list_portal_links` — see the section docstring
+    above for why this does not route to the daemon like
+    :func:`get_gate_a_approval` does.
+    """
+    for link in list_portal_links():
+        if (
+            link.get("repo_name") == repo_name
+            and _as_int(link.get("milestone_number")) == milestone_number
+        ):
+            return link
+    return None
+
+
+def _load_portal_links_raw(conn: sqlite3.Connection) -> list[dict]:
+    row = conn.execute(
+        "SELECT value FROM board_meta WHERE key = 'portal_links'"
+    ).fetchone()
+    if row is None:
+        return []
+    try:
+        data = json.loads(row["value"])
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [d for d in data if isinstance(d, dict)]
+
+
 def delete_milestone_gate(*, repo_name: str, tracking_issue: int) -> None:
     """Drop a milestone from gate control.
 

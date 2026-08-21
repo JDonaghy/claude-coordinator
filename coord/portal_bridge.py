@@ -13,9 +13,13 @@ those are separate, harder design questions and belong to follow-up issues:
 * It does not decide **when** to push. Nothing here reads coord's board or
   watches assignment status transitions. Callers hand it
   ``(submission_id, revision, status)`` and it sends that; where those three
-  values come from — the submission↔work association, and the mapping from
-  coord's internal states to the portal's pinned customer vocabulary — is
-  out of scope here.
+  values come from is out of scope here. The submission↔work association is
+  now resolvable — :func:`coord.portal_store.get_milestone_link` reads the
+  durable ``(repo, milestone_number) -> submission_id`` mapping an operator
+  records with ``coord portal link`` (#2507) — but nothing in this module
+  calls it: this client still just sends whatever ``submission_id`` a caller
+  hands it. The mapping from coord's internal states to the portal's pinned
+  customer vocabulary is a separate, still-unaddressed question.
 * It does not persist a revision counter. The portal is idempotent by
   ``(submission_id, revision)`` and ignores anything at or below its stored
   watermark (see ``applyUpdate`` in coord-portal's ``src/bridge/updates.ts``),

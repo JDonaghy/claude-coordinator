@@ -84,7 +84,7 @@ def run(*args):
 def test_portal_group_is_registered():
     result = run("portal", "--help")
     assert result.exit_code == 0
-    for sub in ("status", "heartbeat", "push"):
+    for sub in ("status", "heartbeat", "push", "link"):
         assert sub in result.output
 
 
@@ -221,6 +221,55 @@ def test_push_reports_rejection_as_failure(config_path, monkeypatch):
     assert result.exit_code != 0
     assert "rejected" in result.output
     assert "unknown_submission" in result.output
+
+
+# ── #2507: milestone ↔ portal submission linkage ────────────────────────────
+
+
+def test_link_reports_unlinked_by_default(config_path):
+    result = run("portal", "link", "--config", config_path, "coord", "3")
+    assert result.exit_code != 0
+    assert "not linked" in result.output
+
+
+def test_link_writes_then_reads_back(config_path):
+    write = run(
+        "portal", "link", "--config", config_path, "coord", "3", "sub_abc123"
+    )
+    assert write.exit_code == 0, write.output
+    assert "linked" in write.output
+    assert "sub_abc123" in write.output
+
+    read = run("portal", "link", "--config", config_path, "coord", "3")
+    assert read.exit_code == 0, read.output
+    assert "submission_id=sub_abc123" in read.output
+
+
+def test_link_relink_overwrites_not_appends(config_path):
+    run("portal", "link", "--config", config_path, "coord", "3", "sub_typo")
+    run("portal", "link", "--config", config_path, "coord", "3", "sub_fixed")
+
+    read = run("portal", "link", "--config", config_path, "coord", "3")
+    assert read.exit_code == 0, read.output
+    assert "submission_id=sub_fixed" in read.output
+    assert "sub_typo" not in read.output
+
+
+def test_link_is_scoped_to_milestone_number(config_path):
+    """Same repo, different milestone — distinct links, no cross-talk."""
+    run("portal", "link", "--config", config_path, "coord", "3", "sub_ms3")
+    run("portal", "link", "--config", config_path, "coord", "9", "sub_ms9")
+
+    ms3 = run("portal", "link", "--config", config_path, "coord", "3")
+    ms9 = run("portal", "link", "--config", config_path, "coord", "9")
+    assert "submission_id=sub_ms3" in ms3.output
+    assert "submission_id=sub_ms9" in ms9.output
+
+
+def test_link_rejects_unknown_repo(config_path):
+    result = run("portal", "link", "--config", config_path, "nope", "3", "sub_1")
+    assert result.exit_code != 0
+    assert "unknown repo" in result.output
 
 
 # ── #1982: the sync loop's operator surface ─────────────────────────────────
@@ -361,6 +410,8 @@ def thin_client(monkeypatch):
         ("portal", "sync"),
         ("portal", "outbox"),
         ("portal", "events"),
+        ("portal", "link", "coord", "3"),
+        ("portal", "link", "coord", "3", "sub_1"),
         ("portal", "enqueue-status", "sub_1", "shipped"),
         ("portal", "enqueue-design-round", "sub_1", "{}"),
         ("portal", "enqueue-preview", "sub_1", "https://pr-1.example.pages.dev"),
