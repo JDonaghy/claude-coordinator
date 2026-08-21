@@ -5074,9 +5074,9 @@ def _maybe_push_design_round(
         # the whole point of the fail-open posture (see docstring above).
         return None
 
-    from coord.mock_author import build_design_round, collect_mock_bundle_files  # noqa: PLC0415
+    from coord.mock_author import collect_mock_bundle_files  # noqa: PLC0415
     from coord.portal_bridge import PortalBridgeError, client_from_config  # noqa: PLC0415
-    from coord.portal_sync import PortalSyncError, enqueue_design_round  # noqa: PLC0415
+    from coord.portal_sync import PortalSyncError, push_design_round_bundle  # noqa: PLC0415
 
     client = client_from_config(portal_cfg)
     if client is None:
@@ -5099,18 +5099,16 @@ def _maybe_push_design_round(
         )
 
     try:
-        bundle_key = client.upload_bundle(link.submission_id, files)
+        bundle_key, row = push_design_round_bundle(
+            client,
+            link.submission_id,
+            files,
+            milestone_title=milestone.get("title") or f"ms-{milestone_number}",
+            tracking_issue_title=issue_data.get("title") or "",
+            tracking_issue_body=issue_data.get("body") or "",
+        )
     except PortalBridgeError as e:
         return MergeEvent(entry, "design_round_push_failed", f"bundle upload failed: {e}")
-
-    design_round = build_design_round(
-        milestone_title=milestone.get("title") or f"ms-{milestone_number}",
-        tracking_issue_title=issue_data.get("title") or "",
-        tracking_issue_body=issue_data.get("body") or "",
-        bundle_key=bundle_key,
-    )
-    try:
-        row = enqueue_design_round(link.submission_id, design_round)
     except PortalSyncError as e:
         return MergeEvent(entry, "design_round_push_failed", f"enqueue failed: {e}")
 

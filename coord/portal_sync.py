@@ -242,6 +242,67 @@ def enqueue_design_round(
     )
 
 
+def push_design_round_bundle(
+    client: Any,
+    submission_id: str,
+    files: dict[str, str],
+    *,
+    milestone_title: str,
+    tracking_issue_title: str,
+    tracking_issue_body: str,
+    round_number: int = 1,
+    now: float | None = None,
+) -> tuple[str, portal_store.OutboxRow]:
+    """Upload *files* as a design round bundle, then queue its D1 metadata.
+
+    The shared tail of the "publish a Gate-A mock bundle to the portal"
+    story — extracted (#2513/PDR-5) so the two callers that need it never
+    duplicate the upload → reshape → enqueue sequence:
+
+    * :mod:`coord.merge_queue`'s post-merge hook (PDR-3/#2508), which reads
+      *files* off a just-merged ``mock-author`` branch via GitHub's Contents
+      API (:func:`coord.mock_author.collect_mock_bundle_files`) and calls
+      this automatically, fail-open, the moment that branch lands.
+    * ``coord portal publish-mocks`` (PDR-5, :mod:`coord.commands.portal`),
+      which reads *files* straight off the operator's local checkout — no
+      merge required — and calls this on demand, fail-loud.
+
+    Only the *source* of ``files`` differs between the two; everything from
+    "here are the files" downstream — upload, build the design-round
+    payload, queue it — is identical, which is the whole point of not
+    duplicating it (the previous shape had this sequence inlined in
+    ``coord.merge_queue._maybe_push_design_round``).
+
+    Three steps, each able to fail independently — callers keep whatever
+    try/except shape they already had around the calls this replaces:
+
+    1. :meth:`coord.portal_bridge.PortalBridgeClient.upload_bundle` — raises
+       :class:`coord.portal_bridge.PortalBridgeError` on a transport/4xx/5xx
+       failure.
+    2. :func:`coord.mock_author.build_design_round` — reshapes the bundle
+       key + tracking-issue text into the D1 metadata payload; does not
+       raise (a malformed ``## Work order`` degrades to an empty
+       decomposition, per that function's own docstring).
+    3. :func:`enqueue_design_round` — raises :class:`PortalSyncError` for a
+       payload it refuses to queue.
+
+    Returns ``(bundle_key, row)`` — the R2 object key the portal assigned
+    the bundle, and the outbox row now queued for it.
+    """
+    from coord.mock_author import build_design_round  # noqa: PLC0415
+
+    bundle_key = client.upload_bundle(submission_id, files)
+    design_round = build_design_round(
+        milestone_title=milestone_title,
+        tracking_issue_title=tracking_issue_title,
+        tracking_issue_body=tracking_issue_body,
+        bundle_key=bundle_key,
+        round_number=round_number,
+    )
+    row = enqueue_design_round(submission_id, design_round, now=now)
+    return bundle_key, row
+
+
 def enqueue_preview(
     submission_id: str, preview_url: str, *, now: float | None = None
 ) -> portal_store.OutboxRow:

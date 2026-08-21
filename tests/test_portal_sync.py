@@ -1108,3 +1108,79 @@ class TestSignoffVerdict:
     def test_comment_defaults_to_empty_string(self):
         event = self._event("signoff.changes_requested")
         assert portal_sync._signoff_comment(event) == ""
+
+
+# ── #2513 (PDR-5): the shared upload+enqueue tail ───────────────────────────
+#
+# `push_design_round_bundle` is the sequence extracted out of
+# `coord.merge_queue._maybe_push_design_round` so PDR-3's merge-triggered
+# auto-push and PDR-5's on-demand `coord portal publish-mocks` both call the
+# SAME upload → build → enqueue steps rather than duplicating them. These
+# tests exercise the function directly, independent of either caller.
+
+
+class _UploadClient:
+    """A `PortalBridgeClient` stand-in that only needs `upload_bundle` —
+    `push_design_round_bundle` never calls `push`/`pull`/`heartbeat`."""
+
+    def __init__(self, bundle_key: str = "bundles/sub-001/r1.tar", error=None):
+        self.bundle_key = bundle_key
+        self.error = error
+        self.uploads: list[tuple[str, dict]] = []
+
+    def upload_bundle(self, submission_id: str, files: dict) -> str:
+        if self.error:
+            raise self.error
+        self.uploads.append((submission_id, dict(files)))
+        return self.bundle_key
+
+
+def test_push_design_round_bundle_uploads_then_enqueues():
+    client = _UploadClient(bundle_key="bundles/sub-001/r7.tar")
+    files = {"contract.md": "# contract", "mocks/index.html": "<html></html>"}
+
+    bundle_key, row = portal_sync.push_design_round_bundle(
+        client,
+        SUB,
+        files,
+        milestone_title="ms title",
+        tracking_issue_title="Q3 push",
+        tracking_issue_body="Ship it.",
+    )
+
+    assert bundle_key == "bundles/sub-001/r7.tar"
+    assert client.uploads == [(SUB, files)]
+    assert row.kind == portal_sync.KIND_DESIGN_ROUND
+    stored = portal_store.outbox_for_submission(SUB)
+    assert len(stored) == 1
+    assert stored[0].fields["design_round"]["bundle_key"] == "bundles/sub-001/r7.tar"
+    assert "Ship it." in stored[0].fields["design_round"]["outcome_definition"]
+
+
+def test_push_design_round_bundle_propagates_an_upload_failure():
+    client = _UploadClient(error=PortalBridgeError("401 unauthorized"))
+    with pytest.raises(PortalBridgeError):
+        portal_sync.push_design_round_bundle(
+            client,
+            SUB,
+            {"contract.md": "# contract"},
+            milestone_title="ms title",
+            tracking_issue_title="Q3 push",
+            tracking_issue_body="Ship it.",
+        )
+    # Nothing was queued — the enqueue step never ran.
+    assert portal_store.outbox_for_submission(SUB) == []
+
+
+def test_push_design_round_bundle_round_number_flows_through():
+    client = _UploadClient()
+    _, row = portal_sync.push_design_round_bundle(
+        client,
+        SUB,
+        {"contract.md": "# contract"},
+        milestone_title="ms title",
+        tracking_issue_title="Q3 push",
+        tracking_issue_body="Ship it.",
+        round_number=2,
+    )
+    assert row.fields["design_round"]["round"] == 2

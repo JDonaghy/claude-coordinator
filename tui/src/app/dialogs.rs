@@ -927,6 +927,28 @@ impl CoordApp {
                     "request-gate-a-changes",
                     "Request Gate A changes",
                 ));
+                // #2513 (PDR-5): "Publish mocks to portal" — on-demand
+                // counterpart to PDR-3's merge-triggered auto-push, for
+                // iterating on a local `--amend` before it's merged, or
+                // re-publishing after a manual edit, without a full PR
+                // round trip. Same "can't dispatch, so don't offer it"
+                // posture as the rest of this menu: disabled when there is
+                // nothing on THIS machine's local checkout to upload yet
+                // (`gate_a_mocks_dir_exists_for`, the mocks-dir sibling of
+                // `gate_a_contract_exists_for` right above it). A missing
+                // portal link (PDR-1, `coord portal link`) is not
+                // client-visible here — `coord portal publish-mocks`
+                // itself fails loud with that exact remedy rather than a
+                // silent no-op, so the item stays enabled and the CLI
+                // surfaces that failure as a toast via the usual path.
+                let mut publish_mocks_item = ContextMenuItem::action(
+                    "publish-mocks-to-portal",
+                    "Publish mocks to portal",
+                );
+                publish_mocks_item.disabled = !epic_issue
+                    .map(|iss| self.gate_a_mocks_dir_exists_for(iss))
+                    .unwrap_or(false);
+                items.push(publish_mocks_item);
             }
             // #1223 (was #1060, docs/ORACLE_LOOP.md, #931/#932): the
             // per-issue acceptance actions — JIT authoring of THIS issue's
@@ -6975,6 +6997,12 @@ impl CoordApp {
             // on Submit; Cancel/Esc drops it with no `coord gate-a` call.
             "request-gate-a-changes" => {
                 self.open_gate_a_changes_note_input();
+                true
+            }
+            // #2513 (PDR-5): on-demand "publish mocks to portal" —
+            // `coord portal publish-mocks <repo> <tracking_issue>`.
+            "publish-mocks-to-portal" => {
+                self.dispatch_publish_mocks_to_portal_for_selected_pipeline_row();
                 true
             }
             // #1060: JIT-author this issue's acceptance-suite slice —

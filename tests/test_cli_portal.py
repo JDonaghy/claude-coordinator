@@ -393,6 +393,193 @@ def test_requeue_reports_an_unknown_row_cleanly():
     assert "no outbox row" in result.output
 
 
+# ── #2513 (PDR-5): manual "publish mocks to portal" ─────────────────────────
+
+
+class _UploadResponse:
+    """Minimal `httpx.Response` stand-in for `/api/bridge/upload` — mirrors
+    `test_merge_queue.py`'s `_StubResponse`, needed here too since
+    `publish-mocks` drives a real `PortalBridgeClient` over `httpx.post`."""
+
+    def __init__(self, status_code=200, json_body=None, text="") -> None:
+        self.status_code = status_code
+        self._json_body = json_body
+        self.text = text or (str(json_body) if json_body is not None else "")
+
+    def json(self):
+        if self._json_body is None:
+            raise ValueError("no body")
+        return self._json_body
+
+
+def _stub_get_issue(*, milestone_number: int | None = 9, title="Q3 push", body="Ship it."):
+    def _get_issue(repo: str, number: int) -> dict:
+        milestone = (
+            {"number": milestone_number, "title": "ms title"}
+            if milestone_number is not None
+            else None
+        )
+        return {"title": title, "body": body, "milestone": milestone}
+
+    return _get_issue
+
+
+def _mock_bundle_dir(tmp_path, *, milestone_number: int = 9, with_index: bool = False):
+    """A local checkout at ``tmp_path/repo`` with a rendered Gate-A bundle
+    on disk — the shape `publish-mocks` reads directly, no `gh` involved."""
+    repo_dir = tmp_path / "repo"
+    ms_dir = repo_dir / "tests" / "acceptance" / f"ms-{milestone_number}"
+    ms_dir.mkdir(parents=True)
+    (ms_dir / "contract.md").write_text("# contract\n")
+    mocks_dir = ms_dir / "mocks"
+    mocks_dir.mkdir()
+    (mocks_dir / "screen.html").write_text("<html>screen</html>")
+    if with_index:
+        # #2512: a master index page, if it exists, rides along automatically
+        # — publish-mocks globs `mocks/*.html` rather than naming files.
+        (mocks_dir / "index.html").write_text("<html>index</html>")
+    return repo_dir
+
+
+def _config_with_repo_path(tmp_path, repo_dir) -> str:
+    path = tmp_path / "coordinator.yml"
+    path.write_text(textwrap.dedent(f"""
+        repos:
+          - name: coord
+            github: owner/coord
+        machines:
+          - name: dellserver
+            host: dellserver
+            repos: [coord]
+            repo_paths:
+              coord: {repo_dir}
+        portal:
+          enabled: true
+          base_url: https://intake.heurontech.com
+          bridge_client_id: id-123
+          bridge_client_secret: secret-456
+    """))
+    return str(path)
+
+
+def test_publish_mocks_is_registered():
+    result = run("portal", "--help")
+    assert result.exit_code == 0
+    assert "publish-mocks" in result.output
+
+
+def test_publish_mocks_refuses_when_disabled(disabled_config_path):
+    result = run(
+        "portal", "publish-mocks", "--config", disabled_config_path, "coord", "3"
+    )
+    assert result.exit_code != 0
+    assert "not enabled" in result.output
+
+
+def test_publish_mocks_rejects_unknown_repo(config_path):
+    result = run("portal", "publish-mocks", "--config", config_path, "nope", "3")
+    assert result.exit_code != 0
+    assert "unknown repo" in result.output
+
+
+def test_publish_mocks_errors_when_no_portal_link(config_path, monkeypatch):
+    """Unlike PDR-3's merge-triggered push (fail-open — a no-op), a manually
+    invoked command must say why it did nothing, naming the fix."""
+    monkeypatch.setattr("coord.github_ops.get_issue", _stub_get_issue())
+    result = run("portal", "publish-mocks", "--config", config_path, "coord", "3")
+    assert result.exit_code != 0
+    assert "coord portal link" in result.output
+
+
+def test_publish_mocks_errors_when_milestone_unresolved(config_path, monkeypatch):
+    monkeypatch.setattr(
+        "coord.github_ops.get_issue", _stub_get_issue(milestone_number=None)
+    )
+    result = run("portal", "publish-mocks", "--config", config_path, "coord", "3")
+    assert result.exit_code != 0
+    assert "not scoped to a milestone" in result.output
+
+
+def test_publish_mocks_errors_when_no_local_checkout(config_path, monkeypatch):
+    from coord import portal_store
+
+    portal_store.link_milestone(
+        repo_name="coord", milestone_number=9, submission_id="sub_1"
+    )
+    monkeypatch.setattr("coord.github_ops.get_issue", _stub_get_issue())
+    result = run("portal", "publish-mocks", "--config", config_path, "coord", "3")
+    assert result.exit_code != 0
+    assert "no local repo checkout" in result.output
+
+
+def test_publish_mocks_errors_when_bundle_is_empty(tmp_path, monkeypatch):
+    from coord import portal_store
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    cfg_path = _config_with_repo_path(tmp_path, repo_dir)
+    portal_store.link_milestone(
+        repo_name="coord", milestone_number=9, submission_id="sub_1"
+    )
+    monkeypatch.setattr("coord.github_ops.get_issue", _stub_get_issue())
+
+    result = run("portal", "publish-mocks", "--config", cfg_path, "coord", "3")
+    assert result.exit_code != 0
+    assert "nothing to publish" in result.output
+
+
+def test_publish_mocks_uploads_and_enqueues(tmp_path, monkeypatch):
+    from coord import portal_store
+
+    repo_dir = _mock_bundle_dir(tmp_path, milestone_number=9, with_index=True)
+    cfg_path = _config_with_repo_path(tmp_path, repo_dir)
+    portal_store.link_milestone(
+        repo_name="coord", milestone_number=9, submission_id="sub_1"
+    )
+    monkeypatch.setattr("coord.github_ops.get_issue", _stub_get_issue())
+
+    seen_upload: dict = {}
+
+    def _post(url, json=None, headers=None, timeout=None):
+        seen_upload["url"] = url
+        seen_upload["files"] = (json or {}).get("files")
+        return _UploadResponse(200, {"bundle_key": "bundles/sub_1/r1.tar"})
+
+    monkeypatch.setattr("httpx.post", _post)
+
+    result = run("portal", "publish-mocks", "--config", cfg_path, "coord", "3")
+    assert result.exit_code == 0, result.output
+    assert "published" in result.output
+    assert "sub_1" in result.output
+    assert seen_upload["url"] == "https://intake.heurontech.com/api/bridge/upload"
+    assert set(seen_upload["files"]) == {
+        "contract.md", "mocks/screen.html", "mocks/index.html",
+    }
+
+    rows = portal_store.outbox_for_submission("sub_1")
+    assert len(rows) == 1
+    assert rows[0].kind == "design_round"
+    assert rows[0].fields["design_round"]["bundle_key"] == "bundles/sub_1/r1.tar"
+
+
+def test_publish_mocks_reports_upload_failure(tmp_path, monkeypatch):
+    from coord import portal_store
+
+    repo_dir = _mock_bundle_dir(tmp_path)
+    cfg_path = _config_with_repo_path(tmp_path, repo_dir)
+    portal_store.link_milestone(
+        repo_name="coord", milestone_number=9, submission_id="sub_1"
+    )
+    monkeypatch.setattr("coord.github_ops.get_issue", _stub_get_issue())
+    monkeypatch.setattr(
+        "httpx.post", lambda *a, **k: _UploadResponse(401, {}, text="unauthorized")
+    )
+
+    result = run("portal", "publish-mocks", "--config", cfg_path, "coord", "3")
+    assert result.exit_code != 0
+    assert "upload failed" in result.output
+
+
 # ── #2336: state-touching commands refuse to run on a thin client ──────────
 
 
@@ -417,6 +604,7 @@ def thin_client(monkeypatch):
         ("portal", "enqueue-preview", "sub_1", "https://pr-1.example.pages.dev"),
         ("portal", "enqueue-question", "sub_1", "why?"),
         ("portal", "requeue", "sub_1", "1"),
+        ("portal", "publish-mocks", "coord", "3"),
     ],
 )
 def test_state_touching_commands_refuse_on_a_thin_client(thin_client, args):

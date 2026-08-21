@@ -4134,6 +4134,62 @@ impl CoordApp {
         }
     }
 
+    /// #2513 (PDR-5): dispatch `coord portal publish-mocks <repo>
+    /// <tracking_issue>` for the selected epic/tracking-issue Pipeline
+    /// row — the on-demand counterpart to PDR-3's merge-triggered
+    /// auto-push: publish whatever mock bundle is on THIS machine's local
+    /// checkout right now, no merge required (iterating on a local
+    /// `--amend`, or re-publishing after a manual edit). Same
+    /// headless-subprocess-spawn shape as
+    /// `dispatch_gate_a_mock_for_selected_pipeline_row` right above — a
+    /// normal (non-interactive) `claude`-free CLI invocation, not a live
+    /// tmux session. The CLI's own validation (portal link exists, local
+    /// mock bundle exists) surfaces failures via the command runner's
+    /// usual toast path.
+    pub(crate) fn dispatch_publish_mocks_to_portal_for_selected_pipeline_row(&mut self) -> bool {
+        let Some(idx) = self.pipeline_sel else {
+            return false;
+        };
+        let Some(issue) = self.pipeline_issues.get(idx).cloned() else {
+            return false;
+        };
+        let Some(repo) = issue.coord_repo.clone() else {
+            self.push_toast(
+                "Publish mocks to portal",
+                "No local repo mapping for this issue — cannot dispatch.",
+                ToastSeverity::Warning,
+            );
+            return false;
+        };
+        let cmd_strs: Vec<String> = vec![
+            "portal".to_string(),
+            "publish-mocks".to_string(),
+            repo,
+            issue.number.to_string(),
+        ];
+        let cmd_refs: Vec<&str> = cmd_strs.iter().map(|s| s.as_str()).collect();
+        use crate::commands::SpawnQueuedOutcome;
+        match self.command_runner.spawn_queued(&cmd_refs) {
+            SpawnQueuedOutcome::Started => {
+                self.push_toast(
+                    "Publishing mocks to portal",
+                    &format!("coord {}", cmd_strs.join(" ")),
+                    ToastSeverity::Info,
+                );
+                true
+            }
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast(
+                    "⏳ Queued",
+                    "Publish mocks to portal runs after current command",
+                    ToastSeverity::Info,
+                );
+                true
+            }
+            SpawnQueuedOutcome::Deduped => false,
+        }
+    }
+
     /// #2063: record the human Gate-A verdict for the selected epic row —
     /// `coord gate-a --approved|--changes <repo> <tracking_issue>`.
     ///
@@ -4313,6 +4369,37 @@ impl CoordApp {
             .join(format!("ms-{}", milestone_number))
             .join("contract.md")
             .is_file()
+    }
+
+    /// #2513 (PDR-5): local-filesystem check — whether
+    /// `tests/acceptance/ms-NN/mocks/` exists and has at least one rendered
+    /// file in the issue's local checkout, where NN is the issue's
+    /// milestone number (via `pipeline_issue_milestone`). Same shape as
+    /// `gate_a_contract_exists_for` right above (#2501's "can't dispatch,
+    /// so don't offer it" posture), checking the mocks directory instead of
+    /// `contract.md` — gates "Publish mocks to portal": there is nothing on
+    /// disk to upload before Gate A has rendered at least one mock.
+    /// Conservatively `false` when the issue has no resolvable milestone or
+    /// no local checkout path is known.
+    pub(crate) fn gate_a_mocks_dir_exists_for(&self, issue: &PipelineIssue) -> bool {
+        let Some((milestone_number, _)) = self.pipeline_issue_milestone(issue) else {
+            return false;
+        };
+        let Some(repo) = issue.coord_repo.as_deref() else {
+            return false;
+        };
+        let Some(local_path) = self.data.pipeline_repo_paths.get(repo) else {
+            return false;
+        };
+        let mocks_dir = std::path::Path::new(local_path.as_str())
+            .join("tests")
+            .join("acceptance")
+            .join(format!("ms-{}", milestone_number))
+            .join("mocks");
+        mocks_dir
+            .read_dir()
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false)
     }
 
     /// #1174: resolve `(issue, repo, tracking_issue, for_path)` for the
