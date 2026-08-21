@@ -656,6 +656,66 @@ enum LocalPullOutcome {
     Failed(String),
 }
 
+/// #2501 review: how long [`pull_default_branch_ff_only`]'s `git fetch`
+/// step is allowed to run before it's killed and reported as a `Failed`
+/// outcome. A local fetch against these repos is sub-second, so this is
+/// generous slack for a slow-but-honest remote, not a target latency — it
+/// exists purely to cap the worst case (a remote peer that accepts the TCP
+/// connection and then silently drops packets) well short of the
+/// OS-level connect/read timeouts, which run into minutes.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Run `program <args>` in `current_dir`, killing it and returning an error
+/// if it hasn't exited within `timeout`. Generic over `program` (rather than
+/// hardcoding `git`) purely so the timeout/kill machinery itself is
+/// unit-testable against a synthetic long-running command without needing a
+/// real git remote that can be made to hang on demand.
+///
+/// Polls [`std::process::Child::try_wait`] rather than blocking on `.wait()`
+/// or `.output()` — those have no built-in deadline, which is the whole
+/// problem this exists to solve. stdin is nulled (matching every other
+/// subprocess call in this module) so nothing here can block on a prompt.
+fn run_command_with_timeout(
+    program: &str,
+    current_dir: &std::path::Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(program)
+        .current_dir(current_dir)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not launch {program}: {e}"))?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    // Best-effort: reap after kill so we don't leak a zombie,
+                    // but don't let a stuck kill/wait itself hang this call —
+                    // both are already non-blocking-ish (kill just signals;
+                    // wait on an already-killed child returns promptly).
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("timed out after {timeout:?}"));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(format!("wait failed: {e}")),
+        }
+    }
+    child
+        .wait_with_output()
+        .map_err(|e| format!("could not read output: {e}"))
+}
+
 /// #2501: fetch `origin` and fast-forward the local checkout at `repo_dir`
 /// onto the remote's default branch.
 ///
@@ -664,7 +724,13 @@ enum LocalPullOutcome {
 /// itself (`app/mod.rs`), out of scope for this fix. This is a rare,
 /// explicit user click — not a per-tick operation — and a local `git fetch`
 /// against these repos is sub-second, so a brief block is an acceptable
-/// trade against the scope this change stays within.
+/// trade against the scope this change stays within. The one step that
+/// actually talks to the network (`fetch`) is bounded by
+/// [`FETCH_TIMEOUT`] regardless: `stdin(Stdio::null())` already makes an
+/// *auth* failure fail fast, but a remote that accepts the TCP connection
+/// and then silently drops packets is not an auth failure — that class of
+/// hang can otherwise block the whole TUI for OS-timeout-scale minutes, not
+/// "briefly".
 ///
 /// Sequence, each step aborting before the next on failure:
 /// 1. `git status --porcelain` — any output at all means a dirty working
@@ -673,6 +739,7 @@ enum LocalPullOutcome {
 ///    or any other resolution failure).
 /// 3. `git fetch origin <branch>` — safe regardless of working-tree state;
 ///    updates `refs/remotes/origin/<branch>` via the default clone refspec.
+///    Killed and reported as `Failed` if it runs past [`FETCH_TIMEOUT`].
 /// 4. Resolve the remote's default branch via
 ///    `refs/remotes/origin/HEAD` (running `git remote set-head origin
 ///    --auto` once, if that ref isn't set yet, to populate it from what was
@@ -728,10 +795,16 @@ fn pull_default_branch_ff_only(repo_dir: &std::path::Path) -> LocalPullOutcome {
         return LocalPullOutcome::Failed("checkout has no branch checked out (detached HEAD)".to_string());
     }
 
-    // 3. Fetch — safe regardless of working-tree state.
-    let fetch = match run(repo_dir, &["fetch", "origin", &branch]) {
+    // 3. Fetch — safe regardless of working-tree state. Bounded, unlike the
+    //    other steps here: this is the one that talks to the network.
+    let fetch = match run_command_with_timeout(
+        "git",
+        repo_dir,
+        &["fetch", "origin", &branch],
+        FETCH_TIMEOUT,
+    ) {
         Ok(out) => out,
-        Err(e) => return LocalPullOutcome::Failed(e),
+        Err(e) => return LocalPullOutcome::Failed(format!("git fetch origin {branch}: {e}")),
     };
     if !fetch.status.success() {
         return LocalPullOutcome::Failed(first_reason(&fetch, "git fetch origin failed"));
@@ -788,13 +861,17 @@ fn resolve_remote_default_branch(repo_dir: &std::path::Path) -> Option<String> {
     short.strip_prefix("origin/").map(|s| s.to_string())
 }
 
-/// #2501: fire-and-forget open of a local filesystem path in the OS's
-/// default browser — the `file://` counterpart to
-/// `dispatch_open_pr_for_selected_pipeline_row`'s `gh pr view --web`. `gh`
-/// handles cross-platform opening for the PR case; there's no `gh`
-/// equivalent for a bare local path, so this shells out to the OS opener
-/// directly. Same "don't care about exit code" posture — the user sees the
-/// browser open, not a coord-tui status.
+/// #2501: fire-and-forget open of a local filesystem path via a `file://`
+/// URL handed to the OS's default opener for that URL — the `file://`
+/// counterpart to `dispatch_open_pr_for_selected_pipeline_row`'s `gh pr view
+/// --web`. `gh` handles cross-platform opening for the PR case; there's no
+/// `gh` equivalent for a bare local path, so this shells out to the OS
+/// opener directly. For an `.html` file that opener is the default browser
+/// (the MIME association); for a bare directory (the pre-index.html
+/// fallback — see the call site's comment) it's typically the file manager
+/// instead, since directories aren't browser-associated. Same "don't care
+/// about exit code" posture either way — the user sees the OS opener react,
+/// not a coord-tui status.
 fn open_local_path_in_browser(path: &std::path::Path) {
     let url = format!("file://{}", percent_encode_file_url_path(path));
     #[cfg(target_os = "macos")]
@@ -817,14 +894,54 @@ fn open_local_path_in_browser(path: &std::path::Path) {
 
 /// #2501: minimal percent-encoding for a filesystem path used in a
 /// `file://` URL — escapes everything outside the URL-safe unreserved set
-/// (preserving `/` as the path separator) so a mocks directory containing
-/// spaces or other punctuation still opens correctly.
+/// (preserving `/` as the path separator and `:` for a Windows drive
+/// letter) so a mocks directory containing spaces or other punctuation
+/// still opens correctly.
 fn percent_encode_file_url_path(path: &std::path::Path) -> String {
-    let s = path.to_string_lossy();
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
+    percent_encode_file_url_path_str(&path.to_string_lossy())
+}
+
+/// Pure string transform backing [`percent_encode_file_url_path`]. Split out
+/// so the Windows drive-letter handling below is testable with literal
+/// `C:\...`-style strings regardless of which OS runs the test suite — a
+/// `PathBuf` built from such a string on Linux keeps the backslashes as
+/// ordinary (valid, if unusual) filename characters rather than parsing them
+/// as separators the way `std::path` would on an actual Windows host, so
+/// operating on the string form directly is what makes this reachable at
+/// all outside CI's one Windows leg.
+///
+/// #2501 review: `open_local_path_in_browser` has a
+/// `#[cfg(target_os = "windows")]` branch, so Windows support was clearly
+/// intended, but without this a path like `C:\Users\john\mocks` produced
+/// `file://C%3A%5CUsers%5Cjohn%5Cmocks` — the drive-letter colon and every
+/// backslash percent-encoded rather than converted, which is not a file URL
+/// any opener recognises. `file:///C:/Users/john/mocks` (forward slashes,
+/// unescaped drive-letter colon, and a leading `/` before the drive letter —
+/// the third slash after `file://`) is the form RFC 8089 / real browsers
+/// expect.
+fn percent_encode_file_url_path_str(s: &str) -> String {
+    // A Windows absolute path always starts `<letter>:` followed by `\`,
+    // `/`, or end-of-string (bare drive root, e.g. `C:`). Detected on the
+    // string alone — not `Path::is_absolute()`, which is itself
+    // Windows-vs-Unix ambiguous for exactly this string on the "wrong" host.
+    let is_windows_drive_path = s.len() >= 2
+        && s.as_bytes()[0].is_ascii_alphabetic()
+        && s.as_bytes()[1] == b':'
+        && matches!(s.as_bytes().get(2), None | Some(b'\\') | Some(b'/'));
+    let normalized = if is_windows_drive_path {
+        // Backslash -> forward slash ONLY on this identified-Windows path;
+        // a bare Unix path keeps literal backslashes untouched (they're a
+        // valid, if rare, filename character there and must not be
+        // rewritten). Leading `/` supplies the third slash of
+        // `file:///C:/...` once the caller prepends the `file://` scheme.
+        format!("/{}", s.replace('\\', "/"))
+    } else {
+        s.to_string()
+    };
+    let mut out = String::with_capacity(normalized.len());
+    for b in normalized.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' | b':' => {
                 out.push(b as char);
             }
             _ => out.push_str(&format!("%{:02X}", b)),
@@ -4712,10 +4829,17 @@ impl CoordApp {
                 return false;
             }
             LocalPullOutcome::Diverged => {
+                // #2501 review: `Diverged` fires on ANY `git merge --ff-only`
+                // failure, not only a genuine divergence (a rarer
+                // merge-time error can hit this path too) — the abort
+                // behaviour is correct either way (never merges), but say
+                // "usually" rather than asserting divergence outright so
+                // the wording stays honest in that rarer case.
                 self.push_toast(
                     title,
-                    "Local checkout has diverged from the remote default \
-                     branch — sort out the checkout yourself, then retry \
+                    "Local checkout could not be fast-forwarded onto the \
+                     remote default branch (usually because it has \
+                     diverged) — sort out the checkout yourself, then retry \
                      (never force-pulling).",
                     ToastSeverity::Warning,
                 );
@@ -9932,5 +10056,156 @@ impl CoordApp {
         // tree has no selection (filtered-out target) or the row is already
         // visible.
         self.scroll_pipeline_selection_into_view();
+    }
+}
+
+// ─── `run_command_with_timeout` (#2501 review) ─────────────────────────────
+//
+// Exercises the generic timeout/kill machinery directly, against a synthetic
+// long-running command, rather than a real (and un-hangable-on-demand) git
+// remote — see the function's own doc comment for why it's generic over
+// `program` in the first place.
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    /// A shell one-liner that sleeps for `secs` — the stand-in for a remote
+    /// that accepts the connection and then never answers.
+    fn sleep_cmd(secs: u64) -> (&'static str, Vec<String>) {
+        ("sh", vec!["-c".to_string(), format!("sleep {secs}")])
+    }
+
+    #[test]
+    fn returns_output_when_the_command_finishes_within_the_deadline() {
+        let out = run_command_with_timeout(
+            "sh",
+            std::path::Path::new("."),
+            &["-c", "echo hello"],
+            Duration::from_secs(5),
+        )
+        .expect("a fast command must not be treated as a timeout");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hello");
+    }
+
+    #[test]
+    fn kills_and_reports_timeout_when_the_command_outlives_the_deadline() {
+        let (program, args) = sleep_cmd(30);
+        let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+        let started = Instant::now();
+        let result = run_command_with_timeout(
+            program,
+            std::path::Path::new("."),
+            &args_ref,
+            Duration::from_millis(150),
+        );
+        let elapsed = started.elapsed();
+        let err = result.expect_err("a 30s sleep must not be allowed to finish");
+        assert!(
+            err.contains("timed out"),
+            "expected a timeout error, got: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the sleeping child must actually be killed, not just given up on \
+             while it keeps running in the background; took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn reports_spawn_failure_for_a_nonexistent_program() {
+        let err = run_command_with_timeout(
+            "coord-tui-test-definitely-not-a-real-binary-2501",
+            std::path::Path::new("."),
+            &[],
+            Duration::from_secs(5),
+        )
+        .expect_err("a nonexistent program cannot spawn");
+        assert!(
+            err.contains("could not launch"),
+            "expected a launch-failure reason, got: {err}"
+        );
+    }
+}
+
+// ─── `percent_encode_file_url_path_str` (#2501 review) ─────────────────────
+//
+// Operates on literal strings rather than a real `PathBuf`, so the Windows
+// drive-letter branch is reachable from every host OS this suite runs on —
+// see the function's own doc comment for why.
+#[cfg(test)]
+mod file_url_tests {
+    use super::*;
+
+    #[test]
+    fn unix_absolute_path_is_unchanged_but_encoded() {
+        let out = percent_encode_file_url_path_str("/home/john/mocks dir");
+        assert_eq!(out, "/home/john/mocks%20dir");
+    }
+
+    #[test]
+    fn windows_backslash_drive_path_becomes_canonical_file_url_form() {
+        let out = percent_encode_file_url_path_str(r"C:\Users\john\mocks");
+        assert_eq!(
+            out, "/C:/Users/john/mocks",
+            "must produce the RFC 8089 form (leading slash, forward \
+             slashes, unescaped drive-letter colon) so `file://` + this is \
+             a URL an opener recognises"
+        );
+    }
+
+    #[test]
+    fn windows_forward_slash_drive_path_still_gets_the_leading_slash() {
+        // Already-forward-slash Windows paths (e.g. from a path built with
+        // `/` throughout) still need the leading `/` before the drive
+        // letter — `file://C:/...` (two slashes) is not the same URL as
+        // `file:///C:/...` (three).
+        let out = percent_encode_file_url_path_str("C:/Users/john/mocks");
+        assert_eq!(out, "/C:/Users/john/mocks");
+    }
+
+    #[test]
+    fn bare_drive_root_is_recognised_as_a_windows_path() {
+        let out = percent_encode_file_url_path_str(r"C:\");
+        assert_eq!(out, "/C:/");
+    }
+
+    #[test]
+    fn windows_path_with_spaces_is_still_percent_encoded() {
+        let out = percent_encode_file_url_path_str(r"C:\Users\john\Gate A mocks");
+        assert_eq!(out, "/C:/Users/john/Gate%20A%20mocks");
+    }
+
+    #[test]
+    fn a_lone_drive_letter_and_colon_with_no_third_char_counts_as_windows() {
+        // `C:` alone (len 2) — the drive-relative-root edge case explicitly
+        // covered by `s.as_bytes().get(2) == None`.
+        let out = percent_encode_file_url_path_str("C:");
+        assert_eq!(out, "/C:");
+    }
+
+    #[test]
+    fn a_unix_path_that_merely_contains_a_colon_is_not_mistaken_for_a_drive_path() {
+        // `bin:extra` at the START of the string could only be a Windows
+        // drive path if the first character were a single ASCII letter —
+        // here it's a multi-character segment, so this must NOT be treated
+        // as `<letter>:` and must NOT gain a leading slash or have its
+        // (already valid on Unix) colon touched differently than before.
+        let out = percent_encode_file_url_path_str("bin:extra/thing");
+        assert_eq!(out, "bin:extra/thing", "no spurious leading slash or rewriting");
+    }
+
+    #[test]
+    fn a_relative_looking_two_char_prefix_without_letter_first_is_not_a_drive_path() {
+        // Starts with a digit, not a letter — must not match the Windows
+        // drive-path heuristic even though byte[1] is `:`.
+        let out = percent_encode_file_url_path_str("1:\\notadrive");
+        assert_eq!(
+            out, "1:%5Cnotadrive",
+            "non-letter-prefixed `X:` must not gain the drive-path leading \
+             slash or backslash-to-slash rewrite (the literal backslash is \
+             still percent-encoded; `:` is unescaped everywhere, drive path \
+             or not — see the function doc comment)"
+        );
     }
 }

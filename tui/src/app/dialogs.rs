@@ -909,8 +909,19 @@ impl CoordApp {
                 // pulls the local checkout's default branch (never forcing,
                 // never touching a dirty tree — see
                 // `pull_default_branch_ff_only`) and then opens
-                // tests/acceptance/ms-NN/mocks/ from disk in the OS's
-                // default browser, where `.html` actually renders.
+                // tests/acceptance/ms-NN/mocks/index.html from disk via a
+                // `file://` URL — a `.html` file IS MIME-associated with the
+                // OS's default browser, so this reliably renders there.
+                // #2512 amendment: until `mocks/index.html` exists (older
+                // checkouts, or a mock-author run predating #2512), this
+                // falls back to opening the raw `mocks/` DIRECTORY instead —
+                // a directory has no such MIME association, so on most
+                // desktops that `file://` URL opens in the OS's file
+                // manager, not the browser; the operator is one extra click
+                // (pick an `.html` file) from the rendered mock, not looking
+                // at it directly. Interim and acceptable per that amendment,
+                // but worth being precise about here rather than implying
+                // both paths land in the browser equally.
                 items.push(ContextMenuItem::action(
                     "dispatch-gate-a-mock",
                     "Dispatch Gate A mock",

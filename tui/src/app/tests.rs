@@ -3474,6 +3474,116 @@
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// #2501 review (test-coverage gap): `WrongBranch` had an implemented,
+    /// toasted branch in `pull_default_branch_ff_only` but no dedicated
+    /// test — only `Dirty`/`Diverged`/success were covered. A checkout with
+    /// something other than the remote's default branch checked out (e.g.
+    /// an operator mid-review on a feature branch) must abort rather than
+    /// merge into or switch off of the "wrong" branch on their behalf.
+    #[test]
+    fn view_gate_a_mock_local_action_aborts_with_toast_on_wrong_branch_checked_out() {
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let root = std::env::temp_dir().join(format!("coord-tui-test-gate-a-pull-wrongbranch-{}", tid));
+        let _ = std::fs::remove_dir_all(&root);
+        let (_origin, local) = init_test_origin_and_local_clone(&root);
+
+        // Clean checkout, but on a branch other than the remote's default
+        // ("main") — e.g. an operator with a feature branch checked out
+        // while reviewing something else. Pushed to origin too (step 3,
+        // `git fetch origin <branch>`, fetches the CURRENT branch by name —
+        // an unpushed local-only branch would fail at the fetch step with
+        // "couldn't find remote ref" instead of ever reaching the
+        // wrong-branch check this test targets).
+        test_git(&local, &["checkout", "-qb", "some-feature-branch"]);
+        test_git(&local, &["push", "-q", "-u", "origin", "some-feature-branch"]);
+
+        let mut app = make_pipeline_app_for_local_mock_menu_test(0, local.to_str().unwrap());
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(751),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::New,
+        };
+        let toasts_before = app.toasts.len();
+        let handled = app.dispatch_context_menu_action("view-gate-a-mock-local", &target);
+        assert!(handled, "view-gate-a-mock-local must be a recognised action");
+        assert!(
+            app.toasts.len() > toasts_before,
+            "a checkout on the wrong branch must toast a warning rather than silently no-op"
+        );
+        let toast_body = app.toasts.last().unwrap().0.body.to_lowercase();
+        assert!(
+            toast_body.contains("some-feature-branch"),
+            "toast should name the branch actually checked out, got: {toast_body:?}",
+        );
+        assert!(
+            toast_body.contains("default branch"),
+            "toast should explain the wrong-branch reason, got: {toast_body:?}",
+        );
+        assert_eq!(
+            String::from_utf8_lossy(
+                &std::process::Command::new("git")
+                    .current_dir(&local)
+                    .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                    .output()
+                    .unwrap()
+                    .stdout
+            )
+            .trim(),
+            "some-feature-branch",
+            "must never switch branches on the operator's behalf"
+        );
+        assert!(
+            !local.join("tests").join("acceptance").join("ms-9").join("mocks").exists(),
+            "no pull must have happened, so no mocks dir can have appeared"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #2501 review (test-coverage gap): `Failed` had an implemented,
+    /// toasted branch but no dedicated test either. Drive it via the most
+    /// realistic real-world trigger — a checkout whose `origin` remote is
+    /// gone (moved/renamed/deleted upstream) — rather than reaching into
+    /// `pull_default_branch_ff_only` directly (it's a private helper with
+    /// no test-only seam, same posture as `Dirty`/`WrongBranch`/`Diverged`
+    /// above: exercised through the real dispatch + real git only).
+    #[test]
+    fn view_gate_a_mock_local_action_aborts_with_toast_on_git_failure() {
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let root = std::env::temp_dir().join(format!("coord-tui-test-gate-a-pull-failed-{}", tid));
+        let _ = std::fs::remove_dir_all(&root);
+        let (_origin, local) = init_test_origin_and_local_clone(&root);
+
+        // No dirty tree, correct branch checked out — but `git fetch
+        // origin` itself fails because the remote no longer exists.
+        test_git(&local, &["remote", "remove", "origin"]);
+
+        let mut app = make_pipeline_app_for_local_mock_menu_test(0, local.to_str().unwrap());
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(751),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::New,
+        };
+        let toasts_before = app.toasts.len();
+        let handled = app.dispatch_context_menu_action("view-gate-a-mock-local", &target);
+        assert!(handled, "view-gate-a-mock-local must be a recognised action");
+        assert!(
+            app.toasts.len() > toasts_before,
+            "a git failure must toast a warning rather than silently no-op"
+        );
+        let toast_body = app.toasts.last().unwrap().0.body.to_lowercase();
+        assert!(
+            toast_body.contains("git pull failed") || toast_body.contains("git fetch"),
+            "toast should explain this was a git failure, got: {toast_body:?}",
+        );
+        assert!(
+            !local.join("tests").join("acceptance").join("ms-9").join("mocks").exists(),
+            "no pull must have happened, so no mocks dir can have appeared"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn completed_work_aid_for_recognizes_mock_author_type() {
         // #1059: Gate A's mock-author (#930) dispatches through the same
