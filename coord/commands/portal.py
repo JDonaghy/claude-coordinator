@@ -284,6 +284,158 @@ def portal_link(
     )
 
 
+# ── #2513 (PDR-5): manual "publish mocks to portal" ─────────────────────────
+
+
+@portal_group.command("publish-mocks")
+@_CONFIG_OPTION
+@click.argument("repo")
+@click.argument("tracking_issue", type=int)
+def portal_publish_mocks(config_path, repo: str, tracking_issue: int) -> None:
+    """Publish REPO's local Gate-A mock bundle for TRACKING_ISSUE's milestone now.
+
+    The on-demand counterpart to PDR-3's merge-triggered auto-push
+    (``coord.merge_queue._maybe_push_design_round``): that path only fires
+    once a `type="mock-author"` PR actually merges, which leaves a real gap
+    for iterating on a local ``coord acceptance mock ... --amend`` before
+    it's merged, or re-publishing after a manual edit. This uploads whatever
+    is currently on THIS machine's local checkout under
+    ``tests/acceptance/ms-NN/`` — ``contract.md`` plus every ``mocks/*.html``
+    fixture, uncommitted changes included — no merge required. That's the
+    whole point of "on demand".
+
+    Reuses PDR-3's shared upload+enqueue helper
+    (:func:`coord.portal_sync.push_design_round_bundle`) as-is — only where
+    the files come from differs.
+
+    Unlike the merge-triggered path (which fails OPEN: no portal link on
+    file for the milestone is silently "nothing to do yet, run `coord portal
+    link`"), this is an operator-invoked command and fails LOUD — a missing
+    link, missing portal config, or an empty local mock bundle is a clear
+    error naming the fix, never a silent no-op.
+    """
+    _refuse_if_thin_client("publish-mocks")
+
+    cfg = _load_config(config_path)
+    repo_cfg = cfg.repo(repo)
+    if repo_cfg is None:
+        click.secho(f"error: unknown repo {repo!r}", fg="red")
+        raise SystemExit(2)
+    client = client_from_config(cfg.portal)
+    if client is None:
+        click.secho(
+            "portal is not enabled — nothing to do (see `coord portal status`)",
+            fg="yellow",
+        )
+        raise SystemExit(1)
+
+    from coord import github_ops, portal_store  # noqa: PLC0415
+    from coord.portal_sync import PortalSyncError, push_design_round_bundle  # noqa: PLC0415
+    from coord.test_orchestrator import find_local_repo_path  # noqa: PLC0415
+
+    try:
+        issue_data = github_ops.get_issue(repo_cfg.github, tracking_issue)
+    except Exception as exc:  # noqa: BLE001 — surface as a clear CLI error, not a traceback
+        click.secho(f"could not fetch tracking issue #{tracking_issue}: {exc}", fg="red")
+        raise SystemExit(1) from exc
+
+    milestone = (issue_data or {}).get("milestone") or {}
+    milestone_number = milestone.get("number")
+    if milestone_number is None:
+        click.secho(
+            f"#{tracking_issue} is not scoped to a milestone — nothing to publish",
+            fg="red",
+        )
+        raise SystemExit(1)
+
+    link = portal_store.get_milestone_link(
+        repo_name=repo_cfg.name, milestone_number=milestone_number
+    )
+    if link is None:
+        click.secho(
+            f"{repo_cfg.name} ms-{milestone_number} has no portal submission linked — "
+            f"run `coord portal link {repo_cfg.name} {milestone_number} <submission_id>` "
+            "first",
+            fg="red",
+        )
+        raise SystemExit(1)
+
+    repo_dir = find_local_repo_path(repo_cfg.name, cfg)
+    if repo_dir is None or not repo_dir.exists():
+        click.secho(
+            f"no local repo checkout found for {repo_cfg.name!r} on this machine "
+            "(repo_paths in coordinator.yml)",
+            fg="red",
+        )
+        raise SystemExit(1)
+
+    files = _collect_local_mock_bundle_files(repo_dir, milestone_number)
+    if not files:
+        click.secho(
+            f"no mock bundle found under {repo_dir}/tests/acceptance/"
+            f"ms-{milestone_number}/ — nothing to publish",
+            fg="red",
+        )
+        raise SystemExit(1)
+
+    try:
+        bundle_key, row = push_design_round_bundle(
+            client,
+            link.submission_id,
+            files,
+            milestone_title=milestone.get("title") or f"ms-{milestone_number}",
+            tracking_issue_title=issue_data.get("title") or "",
+            tracking_issue_body=issue_data.get("body") or "",
+        )
+    except PortalBridgeError as exc:
+        click.secho(f"bundle upload failed: {exc}", fg="red")
+        raise SystemExit(1) from exc
+    except PortalSyncError as exc:
+        click.secho(f"enqueue failed: {exc}", fg="red")
+        raise SystemExit(1) from exc
+
+    click.secho(
+        f"published: {repo_cfg.name} ms-{milestone_number} -> "
+        f"submission {link.submission_id} (seq={row.seq}, bundle_key={bundle_key}, "
+        f"{len(files)} file(s): {', '.join(sorted(files))})",
+        fg="green",
+    )
+
+
+def _collect_local_mock_bundle_files(repo_dir, milestone_number: int) -> dict:
+    """Read a rendered Gate-A bundle off the LOCAL checkout at *repo_dir*.
+
+    PDR-5's on-demand counterpart to
+    :func:`coord.mock_author.collect_mock_bundle_files`, which reads a
+    *merged* branch off GitHub's Contents API — this reads whatever is
+    currently on disk, uncommitted changes included.
+
+    Same ``{relative_path: content}`` shape: ``"contract.md"`` plus every
+    ``mocks/*.html`` fixture — which, if #2512 (master index page) has
+    landed, automatically picks up ``mocks/index.html`` too, since this
+    globs everything under ``mocks/`` rather than naming files. Empty when
+    the ``ms-NN`` acceptance directory doesn't exist locally at all —
+    callers treat that as an error (unlike the merge-triggered path's
+    "nothing to push", this command is operator-invoked and should say why
+    it did nothing rather than no-op quietly).
+    """
+    from pathlib import Path  # noqa: PLC0415
+
+    from coord.acceptance import ms_dirname  # noqa: PLC0415
+
+    ms_dir = Path(repo_dir) / "tests" / "acceptance" / ms_dirname(milestone_number)
+    files: dict = {}
+    contract_path = ms_dir / "contract.md"
+    if contract_path.is_file():
+        files["contract.md"] = contract_path.read_text(encoding="utf-8")
+    mocks_dir = ms_dir / "mocks"
+    if mocks_dir.is_dir():
+        for p in sorted(mocks_dir.iterdir()):
+            if p.is_file() and p.suffix == ".html":
+                files[f"mocks/{p.name}"] = p.read_text(encoding="utf-8")
+    return files
+
+
 # ── #1982: the sync loop's operator surface ─────────────────────────────────
 
 

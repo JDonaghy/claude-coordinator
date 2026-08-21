@@ -2888,6 +2888,179 @@
         );
     }
 
+    // ── #2513 (PDR-5): "Publish mocks to portal" menu item ─────────────────
+
+    /// Same epic/non-epic row shape as `make_pipeline_app_for_audit_menu_test`
+    /// (#751 carries the `epic` label, #42 does not), plus an `open_issues`
+    /// entry for #751 itself carrying milestone #9 (so
+    /// `pipeline_issue_milestone`/`gate_a_mocks_dir_exists_for` can resolve
+    /// straight off the epic row, mirroring how the tracking issue is
+    /// actually milestoned on GitHub) and `pipeline_repo_paths["api"]` set to
+    /// *repo_path* — used by `gate_a_mocks_dir_exists_for`'s on-disk
+    /// `mocks/` check.
+    fn make_pipeline_app_for_publish_mocks_menu_test(
+        selected_idx: usize,
+        repo_path: &str,
+    ) -> CoordApp {
+        let mut pipeline_repo_paths = std::collections::HashMap::new();
+        pipeline_repo_paths.insert("api".to_string(), repo_path.to_string());
+        let data = BoardData {
+            pipeline_default_gates: vec!["review".to_string(), "merge".to_string()],
+            pipeline_tracked_labels: vec!["coord".to_string(), "epic".to_string()],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            pipeline_repo_paths,
+            open_issues: vec![OpenIssue {
+                repo_name: "api".to_string(),
+                number: 751,
+                title: "Milestone-driven workflow epic".to_string(),
+                body: String::new(),
+                state: "open".to_string(),
+                labels: vec!["coord".to_string(), "epic".to_string()],
+                milestone_number: Some(9),
+                milestone_title: Some("v1.0".to_string()),
+                body_truncated: false,
+                body_len: None,
+            }],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![
+            PipelineIssue {
+                number: 751,
+                title: "Milestone-driven workflow epic".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string(), "epic".to_string()],
+                all_labels: vec!["coord".to_string(), "epic".to_string(), "status:ready".to_string()],
+                is_closed: false,
+                body_truncated: false,
+                body_len: None,
+            },
+            PipelineIssue {
+                number: 42,
+                title: "Ordinary sub-task".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string(), "status:ready".to_string()],
+                is_closed: false,
+                body_truncated: false,
+                body_len: None,
+            },
+        ];
+        app.rebuild_pipeline_sidebar(None);
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(selected_idx);
+        app
+    }
+
+    #[test]
+    fn publish_mocks_menu_item_present_only_on_epic_row() {
+        // Black-box coverage, mirroring
+        // `dispatch_gate_a_mock_menu_item_present_only_on_epic_row`: drives
+        // the full event → handle → render path (keyboard equivalent of
+        // right-click, '.') and reads the painted context menu off the
+        // TestBackend screen.
+        use quadraui::tui::testing::driver_with_shell;
+
+        let epic_app =
+            make_pipeline_app_for_publish_mocks_menu_test(0, "/nonexistent/api-repo");
+        let mut driver = driver_with_shell(epic_app, CoordApp::shell_config(), 120, 40);
+        driver.type_char('.');
+        assert!(
+            driver.screen_contains("Publish mocks to portal"),
+            "epic row's context menu must offer 'Publish mocks to portal':\n{}",
+            driver.screen(),
+        );
+
+        let plain_app =
+            make_pipeline_app_for_publish_mocks_menu_test(1, "/nonexistent/api-repo");
+        let mut driver = driver_with_shell(plain_app, CoordApp::shell_config(), 120, 40);
+        driver.type_char('.');
+        assert!(
+            !driver.screen_contains("Publish mocks to portal"),
+            "non-epic row's context menu must NOT offer 'Publish mocks to portal':\n{}",
+            driver.screen(),
+        );
+    }
+
+    #[test]
+    fn publish_mocks_item_disabled_until_mocks_dir_exists_on_disk() {
+        // #2513/#2501: gated on a local-filesystem check
+        // (`gate_a_mocks_dir_exists_for`), mirroring
+        // `author_acceptance_tests_item_disabled_until_contract_exists_on_disk`
+        // — there is nothing to upload before Gate A has rendered at least
+        // one mock into `tests/acceptance/ms-NN/mocks/`.
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let tmp = std::env::temp_dir().join(format!("coord-tui-test-publish-mocks-{}", tid));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let app = make_pipeline_app_for_publish_mocks_menu_test(0, tmp.to_str().unwrap());
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(751),
+            &PipelineRowLifecycle::New,
+            Some("api"),
+        );
+        let publish_item = items
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("publish-mocks-to-portal"))
+            .expect("epic row must offer 'publish-mocks-to-portal'");
+        assert!(
+            publish_item.disabled,
+            "must be disabled before any mock exists on disk"
+        );
+
+        // Write one rendered mock at the expected ms-9 path (milestone #9,
+        // from the fixture's `open_issues` entry) and re-check.
+        let mocks_dir = tmp.join("tests").join("acceptance").join("ms-9").join("mocks");
+        std::fs::create_dir_all(&mocks_dir).unwrap();
+        std::fs::write(mocks_dir.join("screen.html"), "<html></html>").unwrap();
+
+        let app = make_pipeline_app_for_publish_mocks_menu_test(0, tmp.to_str().unwrap());
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(751),
+            &PipelineRowLifecycle::New,
+            Some("api"),
+        );
+        let publish_item = items
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("publish-mocks-to-portal"))
+            .expect("epic row must offer 'publish-mocks-to-portal'");
+        assert!(
+            !publish_item.disabled,
+            "must enable once a rendered mock exists on disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dispatch_publish_mocks_to_portal_action_spawns_command() {
+        // The menu action fires `coord portal publish-mocks <repo>
+        // <tracking_issue>` headlessly — same dispatch mechanism as
+        // `dispatch-gate-a-mock`, not an interactive session.
+        let mut app =
+            make_pipeline_app_for_publish_mocks_menu_test(0, "/nonexistent/api-repo");
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(751),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::New,
+        };
+        let handled = app.dispatch_context_menu_action("publish-mocks-to-portal", &target);
+        assert!(handled, "publish-mocks-to-portal must be a recognised action");
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "portal".to_string(),
+                "publish-mocks".to_string(),
+                "api".to_string(),
+                "751".to_string(),
+            ]],
+        );
+    }
+
     #[test]
     fn completed_work_aid_for_recognizes_mock_author_type() {
         // #1059: Gate A's mock-author (#930) dispatches through the same
