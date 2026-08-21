@@ -19,7 +19,10 @@ pub struct CommandResult {
     pub exit_code: i32,
     pub duration: Duration,
     /// Captured tail of the child's stderr (bounded by `STDERR_CAPTURE_BYTES`).
-    /// Empty when the spawn itself failed before stderr could be read.
+    /// When the spawn itself failed before any stderr could be read, this
+    /// carries the OS error instead (`could not launch <path>: ...`) so the
+    /// reason still reaches the operator rather than vanishing behind a bare
+    /// `exit -1`.
     pub stderr: String,
     /// Captured stdout (bounded by `STDOUT_CAPTURE_BYTES`).  Most commands write
     /// nothing useful here, but `coord diagnose` writes its findings/actions +
@@ -148,6 +151,98 @@ fn find_config_with(
         }
     }
     None
+}
+
+/// Well-known install locations for the `coord` CLI, tried in order when it
+/// is not on `PATH` at all. `~/.local/bin` is where `pip install --user` /
+/// `pipx` land it; `~/.coord-venv/bin` is the agent runtime venv documented
+/// in `docs/AGENT_OPERATIONS.md`.
+const COORD_FALLBACK_BIN_DIRS: &[&str] = &[".local/bin", ".coord-venv/bin"];
+
+/// Resolve the `coord` executable to launch for [`CommandRunner::do_spawn`].
+///
+/// `Command::new("coord")` alone only works when the process inherited a
+/// `PATH` that contains the install dir — true for a TUI started from an
+/// interactive shell, and false for anything started by a daemon, a desktop
+/// launcher, a systemd unit, or (the way this surfaced, #2464) a `cargo
+/// test` invoked by the notify drain: every command then fails with an
+/// empty stderr and `exit -1`, which is indistinguishable from the child
+/// crashing. Falling back to the well-known install dirs mirrors what
+/// `scripts/coord-test-runner.sh`'s `resolve_cargo` does for the same
+/// reason.
+pub(crate) fn resolve_coord_binary() -> PathBuf {
+    resolve_coord_binary_with(
+        std::env::var_os("PATH"),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+/// Pure resolver used by [`resolve_coord_binary`]. Split out so tests can
+/// exercise the precedence order without mutating process env state.
+///
+/// Precedence: the first executable `coord` on `PATH`, then
+/// `$HOME/<dir>/coord` for each of [`COORD_FALLBACK_BIN_DIRS`]. When nothing
+/// resolves it returns the bare name `coord`, preserving the pre-existing
+/// behaviour (let the OS report "not found") rather than inventing a path.
+fn resolve_coord_binary_with(path_var: Option<std::ffi::OsString>, home: Option<PathBuf>) -> PathBuf {
+    if let Some(path_var) = path_var.as_ref() {
+        for dir in std::env::split_paths(path_var) {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            if let Some(hit) = executable_in(&dir) {
+                return hit;
+            }
+        }
+    }
+    if let Some(home) = home {
+        for rel in COORD_FALLBACK_BIN_DIRS {
+            if let Some(hit) = executable_in(&home.join(rel)) {
+                return hit;
+            }
+        }
+    }
+    PathBuf::from("coord")
+}
+
+/// `Some(dir/coord)` when that path exists and looks executable. On Windows
+/// the `.exe` suffix is tried as well, so the resolver stays correct for the
+/// cross-platform port (#39) without a second code path.
+fn executable_in(dir: &std::path::Path) -> Option<PathBuf> {
+    let names: &[&str] = if cfg!(windows) {
+        &["coord.exe", "coord"]
+    } else {
+        &["coord"]
+    };
+    for name in names {
+        let candidate = dir.join(name);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Is `path` a regular file we could actually exec? On unix that means at
+/// least one execute bit is set — a *non*-executable `coord` sitting in a
+/// PATH dir must not shadow a real one further down the list. Elsewhere,
+/// existence is the best available proxy.
+fn is_executable_file(path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// Bare Click groups (no group-level `--config` option of their own) — see
@@ -341,6 +436,10 @@ impl CommandRunner {
         let full_args = build_full_args(&argv, self.config_path.as_deref());
 
         let label_clone = label.clone();
+        // Resolved on the caller's thread so every spawn in one session sees
+        // the same answer, and so the resolution cost (a few `stat`s) is not
+        // repeated inside the worker thread.
+        let program = resolve_coord_binary();
         std::thread::spawn(move || {
             let started = Instant::now();
             // Belt-and-braces: main.rs sets GIT_TERMINAL_PROMPT=0 and
@@ -357,7 +456,7 @@ impl CommandRunner {
             // `coord diagnose` reports its findings on stdout, and the
             // concurrent drain below keeps a chatty child from blocking on a
             // full pipe just as it does for stderr.
-            let spawn_result = Command::new("coord")
+            let spawn_result = Command::new(&program)
                 .args(&full_args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -421,11 +520,16 @@ impl CommandRunner {
                         stdout,
                     }
                 }
-                Err(_) => CommandResult {
+                // The spawn itself failed (most often: `coord` is not
+                // installed, or not reachable from the environment this TUI
+                // was launched in). Report the OS error as the "stderr" so
+                // `poll`'s status message says *why* instead of the bare
+                // `exit -1` that used to be the only clue.
+                Err(e) => CommandResult {
                     label: label_clone,
                     exit_code: -1,
                     duration: started.elapsed(),
-                    stderr: String::new(),
+                    stderr: format!("could not launch {}: {}", program.display(), e),
                     stdout: String::new(),
                 },
             };
@@ -624,163 +728,202 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// #2464: a couple of tests below assert on the *exit status* of a real
-    /// `coord --version`. `do_spawn` launches `Command::new("coord")`, which
-    /// resolves purely through the inherited `PATH` — true for a `cargo test`
-    /// started from an interactive shell, and false for one spawned by the
-    /// notify drain, a systemd unit or a desktop launcher, none of which
-    /// source a login shell and so never see `~/.local/bin`. With the CLI
-    /// unreachable the spawn fails before it ever runs, `do_spawn` reports
-    /// `exit -1` with an empty stderr, and those cases read as a regression
-    /// in the branch under test when the only thing missing is an installed
-    /// dependency. Guard them on this probe and skip *loudly* instead: a test
-    /// that cannot run must never be reported as a failure, and the
-    /// `eprintln!` keeps the skip visible in `cargo test` output (which shows
-    /// captured stdio for passing tests only under `--nocapture`, so the
-    /// message also names the reason in one line for log greps).
+    /// Is a real `coord` CLI reachable from this environment at all?
     ///
-    /// Deliberately mirrors the OS lookup and nothing more: `do_spawn`
-    /// consults no fallback install dirs, so a more generous probe here would
-    /// let a test claim the CLI is available when the code under test still
-    /// cannot find it.
-    fn coord_cli_on_path() -> bool {
-        coord_cli_in(std::env::var_os("PATH"))
+    /// The subprocess tests below assert on the *exit status* of a real
+    /// `coord --version`, so they can only say something about this crate
+    /// when the CLI is actually installed. With [`resolve_coord_binary`] in
+    /// place that is true for every normal dev box and every agent machine
+    /// (PATH, `~/.local/bin`, `~/.coord-venv/bin`) — but on a machine where
+    /// the CLI is genuinely absent, failing here would report a *missing
+    /// dependency* as a *branch regression* (#2464), which is exactly the
+    /// false verdict this helper exists to prevent. Those tests skip
+    /// instead, and say so on stderr. Deliberately reuses the SAME resolver
+    /// `do_spawn` calls — not a separate PATH-only probe — so this can never
+    /// claim the CLI is available when the code under test still can't find
+    /// it (or vice versa).
+    fn coord_cli_available() -> bool {
+        is_executable_file(&resolve_coord_binary())
     }
 
-    /// Pure form of [`coord_cli_on_path`], split out so the probe itself can
-    /// be tested against synthetic directories without mutating the process
-    /// environment (which every other test in this binary shares).
-    fn coord_cli_in(path_var: Option<std::ffi::OsString>) -> bool {
-        let Some(path_var) = path_var else {
-            return false;
-        };
-        // On Windows the OS appends the PATHEXT suffixes; `.exe` is the only
-        // one a Rust/Python console script produces, so check it first and
-        // fall back to the extension-less name for WSL-style layouts.
-        let names: &[&str] = if cfg!(windows) {
-            &["coord.exe", "coord"]
-        } else {
-            &["coord"]
-        };
-        std::env::split_paths(&path_var)
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .any(|dir| names.iter().any(|name| is_executable_file(&dir.join(name))))
-    }
-
-    /// `true` when `path` is a regular file carrying an execute bit. On
-    /// non-unix targets the permission model differs enough that "a regular
-    /// file exists here" is the best available proxy.
-    fn is_executable_file(path: &std::path::Path) -> bool {
-        let Ok(meta) = std::fs::metadata(path) else {
-            return false;
-        };
-        if !meta.is_file() {
+    /// Print the skip reason and return `true` when the CLI is missing, so a
+    /// caller can `if skip_without_coord_cli("name") { return; }`.
+    fn skip_without_coord_cli(test_name: &str) -> bool {
+        if coord_cli_available() {
             return false;
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            meta.permissions().mode() & 0o111 != 0
-        }
-        #[cfg(not(unix))]
-        {
-            true
-        }
-    }
-
-    /// Emit the standard skip notice for a test that needs the real CLI.
-    fn skip_no_coord_cli(test_name: &str) {
         eprintln!(
-            "SKIP {test_name}: no executable `coord` on PATH, so \
-             `Command::new(\"coord\")` cannot launch — this test asserts on a \
+            "SKIP {test_name}: no `coord` CLI on PATH or in the known install \
+             dirs (~/.local/bin, ~/.coord-venv/bin) — this test asserts on a \
              real `coord --version` exit status and would report a missing \
              dependency as a branch regression (#2464)."
         );
+        true
     }
 
-    /// Create a temp dir containing a `coord` entry, and return the dir.
-    /// `executable` controls whether the mode bits allow execution;
-    /// `directory` makes it a directory instead of a file, so the probe's
-    /// "regular file" requirement is exercised too.
-    fn make_fake_bin_dir(tag: &str, executable: bool, directory: bool) -> PathBuf {
-        let unique = format!(
-            "coord-cli-probe-{tag}-{}-{}",
+    /// Build a throwaway directory tree for the resolver tests. Unique per
+    /// (pid, nanos) so concurrent test binaries can never collide.
+    fn make_bin_tmp(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "coord-tui-resolve-{}-{}-{}",
+            tag,
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
-        let dir = std::env::temp_dir().join(unique);
-        std::fs::create_dir_all(&dir).unwrap();
-        let entry = dir.join("coord");
-        if directory {
-            std::fs::create_dir_all(&entry).unwrap();
-        } else {
-            std::fs::write(&entry, "#!/bin/sh\nexit 0\n").unwrap();
-            // Off-unix there are no mode bits to set, so the flag is inert —
-            // bind it so the cross-platform build (#39) stays warning-free.
-            #[cfg(not(unix))]
-            let _ = executable;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = if executable { 0o755 } else { 0o644 };
-                std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(mode)).unwrap();
-            }
-        }
-        dir
+                .unwrap_or(0),
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
     }
 
-    #[test]
-    fn coord_cli_probe_false_when_path_unset_or_empty() {
-        assert!(!coord_cli_in(None), "an unset PATH cannot resolve anything");
-        assert!(
-            !coord_cli_in(Some(std::ffi::OsString::from(""))),
-            "an empty PATH cannot resolve anything"
-        );
-    }
-
-    #[test]
-    fn coord_cli_probe_finds_an_executable_coord() {
-        let dir = make_fake_bin_dir("hit", true, false);
-        assert!(coord_cli_in(Some(dir.clone().into_os_string())));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn coord_cli_probe_ignores_a_non_executable_file() {
-        // A `coord` that exists but isn't +x can't be spawned either, so the
-        // probe must not report it as available.
-        let dir = make_fake_bin_dir("noexec", false, false);
-        let available = coord_cli_in(Some(dir.clone().into_os_string()));
-        std::fs::remove_dir_all(&dir).ok();
+    /// Create `dir/coord`; `executable` controls whether the exec bits are set.
+    fn write_fake_coord(dir: &std::path::Path, executable: bool) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(if cfg!(windows) { "coord.exe" } else { "coord" });
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
         #[cfg(unix)]
-        assert!(!available, "a non-executable `coord` is not launchable");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = if executable { 0o755 } else { 0o644 };
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
         #[cfg(not(unix))]
-        let _ = available; // no mode bits to strip off-unix
+        let _ = executable;
+        path
     }
 
     #[test]
-    fn coord_cli_probe_ignores_a_directory_named_coord() {
-        let dir = make_fake_bin_dir("isdir", true, true);
-        let available = coord_cli_in(Some(dir.clone().into_os_string()));
-        std::fs::remove_dir_all(&dir).ok();
-        assert!(!available, "a directory named `coord` is not an executable");
+    fn resolve_coord_binary_prefers_the_first_hit_on_path() {
+        let root = make_bin_tmp("path-first");
+        let first = root.join("first");
+        let second = root.join("second");
+        let expected = write_fake_coord(&first, true);
+        write_fake_coord(&second, true);
+        let path_var = std::env::join_paths([&first, &second]).unwrap();
+
+        let resolved = resolve_coord_binary_with(Some(path_var), Some(root.clone()));
+        assert_eq!(resolved, expected, "the earliest PATH entry must win");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn coord_cli_probe_scans_every_path_entry() {
+    fn resolve_coord_binary_falls_back_to_home_install_dirs_when_path_misses() {
+        // The regression this whole change exists for: a daemon-inherited
+        // PATH with no `~/.local/bin` in it must still find the CLI.
+        let root = make_bin_tmp("home-fallback");
+        let empty_path_dir = root.join("empty");
+        std::fs::create_dir_all(&empty_path_dir).unwrap();
+        let home = root.join("home");
+        let expected = write_fake_coord(&home.join(".local").join("bin"), true);
+        let path_var = std::env::join_paths([&empty_path_dir]).unwrap();
+
+        let resolved = resolve_coord_binary_with(Some(path_var), Some(home));
+        assert_eq!(resolved, expected, "must fall back to ~/.local/bin/coord");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_coord_binary_falls_back_to_the_agent_venv() {
+        let root = make_bin_tmp("venv-fallback");
+        let home = root.join("home");
+        // `~/.local/bin` deliberately absent, so `~/.coord-venv/bin` is the
+        // only remaining candidate.
+        let expected = write_fake_coord(&home.join(".coord-venv").join("bin"), true);
+
+        let resolved = resolve_coord_binary_with(None, Some(home));
+        assert_eq!(resolved, expected, "must fall back to ~/.coord-venv/bin/coord");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_coord_binary_ignores_a_non_executable_file_on_path() {
+        let root = make_bin_tmp("non-exec");
+        let shadow = root.join("shadow");
+        let real = root.join("real");
+        write_fake_coord(&shadow, false);
+        let expected = write_fake_coord(&real, true);
+        let path_var = std::env::join_paths([&shadow, &real]).unwrap();
+
+        let resolved = resolve_coord_binary_with(Some(path_var), Some(root.clone()));
+        assert_eq!(
+            resolved, expected,
+            "a non-executable `coord` must not shadow the real one later on PATH",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_coord_binary_ignores_a_directory_named_coord() {
+        let root = make_bin_tmp("isdir");
+        let shadow_dir = root.join("shadow").join("coord");
+        std::fs::create_dir_all(&shadow_dir).unwrap();
+        let real = root.join("real");
+        let expected = write_fake_coord(&real, true);
+        let path_var = std::env::join_paths([root.join("shadow"), real]).unwrap();
+
+        let resolved = resolve_coord_binary_with(Some(path_var), Some(root.clone()));
+        assert_eq!(
+            resolved, expected,
+            "a directory named `coord` is not an executable and must not shadow the real one",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_coord_binary_scans_every_path_entry() {
         // The hit is in the *second* entry, behind an empty segment and a
         // directory that has no `coord` — all three must be walked.
-        let miss = make_fake_bin_dir("miss-a", true, false);
-        std::fs::remove_file(miss.join("coord")).unwrap();
-        let hit = make_fake_bin_dir("hit-b", true, false);
-        let joined = std::env::join_paths([PathBuf::from(""), miss.clone(), hit.clone()]).unwrap();
-        let available = coord_cli_in(Some(joined));
-        std::fs::remove_dir_all(&miss).ok();
-        std::fs::remove_dir_all(&hit).ok();
-        assert!(available, "the probe must scan past earlier misses");
+        let root = make_bin_tmp("scan");
+        let miss = root.join("miss");
+        std::fs::create_dir_all(&miss).unwrap();
+        let hit = root.join("hit");
+        let expected = write_fake_coord(&hit, true);
+        let path_var = std::env::join_paths([PathBuf::from(""), miss.clone(), hit.clone()]).unwrap();
+
+        let resolved = resolve_coord_binary_with(Some(path_var), Some(root.clone()));
+        assert_eq!(resolved, expected, "the resolver must scan past earlier misses");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_coord_binary_returns_the_bare_name_when_nothing_resolves() {
+        let root = make_bin_tmp("nothing");
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+
+        let resolved = resolve_coord_binary_with(None, Some(home));
+        assert_eq!(
+            resolved,
+            PathBuf::from("coord"),
+            "with nothing installed, keep the pre-existing behaviour: let the OS report it",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spawn_failure_reports_the_reason_instead_of_a_bare_exit_code() {
+        // Before this, a failed spawn produced `exit -1` with an empty
+        // stderr, so `poll`'s status message read "coord --version failed
+        // (exit -1)" with no way to tell a missing CLI from a crash.
+        let mut runner = CommandRunner::new_for_test();
+        runner.push_canned_result(-1, "could not launch coord: No such file or directory");
+        runner.spawn_queued(&["--version"]);
+        let result = runner.poll().expect("no_spawn resolves synchronously");
+        assert_eq!(result.exit_code, -1);
+        let (msg, _) = runner.message.as_ref().expect("message set on completion");
+        assert!(
+            msg.contains("could not launch coord"),
+            "the launch failure reason must reach the status bar, got: {msg}"
+        );
     }
 
     #[test]
@@ -820,8 +963,7 @@ mod tests {
 
     #[test]
     fn poll_captures_result() {
-        if !coord_cli_on_path() {
-            skip_no_coord_cli("poll_captures_result");
+        if skip_without_coord_cli("poll_captures_result") {
             return;
         }
         let _guard = lock_subprocess_test();
@@ -865,8 +1007,7 @@ mod tests {
 
     #[test]
     fn spawn_no_inject_for_flag_args() {
-        if !coord_cli_on_path() {
-            skip_no_coord_cli("spawn_no_inject_for_flag_args");
+        if skip_without_coord_cli("spawn_no_inject_for_flag_args") {
             return;
         }
         let _guard = lock_subprocess_test();
