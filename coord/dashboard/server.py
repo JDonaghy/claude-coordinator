@@ -552,7 +552,15 @@ def openapi_spec() -> dict:
                 ),
             },
         },
-        "required": ["report_id", "generated_at", "window", "columns", "rows", "notes"],
+        "required": [
+            "report_id",
+            "generated_at",
+            "window",
+            "columns",
+            "column_meta",
+            "rows",
+            "notes",
+        ],
     }
     report_result_ref = {"$ref": "#/components/schemas/ReportResult"}
     report_catalogue_response = {
