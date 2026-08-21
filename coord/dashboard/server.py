@@ -15,7 +15,13 @@ from pathlib import Path
 import httpx
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from starlette.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
@@ -449,6 +455,111 @@ def openapi_spec() -> dict:
             "summary": drive_queue_summary_ref,
         },
     }
+    # #2492 RPT-1: the report engine's wire types. `dataclass_schema` walks
+    # `coord.reports` dataclasses straight (like `DriveQueueSummary` above)
+    # for the ones its generic dataclass -> JSON-Schema walk actually
+    # supports (`RowIdentity`/`ColumnMeta`/`ChartSeries` have no `tuple[...]`
+    # or `Callable` fields). `ReportParam`/`ReportDef`/`ChartSpec`/
+    # `ReportResult` do — `ReportParam.validate`/`ReportDef.run` are
+    # deliberately non-wire (excluded from their own `to_dict()`), and
+    # `coord/openapi.py:json_schema_for` has no mapping for `Callable` or
+    # `tuple[...]` at all (`ChartSpec.series`, `ReportResult.window`,
+    # `ReportDef.params`, `ReportParam.choices` are all tuples on the
+    # dataclass but lists on the wire) — so those four are hand-built here,
+    # matching each type's own `to_dict()` field-for-field, the same way
+    # `board_response`/`session_response` below are hand-built rather than
+    # derived. Registered as named `components` refs either way (not inlined
+    # like `board_response`) because these are reused across both report
+    # routes and are what #1550's TS codegen (`scripts/codegen.py`) emits an
+    # `interface` for.
+    from coord.reports import ChartSeries, ColumnMeta, RowIdentity  # noqa: PLC0415 — mirrors serve_app.py's lazy `reports` import
+
+    row_identity_ref = dataclass_schema(RowIdentity, components)
+    column_meta_ref = dataclass_schema(ColumnMeta, components)
+    chart_series_ref = dataclass_schema(ChartSeries, components)
+    components["ReportParam"] = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string"},
+            "label": {"type": "string"},
+            "kind": {"type": "string", "description": "choice|text"},
+            "choices": {"type": "array", "items": {"type": "string"}},
+            "default": {"type": "string"},
+            "help": {"type": "string"},
+            "free_form": {
+                "type": "boolean",
+                "description": "choices are presets, not a whitelist",
+            },
+        },
+        "required": ["id", "label"],
+    }
+    report_param_ref = {"$ref": "#/components/schemas/ReportParam"}
+    components["ReportDef"] = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string"},
+            "title": {"type": "string"},
+            "description": {"type": "string"},
+            "params": {"type": "array", "items": report_param_ref},
+            "row_identity": {**row_identity_ref, "nullable": True},
+        },
+        "required": ["id", "title", "description", "params"],
+    }
+    report_def_ref = {"$ref": "#/components/schemas/ReportDef"}
+    components["ChartSpec"] = {
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "description": "open vocabulary — bar|line|sparkline today",
+            },
+            "series": {"type": "array", "items": chart_series_ref},
+            "x": {"type": "string", "nullable": True},
+            "group_by": {"type": "string", "nullable": True},
+            "stacked": {"type": "boolean"},
+            "title": {"type": "string"},
+            "y_label": {"type": "string"},
+        },
+        "required": ["kind", "series"],
+    }
+    chart_spec_ref = {"$ref": "#/components/schemas/ChartSpec"}
+    components["ReportResult"] = {
+        "type": "object",
+        "properties": {
+            "report_id": {"type": "string"},
+            "generated_at": {"type": "number"},
+            "window": {"type": "array", "items": {"type": "number"}},
+            "columns": {"type": "array", "items": {"type": "string"}},
+            "column_meta": {"type": "array", "items": column_meta_ref},
+            "rows": {"type": "array", "items": {"type": "object"}},
+            "notes": {"type": "array", "items": {"type": "string"}},
+            "totals": {
+                "type": "object",
+                "nullable": True,
+                "description": (
+                    "#1763: optional grand-total row keyed by the same "
+                    "column ids as `rows`. `null` for reports with no "
+                    "meaningful sum."
+                ),
+            },
+            "chart": {
+                **chart_spec_ref,
+                "nullable": True,
+                "description": (
+                    "#2271: optional chart declaration — carries no numbers "
+                    "of its own, the renderer reads the same `rows` the "
+                    "table does."
+                ),
+            },
+        },
+        "required": ["report_id", "generated_at", "window", "columns", "rows", "notes"],
+    }
+    report_result_ref = {"$ref": "#/components/schemas/ReportResult"}
+    report_catalogue_response = {
+        "type": "object",
+        "properties": {"reports": {"type": "array", "items": report_def_ref}},
+        "required": ["reports"],
+    }
     board_response = {
         "type": "object",
         "properties": {
@@ -577,6 +688,70 @@ def openapi_spec() -> dict:
                         )
                     },
                     "404": {"description": "drive-queue entry not found"},
+                },
+            }
+        },
+        "/api/report": {
+            "get": {
+                "summary": (
+                    "#2492: the report catalogue — ids, titles, descriptions "
+                    "and full parameter metadata (kind/choices/default), so "
+                    "a client builds its parameter form from here rather "
+                    "than hardcoding it"
+                ),
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {"schema": report_catalogue_response}
+                        },
+                    }
+                },
+            }
+        },
+        "/api/report/{report_id}": {
+            "get": {
+                "summary": (
+                    "#2492: run a report and return its ReportResult. "
+                    "Read-only — no board write, no reconcile side effect. "
+                    "Query parameters are the report's own params (see "
+                    "GET /api/report)"
+                ),
+                "parameters": [
+                    _dashboard_path_param("report_id", "report id from the catalogue"),
+                    {
+                        "name": "format",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "string", "enum": ["json", "csv"]},
+                        "description": (
+                            "#1765: response encoding. Absent/`json` returns "
+                            "the ReportResult unchanged; `csv` returns "
+                            "text/csv (raw values, `#`-prefixed notes) with "
+                            "a Content-Disposition filename."
+                        ),
+                    },
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {"schema": report_result_ref},
+                            "text/csv": {
+                                "schema": {"type": "string"},
+                                "description": (
+                                    "`?format=csv`. Header row labelled from "
+                                    "`column_meta`, one row per `rows` entry "
+                                    "with raw values, `notes` as leading `#` "
+                                    "lines."
+                                ),
+                            },
+                        },
+                    },
+                    "400": {
+                        "description": "Unknown parameter / bad parameter value / unknown format"
+                    },
+                    "404": {"description": "Unknown report id"},
                 },
             }
         },
@@ -922,6 +1097,22 @@ def build_app(
                 )
             }
         raise ValueError(f"unknown drive-queue action: {action!r}")
+
+    def _report_catalogue() -> dict:
+        """The report engine's catalogue — seeded fixture or the real
+        registry (#2492).
+
+        Unlike ``_read_drive_queue()``, there is no daemon-vs-local split to
+        resolve here: ``coord.reports.catalogue()`` is pure in-process
+        metadata (report ids/titles/param definitions), never a DB read, so
+        live mode calls it directly — same as ``coord/serve_app.py``'s own
+        ``get_report_catalogue``.
+        """
+        if _fixture is not None:
+            return _fixture.report_catalogue()
+        from coord import reports as _reports  # noqa: PLC0415
+
+        return _reports.catalogue()
 
     # ── Real-time event bus ────────────────────────────────────────────────
     event_source = EventSource()
@@ -1394,6 +1585,73 @@ def build_app(
                 {"ok": False, "error": "drive-queue entry not found"}, status_code=404
             )
         return JSONResponse({"ok": True})
+
+    async def api_report_catalogue(request: Request) -> Response:  # noqa: ARG001 — Starlette handler signature
+        """GET /api/report — the report catalogue (#2492).
+
+        Mirrors ``coord/serve_app.py``'s ``get_report_catalogue`` almost
+        verbatim, just routed through ``_report_catalogue()`` — the
+        fixture-vs-live indirection every handler in this file goes through
+        (see ``_read_board()``/``_read_drive_queue()``).
+        """
+        return JSONResponse(_report_catalogue())
+
+    async def api_report_run(request: Request) -> Response:
+        """GET /api/report/{report_id}?... — run a report and return its
+        ReportResult (#2492).
+
+        Mirrors ``coord/serve_app.py``'s ``get_report`` almost verbatim:
+        ``format`` is popped before param validation (a rendering choice,
+        not a report parameter — #1765), ``UnknownReportError`` -> 404,
+        ``ReportError`` -> 400, anything else -> 503. ``run_report`` reads
+        local state directly (audit_log/issues/assignments) same as the
+        daemon does today, so live mode needs no board-daemon proxy either
+        — only fixture mode swaps the source, via
+        ``_fixture.report_result()``.
+        """
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        from coord import reports as _reports  # noqa: PLC0415
+
+        report_id = request.path_params["report_id"]
+        params = dict(request.query_params)
+        # #1765: `format` is a *rendering* choice, not a report parameter —
+        # pop it before validation or `resolve_params` rejects it as an
+        # unknown parameter.
+        fmt = (params.pop("format", "") or "json").strip().lower()
+        if fmt not in ("json", "csv"):
+            return JSONResponse(
+                {"error": f"unknown format {fmt!r} — allowed values: json, csv"},
+                status_code=400,
+            )
+        try:
+            if _fixture is not None:
+                result = _fixture.report_result(report_id, params)
+            else:
+                result = await run_in_threadpool(_reports.run_report, report_id, params)
+        except _reports.UnknownReportError as e:
+            return JSONResponse({"error": str(e)}, status_code=404)
+        except _reports.ReportError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        except Exception as e:  # noqa: BLE001 — surface a clean 503 rather than a stack trace
+            return JSONResponse(
+                {"error": "report run failed", "detail": str(e)}, status_code=503
+            )
+        if fmt == "csv":
+            # Same serializer the CLI calls, so `coord report run --format
+            # csv` and this route emit identical bytes for identical params.
+            return Response(
+                _reports.result_to_csv(result),
+                media_type="text/csv; charset=utf-8",
+                headers={
+                    "Content-Disposition": (
+                        f'attachment; filename="{_reports.csv_filename(result)}"'
+                    )
+                },
+            )
+        return JSONResponse(
+            result.to_dict() if isinstance(result, _reports.ReportResult) else result
+        )
 
     async def api_approve(request: Request) -> JSONResponse:
         from coord.dispatch import dispatch, post_briefing, compute_do_not_touch
@@ -2316,6 +2574,8 @@ def build_app(
         Route("/api/proposals", api_proposals, methods=["GET"]),
         Route("/api/drive-queue", api_drive_queue, methods=["GET"]),
         Route("/api/drive-queue/action", api_drive_queue_action, methods=["POST"]),
+        Route("/api/report", api_report_catalogue, methods=["GET"]),
+        Route("/api/report/{report_id}", api_report_run, methods=["GET"]),
         Route("/api/approve", api_approve, methods=["POST"]),
         Route("/api/reject", api_reject, methods=["POST"]),
         Route("/api/diff/{id}", api_diff, methods=["GET"]),

@@ -780,6 +780,101 @@ class TestDriveQueueActionAPI:
         assert calls == [{"action": "dequeue", "repo_name": "api", "issue_number": 7}]
 
 
+class TestReportAPI:
+    """GET /api/report + GET /api/report/{report_id} (#2492 RPT-1).
+
+    Same "seeded DB -> GET -> assert shape" bar as `TestDriveQueueAPI` above:
+    `drive-queue-status` is the cheapest report to seed for a dashboard-level
+    shape test (a couple of `_enqueue_drive_queue_local` rows, no audit_log
+    fixture needed) — the report *engine* itself already has an exhaustive
+    suite in `tests/test_reports.py`; this only pins that the dashboard's
+    thin routes reach it and shape the response/errors the same way
+    `coord/serve_app.py`'s `GET /report` + `GET /report/{report_id}` do.
+    """
+
+    def test_catalogue_lists_every_report_with_param_metadata(self, rw_db) -> None:
+        client = _client()
+        r = client.get("/api/report")
+        assert r.status_code == 200
+        body = r.json()
+        ids = [rep["id"] for rep in body["reports"]]
+        assert "drive-queue-status" in ids
+        assert "issue-activity" in ids
+        rep = next(rep for rep in body["reports"] if rep["id"] == "drive-queue-status")
+        assert rep["title"] == "Drive Queue Status"
+        params = {p["id"]: p for p in rep["params"]}
+        assert set(params) == {"repo"}
+
+    def test_run_returns_report_result_for_seeded_rows(self, rw_db) -> None:
+        from coord.state import _enqueue_drive_queue_local, _update_drive_queue_entry_local
+
+        _enqueue_drive_queue_local("api", 1)
+        _enqueue_drive_queue_local("api", 2, after=["api#1"])
+        _update_drive_queue_entry_local("api", 1, state="running")
+
+        client = _client()
+        r = client.get("/api/report/drive-queue-status")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["report_id"] == "drive-queue-status"
+        assert {row["issue"] for row in body["rows"]} == {1, 2}
+        by_issue = {row["issue"]: row for row in body["rows"]}
+        assert by_issue[1]["state"] == "running"
+        # #1760: additive display metadata, one entry per `columns` entry.
+        assert [m["id"] for m in body["column_meta"]] == body["columns"]
+
+    def test_run_repo_param_narrows_rows(self, rw_db) -> None:
+        from coord.state import _enqueue_drive_queue_local
+
+        _enqueue_drive_queue_local("api", 1)
+        _enqueue_drive_queue_local("web", 2)
+
+        client = _client()
+        r = client.get("/api/report/drive-queue-status", params={"repo": "api"})
+        assert r.status_code == 200
+        rows = r.json()["rows"]
+        assert {row["repo"] for row in rows} == {"api"}
+
+    def test_format_csv_returns_text_csv_with_a_filename(self, rw_db) -> None:
+        from coord.state import _enqueue_drive_queue_local
+
+        _enqueue_drive_queue_local("api", 1)
+
+        client = _client()
+        r = client.get(
+            "/api/report/drive-queue-status", params={"format": "csv"}
+        )
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/csv")
+        disposition = r.headers["content-disposition"]
+        assert disposition.startswith("attachment; filename=")
+        assert "drive-queue-status-" in disposition and ".csv" in disposition
+        assert "# report: drive-queue-status" in r.text
+
+    def test_unknown_report_id_is_404(self, rw_db) -> None:
+        client = _client()
+        r = client.get("/api/report/no-such-report")
+        assert r.status_code == 404
+        assert "drive-queue-status" in r.json()["error"]
+
+    def test_unknown_format_is_400(self, rw_db) -> None:
+        client = _client()
+        r = client.get(
+            "/api/report/drive-queue-status", params={"format": "xlsx"}
+        )
+        assert r.status_code == 400
+        assert "csv" in r.json()["error"]
+
+    def test_format_is_not_treated_as_a_report_parameter(self, rw_db) -> None:
+        """`resolve_params` rejects unknown parameters — `format` must be
+        popped before it gets there (#1765)."""
+        client = _client()
+        r = client.get(
+            "/api/report/drive-queue-status", params={"format": "csv"}
+        )
+        assert r.status_code == 200
+
+
 class TestApproveAPI:
     # #749: board_service.read_board() tries load_board() before build_board()
     # — mock both so the real load_board() (which needs a live connection on
