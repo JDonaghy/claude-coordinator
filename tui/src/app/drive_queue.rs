@@ -868,7 +868,9 @@ impl CoordApp {
         ("Title", 3.0, ColumnAlign::Left),
         ("State", 1.0, ColumnAlign::Left),
         ("Machine", 1.2, ColumnAlign::Left),
-        ("Tries", 0.6, ColumnAlign::Right),
+        ("#Work", 0.7, ColumnAlign::Right),
+        ("#Smoke", 0.8, ColumnAlign::Right),
+        ("#Review", 0.9, ColumnAlign::Right),
         ("After", 1.4, ColumnAlign::Left),
         ("Hold", 0.9, ColumnAlign::Left),
         ("Reason", 4.0, ColumnAlign::Left),
@@ -889,8 +891,16 @@ impl CoordApp {
 
     /// Index of the `#` (position) column — sorted numerically.
     pub(crate) const QUEUE_COL_POSITION: usize = 0;
-    /// Index of the `Tries` (attempts) column — sorted numerically.
-    pub(crate) const QUEUE_COL_TRIES: usize = 5;
+    /// Index of the `#Work` column — sorted numerically. #2524: replaced
+    /// the single `Tries` column (`e.attempts`, the daemon's own
+    /// crash/relaunch counter — orthogonal to leg-dispatch counts; see
+    /// `queue_assignment_count`'s doc comment) with three per-stage
+    /// dispatch counts.
+    pub(crate) const QUEUE_COL_WORK: usize = 5;
+    /// Index of the `#Smoke` column — sorted numerically.
+    pub(crate) const QUEUE_COL_SMOKE: usize = 6;
+    /// Index of the `#Review` column — sorted numerically.
+    pub(crate) const QUEUE_COL_REVIEW: usize = 7;
 
     /// `DataTable` columns from [`Self::QUEUE_COLUMNS`].
     fn queue_columns() -> Vec<Column> {
@@ -945,11 +955,16 @@ impl CoordApp {
                 s
             }
         };
+        let work_count = self.queue_assignment_count(&e.repo_name, e.issue_number, "work");
+        let smoke_count = self.queue_assignment_count(&e.repo_name, e.issue_number, "smoke");
+        let review_count = self.queue_assignment_count(&e.repo_name, e.issue_number, "review");
         QueueRow {
             repo_name: e.repo_name.clone(),
             issue_number: e.issue_number,
             position: e.position,
-            attempts: e.attempts,
+            work_count,
+            smoke_count,
+            review_count,
             state: e.state.clone(),
             held: is_holding(e),
             cells: vec![
@@ -957,8 +972,10 @@ impl CoordApp {
                 alias_queue_key(&e.key()),
                 or_dash(self.queue_issue_title(&e.repo_name, e.issue_number)),
                 or_dash(e.state.clone()),
-                or_dash(e.machine.clone().unwrap_or_default()),
-                e.attempts.to_string(),
+                or_dash(self.queue_live_machine(e).unwrap_or_default()),
+                work_count.to_string(),
+                smoke_count.to_string(),
+                review_count.to_string(),
                 or_dash(
                     e.after
                         .iter()
@@ -970,6 +987,58 @@ impl CoordApp {
                 or_dash(queue_reason_cell(e)),
             ],
         }
+    }
+
+    /// Count of this entry's own dispatched legs whose `assignment_type`
+    /// equals `atype` — `"work"` (the original dispatch plus any `[fix-N]`
+    /// bounces, still `type="work"`, `coord/auto_loop.py:1144`/`:1199`),
+    /// `"smoke"`, or `"review"`. Every leg dispatched for an issue shares
+    /// its `(repo, issue_number)` key regardless of stage, so this is a
+    /// plain filter over `data.assignments` — no new wire field (#2524).
+    ///
+    /// An assignment with no `assignment_type` on the wire is `"work"`
+    /// (`.unwrap_or("work")`, the same default used throughout
+    /// `app/sessions.rs`/`app/dialogs.rs`).
+    ///
+    /// Deliberately NOT `e.attempts` — that's the drive queue's own
+    /// crash/relaunch counter (incremented only when a launched session
+    /// *dies* and gets requeued, `coord/drive_queue.py:2609`), orthogonal
+    /// to how many legs actually ran. A healthy entry that cleanly runs
+    /// work → smoke → review → merge sits at `attempts == 0` throughout.
+    fn queue_assignment_count(&self, repo: &str, issue_number: i64, atype: &str) -> i64 {
+        let Ok(issue_number) = u64::try_from(issue_number) else {
+            return 0;
+        };
+        self.data
+            .assignments
+            .iter()
+            .filter(|a| a.repo == repo && a.issue_number == issue_number)
+            .filter(|a| a.assignment_type.as_deref().unwrap_or("work") == atype)
+            .count() as i64
+    }
+
+    /// The machine actually running this entry's current leg, so `Machine`
+    /// reads live instead of blank on the rows an operator most wants to
+    /// glance at (#2524). Same "prefer the running assignment" lookup as
+    /// `open_watch_for_selected_issue` (`app/mod.rs:4528`) and the Stop
+    /// picker (`app/mod.rs:4907`) — Board/Pipeline precedent, not a new
+    /// pattern.
+    ///
+    /// Falls back to the operator's own `--machine` pin (`e.machine`) when
+    /// nothing is currently running — a `waiting`/`blocked` row may still
+    /// be usefully pinned — then to `None` (the caller renders the dash).
+    fn queue_live_machine(&self, e: &BoardDriveQueueEntry) -> Option<String> {
+        let issue_number = u64::try_from(e.issue_number).ok();
+        self.data
+            .assignments
+            .iter()
+            .find(|a| {
+                Some(a.issue_number) == issue_number
+                    && a.repo == e.repo_name
+                    && a.status == "running"
+            })
+            .map(|a| a.machine.clone())
+            .or_else(|| e.machine.clone())
     }
 
     /// Issue title for a queued entry, from whatever this client already
@@ -1917,7 +1986,15 @@ pub(crate) struct QueueRow {
     /// Dense 0-based slot in the WHOLE queue (`done` rows included) — the
     /// number `coord drive-queue move --to` speaks in.
     pub(crate) position: i64,
-    pub(crate) attempts: i64,
+    /// Count of this entry's `type="work"` assignments (original dispatch
+    /// + `[fix-N]` bounces). #2524: replaced `attempts` (the daemon's
+    /// crash/relaunch counter, not a leg-dispatch count — see
+    /// `CoordApp::queue_assignment_count`'s doc comment).
+    pub(crate) work_count: i64,
+    /// Count of this entry's `type="smoke"` assignments.
+    pub(crate) smoke_count: i64,
+    /// Count of this entry's `type="review"` assignments.
+    pub(crate) review_count: i64,
     /// Wire `state`, verbatim.
     pub(crate) state: String,
     /// `hold_state == "fired"` — this entry's deploy gate is holding the
@@ -2021,26 +2098,47 @@ fn queue_reason_cell(e: &BoardDriveQueueEntry) -> String {
     }
 }
 
-/// Order two Queue rows by `col`.
-///
-/// Numeric for the two numeric columns, case-insensitive text otherwise.
-/// Comparing the *rendered* strings for `#`/`Tries` would sort `10` before
-/// `2` — the same defect #1762 fixed for the Reports result table.
+/// Columns [`queue_compare_rows`] sorts as numbers rather than strings —
+/// the #1762 "`10` sorts before `2`" fix (comparing the *rendered* strings
+/// for `#`/`Tries` would sort `10` before `2`). #2524 grew this past the
+/// original `#`/`Tries` pair when `Tries` became three per-stage counts; a
+/// `contains()` check here is what keeps that from meaning three more
+/// one-off match arms in `queue_compare_rows` itself.
+const QUEUE_NUMERIC_COLS: [usize; 4] = [
+    CoordApp::QUEUE_COL_POSITION,
+    CoordApp::QUEUE_COL_WORK,
+    CoordApp::QUEUE_COL_SMOKE,
+    CoordApp::QUEUE_COL_REVIEW,
+];
+
+/// The typed value behind a numerically-sorted column (one of
+/// [`QUEUE_NUMERIC_COLS`]) — mirrors of the `position`/`work_count`/
+/// `smoke_count`/`review_count` fields on [`QueueRow`].
+fn queue_numeric_sort_key(row: &QueueRow, col: usize) -> i64 {
+    match col {
+        CoordApp::QUEUE_COL_POSITION => row.position,
+        CoordApp::QUEUE_COL_WORK => row.work_count,
+        CoordApp::QUEUE_COL_SMOKE => row.smoke_count,
+        CoordApp::QUEUE_COL_REVIEW => row.review_count,
+        _ => 0,
+    }
+}
+
+/// Order two Queue rows by `col` — numeric for [`QUEUE_NUMERIC_COLS`],
+/// case-insensitive text otherwise.
 fn queue_compare_rows(
     a: &QueueRow,
     b: &QueueRow,
     col: usize,
     dir: SortDirection,
 ) -> std::cmp::Ordering {
-    let base = match col {
-        CoordApp::QUEUE_COL_POSITION => a.position.cmp(&b.position),
-        CoordApp::QUEUE_COL_TRIES => a.attempts.cmp(&b.attempts),
-        _ => {
-            let empty = String::new();
-            let av = a.cells.get(col).unwrap_or(&empty).to_lowercase();
-            let bv = b.cells.get(col).unwrap_or(&empty).to_lowercase();
-            av.cmp(&bv)
-        }
+    let base = if QUEUE_NUMERIC_COLS.contains(&col) {
+        queue_numeric_sort_key(a, col).cmp(&queue_numeric_sort_key(b, col))
+    } else {
+        let empty = String::new();
+        let av = a.cells.get(col).unwrap_or(&empty).to_lowercase();
+        let bv = b.cells.get(col).unwrap_or(&empty).to_lowercase();
+        av.cmp(&bv)
     };
     match dir {
         SortDirection::Ascending => base,
@@ -2064,7 +2162,7 @@ pub(crate) fn dq_state_colors(state: &str) -> (Color, Color) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::fixtures::make_test_app;
+    use crate::app::fixtures::{make_assignment_typed, make_test_app};
 
     fn entry(
         issue: i64,
@@ -3186,10 +3284,12 @@ mod tests {
             ..BoardData::default()
         });
         let rows = app.queue_rows();
+        // Hold is cells[9] post-#2524 (After/Hold/Reason each shifted two
+        // slots right when Tries became #Work/#Smoke/#Review).
         let cell_for = |issue: i64| {
             rows.iter()
                 .find(|r| r.issue_number == issue)
-                .map(|r| r.cells[7].clone())
+                .map(|r| r.cells[9].clone())
                 .unwrap_or_else(|| panic!("row {issue} not found"))
         };
         assert_eq!(cell_for(2146), "FIRED");
@@ -3290,6 +3390,143 @@ mod tests {
             "a held row must survive the done filter, or Resume is unreachable"
         );
         assert!(rows[0].held);
+    }
+
+    // ── Q-4 (#2524): #Work/#Smoke/#Review counts + the live Machine ──────
+
+    /// Two `type="work"` assignments (the original dispatch, `done`, and a
+    /// `[fix-1]` bounce, `running`) plus one `done` `type="smoke"` — the
+    /// exact shape the issue describes. Counts land in their own buckets,
+    /// and `Machine` shows the RUNNING leg's machine, not the entry's own
+    /// (here unset) `--machine` pin.
+    #[test]
+    fn queue_row_counts_per_stage_assignments_and_shows_the_live_machine() {
+        let app = make_test_app(BoardData {
+            drive_queue: vec![entry(42, 0, QUEUE_STATE_RUNNING, &[])],
+            assignments: vec![
+                Assignment {
+                    id: "a-work-done".to_string(),
+                    machine: "alpha".to_string(),
+                    ..make_assignment_typed("done", 42, "myrepo", Some("work"))
+                },
+                Assignment {
+                    id: "a-work-running".to_string(),
+                    machine: "bravo".to_string(),
+                    ..make_assignment_typed("running", 42, "myrepo", Some("work"))
+                },
+                Assignment {
+                    id: "a-smoke-done".to_string(),
+                    machine: "alpha".to_string(),
+                    ..make_assignment_typed("done", 42, "myrepo", Some("smoke"))
+                },
+            ],
+            ..BoardData::default()
+        });
+        let rows = app.queue_rows();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(
+            row.work_count, 2,
+            "the original dispatch + the [fix-1] bounce are both type=\"work\""
+        );
+        assert_eq!(row.smoke_count, 1);
+        assert_eq!(row.review_count, 0);
+        assert_eq!(row.cells[CoordApp::QUEUE_COL_WORK], "2");
+        assert_eq!(row.cells[CoordApp::QUEUE_COL_SMOKE], "1");
+        assert_eq!(row.cells[CoordApp::QUEUE_COL_REVIEW], "0");
+        assert_eq!(
+            row.cells[4], "bravo",
+            "Machine must show the currently-RUNNING leg's machine, not \
+             stay blank or show a stale finished leg's machine"
+        );
+    }
+
+    /// A freshly-enqueued entry with nothing dispatched yet: zero counts,
+    /// no panic, and the dash placeholder (not a blank cell) for `Machine`.
+    #[test]
+    fn queue_row_zero_assignments_renders_zero_counts_and_dash_machine() {
+        let app = make_test_app(BoardData {
+            drive_queue: vec![entry(99, 0, QUEUE_STATE_WAITING, &[])],
+            ..BoardData::default()
+        });
+        let rows = app.queue_rows();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.work_count, 0);
+        assert_eq!(row.smoke_count, 0);
+        assert_eq!(row.review_count, 0);
+        assert_eq!(row.cells[CoordApp::QUEUE_COL_WORK], "0");
+        assert_eq!(row.cells[CoordApp::QUEUE_COL_SMOKE], "0");
+        assert_eq!(row.cells[CoordApp::QUEUE_COL_REVIEW], "0");
+        assert_eq!(row.cells[4], QUEUE_EMPTY_CELL);
+    }
+
+    /// A `waiting` entry that's pinned but has nothing currently running
+    /// (and, to prove the fallback is "nothing running", one unrelated
+    /// `done` assignment on a THIRD machine) must still show the pin, not
+    /// a dash and not the done leg's machine.
+    #[test]
+    fn queue_row_machine_falls_back_to_the_pin_when_nothing_is_running() {
+        let app = make_test_app(BoardData {
+            drive_queue: vec![BoardDriveQueueEntry {
+                machine: Some("pinned-box".to_string()),
+                ..entry(7, 0, QUEUE_STATE_WAITING, &[])
+            }],
+            assignments: vec![Assignment {
+                id: "a-work-done".to_string(),
+                machine: "finished-on-this-one".to_string(),
+                ..make_assignment_typed("done", 7, "myrepo", Some("work"))
+            }],
+            ..BoardData::default()
+        });
+        let rows = app.queue_rows();
+        assert_eq!(
+            rows[0].cells[4], "pinned-box",
+            "no assignment is RUNNING, so the operator's own pin wins over \
+             a finished leg's machine"
+        );
+    }
+
+    /// The three new count columns must sort as numbers, not as rendered
+    /// strings — the same #1762 defect ("`10` sorts before `2`") the
+    /// original `#`/`Tries` pair was fixed against.
+    #[test]
+    fn queue_new_count_columns_sort_numerically_not_lexically() {
+        let assignments_for = |issue: u64, n: usize| -> Vec<Assignment> {
+            ["work", "smoke", "review"]
+                .iter()
+                .flat_map(|atype| {
+                    (0..n).map(move |i| Assignment {
+                        id: format!("{issue}-{atype}-{i}"),
+                        ..make_assignment_typed("done", issue, "myrepo", Some(atype))
+                    })
+                })
+                .collect()
+        };
+        let mut assignments = assignments_for(1, 2);
+        assignments.extend(assignments_for(10, 10));
+        let mut app = make_test_app(BoardData {
+            drive_queue: vec![
+                entry(1, 0, QUEUE_STATE_WAITING, &[]),
+                entry(10, 1, QUEUE_STATE_WAITING, &[]),
+            ],
+            assignments,
+            ..BoardData::default()
+        });
+        for col in [
+            CoordApp::QUEUE_COL_WORK,
+            CoordApp::QUEUE_COL_SMOKE,
+            CoordApp::QUEUE_COL_REVIEW,
+        ] {
+            assert!(app.queue_sort_by_column(col));
+            let order: Vec<i64> = app.queue_rows().iter().map(|r| r.issue_number).collect();
+            assert_eq!(
+                order,
+                vec![1, 10],
+                "column {col}: the entry with 2 must sort before the one with \
+                 10, not lexically after it"
+            );
+        }
     }
 
     #[test]

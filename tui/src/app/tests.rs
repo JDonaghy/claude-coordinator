@@ -47439,7 +47439,10 @@ Milestone tracking issue.
     fn tuidriver_queue_panel_renders_the_declared_columns() {
         let driver = queue_driver(queue_fixture_json(), 200, 30);
         let screen = driver.screen();
-        for title in ["Issue", "Title", "State", "Machine", "Tries", "After", "Hold", "Reason"] {
+        for title in [
+            "Issue", "Title", "State", "Machine", "#Work", "#Smoke", "#Review", "After", "Hold",
+            "Reason",
+        ] {
             assert!(
                 screen.contains(title),
                 "#1866: the grid must carry a `{title}` column:\n{screen}"
@@ -47651,25 +47654,39 @@ Milestone tracking issue.
 
     #[test]
     fn queue_sort_orders_numeric_columns_numerically() {
-        // `Tries` runs 0, 0, 1, 3, 9 here. A lexical sort of the RENDERED
-        // strings would be indistinguishable at these values, so the test
-        // uses the raw comparator against a two-digit attempt count that
-        // sorts the other way as text ("10" < "9").
-        let mut app = queue_app(
+        // `#Work` runs 10 for issue 1 and 9 for issue 2. A lexical sort of
+        // the RENDERED strings would be indistinguishable at these values,
+        // so the test uses the raw comparator against a two-digit count
+        // that sorts the other way as text ("10" < "9").
+        let work_assignments = |issue: u64, n: usize| -> Vec<Assignment> {
+            (0..n)
+                .map(|i| Assignment {
+                    id: format!("r-{issue}-work-{i}"),
+                    ..make_assignment_typed("done", issue, "r", Some("work"))
+                })
+                .collect()
+        };
+        let mut assignments = work_assignments(1, 10);
+        assignments.extend(work_assignments(2, 9));
+        let mut app = make_app_with_drive_queue(
+            BoardData {
+                assignments,
+                ..BoardData::default()
+            },
             r#"[{"repo_name": "r", "issue_number": 1, "position": 0,
-                 "state": "waiting", "attempts": 10},
+                 "state": "waiting"},
                 {"repo_name": "r", "issue_number": 2, "position": 1,
-                 "state": "waiting", "attempts": 9}]"#,
+                 "state": "waiting"}]"#,
         );
         assert!(
-            app.queue_sort_by_column(CoordApp::QUEUE_COL_TRIES),
-            "sorting the Tries column must apply"
+            app.queue_sort_by_column(CoordApp::QUEUE_COL_WORK),
+            "sorting the #Work column must apply"
         );
-        let order: Vec<i64> = app.queue_rows().iter().map(|r| r.attempts).collect();
+        let order: Vec<i64> = app.queue_rows().iter().map(|r| r.work_count).collect();
         assert_eq!(
             order,
             vec![9, 10],
-            "#1866: `Tries` must sort numerically — a lexical sort would put \
+            "#2524: `#Work` must sort numerically — a lexical sort would put \
              10 before 9 (the #1762 defect)"
         );
     }
@@ -48590,7 +48607,7 @@ Milestone tracking issue.
     fn queue_detail_scroll_resets_when_a_header_sort_reshuffles_the_rows() {
         let mut app = queue_app(queue_fixture_json());
         app.queue_detail_scroll = 4;
-        assert!(app.queue_sort_by_column(CoordApp::QUEUE_COL_TRIES));
+        assert!(app.queue_sort_by_column(CoordApp::QUEUE_COL_WORK));
         assert_eq!(
             app.queue_detail_scroll, 0,
             "#1867: a re-sort can put a different entry at the same index \
@@ -49782,7 +49799,10 @@ Milestone tracking issue.
                  "position": 2, "state": "waiting",
                  "after_json": ["claude-coordinator#1834", "claude-coordinator#1241"]}
             ]"#,
-            220,
+            // #2524: three columns wider than when this width was picked
+            // (`Tries` → `#Work`/`#Smoke`/`#Review`), so `After` needs more
+            // room to stay untruncated at the same content.
+            260,
             30,
         );
         let screen = driver.screen();
