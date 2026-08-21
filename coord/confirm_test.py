@@ -82,7 +82,12 @@ saying so:
   that lesson is not re-learned here;
 * a timeout (:data:`~coord.revalidate.KIND_TIMEOUT`) — a hung or merely slow
   suite says nothing about the branch. Classifying a timeout as a refutation
-  would let a too-tight ceiling fail every branch in the fleet, so it does not.
+  would let a too-tight ceiling fail every branch in the fleet, so it does not;
+* an external signal killing the confirmation subprocess (:data:`KIND_SIGNAL`,
+  #2527) — a negative ``returncode`` from `subprocess.run` (e.g. ``-15`` for
+  SIGTERM), most often a `coord-agent`/`coord-serve` restart landing mid-run.
+  The command never ran to completion, exactly like a timeout, so it gets the
+  identical inconclusive treatment rather than being read as "ran and failed".
 
 That asymmetry is the safety property: the worst case of a broken confirmation
 environment is that the Test stage behaves exactly as it did before this module
@@ -181,6 +186,17 @@ DISABLE_ENV_VAR = "COORD_CONFIRM_TEST_VERDICT"
 _FALSEY = frozenset({"0", "false", "no", "off", ""})
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
+#: #2527: a confirmation subprocess terminated by an external signal (a
+#: coord-agent/coord-serve restart, a manual ``kill``, anything that delivers
+#: a signal rather than letting the command run to completion) — not
+#: :data:`KIND_TIMEOUT` (this module's own deadline) but the same shape from
+#: the branch's point of view: the suite never got a chance to finish, so
+#: nothing was learned about it. `subprocess.run` surfaces this as a negative
+#: ``returncode`` (``-signal.SIGTERM`` == ``-15``) through its normal return
+#: path rather than raising, which is exactly what let it slip past the
+#: existing ``TimeoutExpired`` carve-out and get misread as "ran and failed".
+KIND_SIGNAL = "signal"
+
 #: The only kinds that may overturn a PASS claim: a build or test command that
 #: ran to completion and returned nonzero. Nothing weaker. See the module
 #: docstring's fail-direction section — this frozenset IS that safety property.
@@ -188,7 +204,7 @@ REFUTING_KINDS = frozenset({KIND_BUILD, KIND_SUITE})
 
 #: Kinds meaning "the check could not reach a verdict". The caller falls back to
 #: the worker's own claim on any of these, which is pre-#2464 behaviour.
-INCONCLUSIVE_KINDS = frozenset({KIND_SETUP, KIND_INFRA, KIND_TIMEOUT})
+INCONCLUSIVE_KINDS = frozenset({KIND_SETUP, KIND_INFRA, KIND_TIMEOUT, KIND_SIGNAL})
 
 
 # ── Per-pass budget (#2464-review) ──────────────────────────────────────────
@@ -477,10 +493,35 @@ def _classify_failure(
 ) -> ConfirmationResult:
     """Turn a nonzero build/test exit into the right kind.
 
-    Order matters and mirrors :func:`coord.revalidate.revalidate`: infra first
-    (the suite never ran), then baseline-red (it ran, but the branch is not at
-    fault), and only what is left over is a genuine refutation.
+    Order matters and mirrors :func:`coord.revalidate.revalidate`: signal-kill
+    first (#2527 — the command never ran to completion at all, so there is
+    nothing left to classify), then infra (the suite never ran), then
+    baseline-red (it ran, but the branch is not at fault), and only what is
+    left over is a genuine refutation.
     """
+    if returncode < 0:
+        # #2527: a negative returncode means `subprocess.run` reports the
+        # child was killed BY a signal, not that it ran and exited nonzero —
+        # e.g. `-15` for SIGTERM from a `coord-agent`/`coord-serve` restart
+        # landing mid-confirmation, or a manual `kill`. Same fail-direction
+        # as `subprocess.TimeoutExpired` just above this function's callers:
+        # a command that never finished says nothing about the branch, so
+        # this must stay inconclusive — never `REFUTING_KINDS` — no matter
+        # how "nonzero" the raw exit code looks.
+        return ConfirmationResult(
+            kind=KIND_SIGNAL,
+            reason=(
+                f"confirmation {stage} command was killed by signal "
+                f"{-returncode} (exit {returncode}) rather than running to "
+                "completion — like a timeout, a command that never finished "
+                "says nothing about the branch, so this is not a refutation "
+                "(#2527)"
+            ),
+            output=_tail(output),
+            command=command,
+            returncode=returncode,
+            worktree=worktree,
+        )
     infra = is_infrastructure_failure(returncode, output)
     baseline = not infra and is_baseline_red_failure(returncode, output)
     if infra:
@@ -780,6 +821,7 @@ __all__ = [
     "CONFIRM_PASS_BUDGET_SECONDS",
     "DISABLE_ENV_VAR",
     "INCONCLUSIVE_KINDS",
+    "KIND_SIGNAL",
     "NOTIFY_BASE_CLIENT_TIMEOUT_SECONDS",
     "REFUTING_KINDS",
     "ConfirmationResult",

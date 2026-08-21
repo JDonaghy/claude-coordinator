@@ -2563,6 +2563,64 @@ class TestMuteSmokeLegLoopTerminates:
         )
 
 
+class TestConfirmedPassVerdictSignalKill:
+    """#2527: a confirmation subprocess killed by an external signal (a
+    `coord-agent`/`coord-serve` restart landing mid-run, a manual `kill`, ...)
+    must be treated as inconclusive, exactly like `subprocess.TimeoutExpired`
+    already is — never as a refutation.
+
+    `_confirmed_pass_verdict` branches purely on `ConfirmationResult`'s
+    `.refuted` / `.baseline_red` / `.confirmed` / `.inconclusive` properties,
+    so a stubbed `_run_pass_confirmation` returning a `KIND_SIGNAL` result
+    (coord/confirm_test.py's new classification for a negative returncode) is
+    enough to pin the notify-side outcome without spinning up a real
+    subprocess.
+    """
+
+    def _transition(self):
+        from coord.notify import Transition, EVENT_COMPLETION  # noqa: PLC0415
+
+        return Transition(
+            assignment_id="work-1",
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=42,
+            event=EVENT_COMPLETION,
+            exit_code=0,
+        )
+
+    def test_signal_killed_confirmation_is_unconfirmed_not_failed(self) -> None:
+        from coord import confirm_test as ct  # noqa: PLC0415
+        from coord.notify import _confirmed_pass_verdict  # noqa: PLC0415
+
+        killed = ct.ConfirmationResult(
+            kind=ct.KIND_SIGNAL,
+            reason=(
+                "confirmation suite command was killed by signal 15 (exit "
+                "-15) rather than running to completion — like a timeout, a "
+                "command that never finished says nothing about the branch, "
+                "so this is not a refutation (#2527)"
+            ),
+            returncode=-15,
+        )
+        entry = {"branch": "issue-42-fix-thing"}
+
+        with patch(
+            "coord.notify._run_pass_confirmation", return_value=killed,
+        ):
+            state, reason = _confirmed_pass_verdict(
+                self._transition(), entry, claim_reason="SMOKE: pass",
+            )
+
+        assert state == "passed", (
+            "a signal-killed confirmation subprocess never ran to completion "
+            f"— it must fall back to the worker's own claim, not fail closed "
+            f"(got state={state!r}, reason={reason!r})"
+        )
+        assert "REFUTED" not in reason
+        assert "UNCONFIRMED" in reason
+
+
 class _FakeAssignClient:
     """Minimal agent stand-in for `dispatch_smoke`: /health has no
     `tool_versions` (the #1570 D probe fails open) and /assign returns an id."""

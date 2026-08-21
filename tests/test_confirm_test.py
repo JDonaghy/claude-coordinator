@@ -299,6 +299,46 @@ class TestConfirmBranch:
         assert result.refuted is False
         assert result.inconclusive is True
 
+    def test_signal_killed_suite_is_inconclusive_not_a_refutation(
+        self, checkout: Path
+    ) -> None:
+        """#2527: a confirmation subprocess killed by an external signal (a
+        `coord-agent`/`coord-serve` restart, a manual `kill`, ...) surfaces as
+        a negative returncode through `subprocess.run`'s normal (non-raising)
+        return path. That must read exactly like a timeout — the command
+        never ran to completion, so nothing was learned about the branch —
+        not like a real nonzero exit that ran to completion and failed.
+        """
+        runner = _ScriptedRunner(default=_FakeProc(-15, stdout="killed"))
+        result = ct.confirm_branch(
+            "api", BRANCH, _StubConfig(repo_path=str(checkout)), runner=runner,
+        )
+
+        assert result.kind == ct.KIND_SIGNAL, result.reason
+        assert result.refuted is False, (
+            "a signal-killed subprocess must never overturn a pass claim — "
+            "it never ran to completion"
+        )
+        assert result.inconclusive is True
+        assert result.returncode == -15
+
+    def test_signal_killed_build_is_inconclusive_before_the_suite_runs(
+        self, checkout: Path
+    ) -> None:
+        repo = _StubRepo(build_command="build-it")
+        runner = _ScriptedRunner(results={"build-it": _FakeProc(-9, stderr="killed")})
+        result = ct.confirm_branch(
+            "api", BRANCH, _StubConfig(repo, repo_path=str(checkout)), runner=runner,
+        )
+
+        assert result.kind == ct.KIND_SIGNAL, result.reason
+        assert result.refuted is False
+        assert result.inconclusive is True
+        assert [c[0] for c in runner.calls] == ["build-it"], (
+            "a signal-killed build must short-circuit before the suite is "
+            "attempted, same as a real build failure"
+        )
+
     def test_ci_command_wins_over_test_command(self, checkout: Path) -> None:
         """#2091: when a repo declares what CI runs, confirm with THAT."""
         repo = _StubRepo(ci_command="the-ci-suite")
