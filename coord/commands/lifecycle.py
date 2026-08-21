@@ -130,8 +130,15 @@ def notify(config_path: Path) -> None:
     from coord.notify import run as run_notify
 
     cfg = _load_config(config_path)
-    posted, stuck, needs_attention, stalled, liveness = run_notify(cfg)
-    if not posted and not stuck and not needs_attention and not stalled and not liveness:
+    posted, stuck, needs_attention, stalled, liveness, phantom_healed = run_notify(cfg)
+    if (
+        not posted
+        and not stuck
+        and not needs_attention
+        and not stalled
+        and not liveness
+        and not phantom_healed
+    ):
         click.echo("No new transitions to notify.")
         return
     if posted:
@@ -173,6 +180,15 @@ def notify(config_path: Path) -> None:
                 f"#{lv.issue_number} (assignment {lv.assignment_id}, "
                 f"{lv.consecutive_blocked} consecutive blocked verdicts)"
             )
+    if phantom_healed:
+        click.echo(f"Auto-healed {len(phantom_healed)} phantom row(s) (#2536):")
+        for h in phantom_healed:
+            click.echo(
+                f"  [phantom-healed:{h.stage}] {h.machine_name} → {h.repo_name} "
+                f"#{h.issue_number} (assignment {h.assignment_id})"
+            )
+            click.echo(f"    {h.detail}")
+            click.echo(f"    → {h.action}")
     board = read_board()
 
     if is_round_complete(board) and cfg.hooks.on_round_complete:

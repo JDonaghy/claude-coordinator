@@ -1272,6 +1272,47 @@ class TestPipelineConfigParsing:
         ):
             load(p)
 
+    def test_auto_heal_phantom_rows_defaults_to_true(self, tmp_path) -> None:
+        """#2536: unlike auto_dispatch_stalled, the phantom-row self-heal
+        sweep ships lit — every action it takes is gated behind a
+        confirmed-dead liveness read plus an aged-out wall-clock buffer, and
+        it never dispatches work or touches a branch."""
+        from coord.config import load
+
+        p = tmp_path / "coordinator.yml"
+        p.write_text(
+            "repos:\n  - name: api\n    github: acme/api\n"
+            "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
+        )
+        cfg = load(p)
+        assert cfg.pipeline.auto_heal_phantom_rows is True
+
+    def test_can_disable_auto_heal_phantom_rows(self, tmp_path) -> None:
+        from coord.config import load
+
+        p = tmp_path / "coordinator.yml"
+        p.write_text(
+            "repos:\n  - name: api\n    github: acme/api\n"
+            "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
+            "pipeline:\n  auto_heal_phantom_rows: false\n"
+        )
+        cfg = load(p)
+        assert cfg.pipeline.auto_heal_phantom_rows is False
+
+    def test_invalid_auto_heal_phantom_rows_raises(self, tmp_path) -> None:
+        from coord.config import ConfigError, load
+
+        p = tmp_path / "coordinator.yml"
+        p.write_text(
+            "repos:\n  - name: api\n    github: acme/api\n"
+            "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
+            "pipeline:\n  auto_heal_phantom_rows: maybe\n"
+        )
+        with pytest.raises(
+            ConfigError, match="pipeline.auto_heal_phantom_rows must be a boolean"
+        ):
+            load(p)
+
 
 # ── Unit tests: Assignment.review_iteration persistence ─────────────────────
 

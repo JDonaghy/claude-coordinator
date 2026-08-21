@@ -2291,3 +2291,140 @@ def test_diagnose_without_json_flag_no_json_line(monkeypatch) -> None:
     assert result.exit_code == 0
     assert "DIAGNOSE_JSON:" not in result.output
     assert "DIAGNOSE_RESULT:" in result.output
+
+
+# ── #2536: fleet-wide phantom-row self-heal sweep ───────────────────────────
+
+
+@pytest.fixture
+def sweep_config() -> Config:
+    """A config with a tiny 'work' attention threshold so tests don't need
+    to fabricate hour-old timestamps to get past the aged-out guard."""
+    cfg = Config(
+        repos=[Repo(name="api", github="acme/api", default_branch="main")],
+        machines=[Machine(name="precision", host="precision.tailnet", repos=["api"])],
+    )
+    cfg.pipeline.attention_thresholds = {"work": 60.0}  # 1 minute
+    return cfg
+
+
+def test_sweep_heals_confirmed_dead_aged_out_row(monkeypatch, sweep_config) -> None:
+    """A running row whose session reads dead, and which is aged well past
+    its own threshold + buffer, gets the same recovery `--reset` runs."""
+    calls = _stub(monkeypatch, session="dead")
+    now = time.time()
+    # threshold(60s) + buffer(600s) = 660s; well past that.
+    a = _assign(aid="w1", status="running", dispatched_at=now - 3600)
+    board = Board(active=[a])
+
+    healed = diagnose.sweep_dead_running_rows(board, sweep_config, now=now)
+
+    assert len(healed) == 1
+    assert healed[0].assignment_id == "w1"
+    assert healed[0].repo_name == "api"
+    assert healed[0].issue_number == 42
+    assert "finalized phantom session" in healed[0].action
+    assert calls["finalize"] == ["w1"]
+
+
+def test_sweep_never_acts_on_live_session(monkeypatch, sweep_config) -> None:
+    """#1870/#2536: a LIVE session is never touched, no matter how old."""
+    calls = _stub(monkeypatch, session="live")
+    now = time.time()
+    a = _assign(aid="w1", status="running", dispatched_at=now - 3600)
+    board = Board(active=[a])
+
+    healed = diagnose.sweep_dead_running_rows(board, sweep_config, now=now)
+
+    assert healed == []
+    assert calls["finalize"] == []
+
+
+def test_sweep_never_acts_on_ambiguous_session(monkeypatch, sweep_config) -> None:
+    """#1870/#2536: an UNKNOWN liveness read (unresolvable machine,
+    unreachable agent, probe error) is never treated as dead."""
+    calls = _stub(monkeypatch, session="unknown")
+    now = time.time()
+    a = _assign(aid="w1", status="running", dispatched_at=now - 3600)
+    board = Board(active=[a])
+
+    healed = diagnose.sweep_dead_running_rows(board, sweep_config, now=now)
+
+    assert healed == []
+    assert calls["finalize"] == []
+
+
+def test_sweep_does_not_race_a_row_that_has_not_aged_out(monkeypatch, sweep_config) -> None:
+    """A row still inside threshold + buffer is left alone — and never even
+    gets a liveness probe, so a session merely between turns is never
+    raced."""
+    probed: list[str] = []
+    monkeypatch.setattr(
+        diagnose, "_session_state",
+        lambda a, c: probed.append(a.assignment_id) or "dead",
+    )
+    monkeypatch.setattr(diagnose, "_finalize_dead", lambda a, c: "advisory")
+    now = time.time()
+    # threshold(60s) + buffer(600s) = 660s — this row is only 30s old.
+    a = _assign(aid="w1", status="running", dispatched_at=now - 30)
+    board = Board(active=[a])
+
+    healed = diagnose.sweep_dead_running_rows(board, sweep_config, now=now)
+
+    assert healed == []
+    assert probed == []  # never even probed — the age guard runs first
+
+
+def test_sweep_dry_run_reports_without_finalizing(monkeypatch, sweep_config) -> None:
+    calls = _stub(monkeypatch, session="dead")
+    now = time.time()
+    a = _assign(aid="w1", status="running", dispatched_at=now - 3600)
+    board = Board(active=[a])
+
+    healed = diagnose.sweep_dead_running_rows(
+        board, sweep_config, now=now, dry_run=True,
+    )
+
+    assert len(healed) == 1
+    assert healed[0].action.startswith("(dry-run)")
+    assert calls["finalize"] == []
+
+
+def test_sweep_ignores_interactive_session_types(monkeypatch, sweep_config) -> None:
+    """An interactive type (e.g. 'chat') has no wall-clock concept at all —
+    attention_threshold_for returns inf — so it's never a heal candidate no
+    matter how old."""
+    calls = _stub(monkeypatch, session="dead")
+    now = time.time()
+    a = _assign(aid="c1", typ="chat", status="running", dispatched_at=now - 100_000)
+    board = Board(active=[a])
+
+    healed = diagnose.sweep_dead_running_rows(board, sweep_config, now=now)
+
+    assert healed == []
+    assert calls["finalize"] == []
+
+
+def test_sweep_finalize_failure_falls_back_to_mark_terminal(monkeypatch, sweep_config) -> None:
+    """A finalize that raises still gets a best-effort terminal mark, and
+    the row is still reported healed (with the failure noted)."""
+    monkeypatch.setattr(diagnose, "_session_state", lambda a, c: "dead")
+
+    def _boom(a, c):
+        raise RuntimeError("ssh timed out")
+
+    marked: list[str] = []
+    monkeypatch.setattr(diagnose, "_finalize_dead", _boom)
+    monkeypatch.setattr(
+        diagnose, "_mark_terminal",
+        lambda a, c: marked.append(a.assignment_id),
+    )
+    now = time.time()
+    a = _assign(aid="w1", status="running", dispatched_at=now - 3600)
+    board = Board(active=[a])
+
+    healed = diagnose.sweep_dead_running_rows(board, sweep_config, now=now)
+
+    assert len(healed) == 1
+    assert "finalize failed" in healed[0].action
+    assert marked == ["w1"]

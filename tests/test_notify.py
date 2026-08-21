@@ -132,7 +132,7 @@ class TestRun:
         agent_status = {"active": [], "completed": [_agent_completed("abc", "done")]}
         with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
              patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
-            posted, _stuck, _attn, _stalled, _liveness = notify_mod.run(config)
+            posted, _stuck, _attn, _stalled, _liveness, _phantom = notify_mod.run(config)
         assert len(posted) == 1
         mock_post.assert_called_once()
         # Comment body includes the completion marker
@@ -147,7 +147,7 @@ class TestRun:
         with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
              patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
             notify_mod.run(config)
-            posted_again, _stuck, _attn, _stalled, _liveness = notify_mod.run(config)
+            posted_again, _stuck, _attn, _stalled, _liveness, _phantom = notify_mod.run(config)
         # Comment posted exactly once across both runs
         assert mock_post.call_count == 1
         assert posted_again == []
@@ -232,7 +232,7 @@ class TestRun:
         }
         with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
              patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
-            posted, _stuck, _attn, _stalled, _liveness = notify_mod.run(config)
+            posted, _stuck, _attn, _stalled, _liveness, _phantom = notify_mod.run(config)
         assert len(posted) == 1
         mock_post.assert_called_once()
         body = mock_post.call_args.args[2]
@@ -267,6 +267,86 @@ class TestRun:
         assert "some unrelated final message" not in body
 
 
+# ── #2536: fleet-wide phantom-row self-heal sweep glue ──────────────────────
+
+
+class TestPhantomRowHealSweep:
+    """`coord.notify._sweep_phantom_rows` is thin glue around
+    `coord.diagnose.sweep_dead_running_rows`: read the board, run the sweep,
+    post one comment per row it healed. The sweep's own liveness/aged-out
+    logic is covered in tests/test_diagnose.py; these tests only cover the
+    notify-side wiring (the flag gate, the comment, the audit trail, and
+    `run()`'s new return element)."""
+
+    def _fake_heal(self, **overrides):
+        from coord.diagnose import PhantomRowHeal
+
+        base = dict(
+            assignment_id="w1",
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=42,
+            stage="work",
+            detail="work row running 60m (past its 45m needs-attention "
+            "threshold + 10m buffer) — session confirmed dead on machine 'laptop'",
+            action="finalized phantom session (advisory)",
+        )
+        base.update(overrides)
+        return PhantomRowHeal(**base)
+
+    def test_disabled_flag_skips_sweep_entirely(self, coord_dir: Path, config: Config) -> None:
+        config.pipeline.auto_heal_phantom_rows = False
+        with patch("coord.diagnose.sweep_dead_running_rows") as mock_sweep:
+            result = notify_mod._sweep_phantom_rows(config)
+        assert result == []
+        mock_sweep.assert_not_called()
+
+    def test_enabled_by_default_posts_one_comment_per_heal(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        heal = self._fake_heal()
+        with patch("coord.diagnose.sweep_dead_running_rows", return_value=[heal]), \
+             patch("coord.notify.github_ops.post_issue_comment") as mock_post:
+            result = notify_mod._sweep_phantom_rows(config)
+
+        assert result == [heal]
+        mock_post.assert_called_once()
+        repo_github, issue_number, body = mock_post.call_args.args
+        assert repo_github == "acme/api"
+        assert issue_number == 42
+        assert "coord:event=phantom_row_healed" in body
+        assert "w1" in body
+        assert heal.detail in body
+        assert heal.action in body
+
+    def test_comment_failure_is_swallowed_and_row_excluded(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        """A GitHub-post failure must not crash the sweep — matches every
+        other best-effort sweep in this module."""
+        heal = self._fake_heal()
+        with patch("coord.diagnose.sweep_dead_running_rows", return_value=[heal]), \
+             patch(
+                 "coord.notify.github_ops.post_issue_comment",
+                 side_effect=RuntimeError("gh unavailable"),
+             ):
+            result = notify_mod._sweep_phantom_rows(config)
+        assert result == []
+
+    def test_run_returns_phantom_healed_as_sixth_element(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        heal = self._fake_heal()
+        with patch.object(notify_mod, "_agent_status", return_value=None), \
+             patch("coord.diagnose.sweep_dead_running_rows", return_value=[heal]), \
+             patch("coord.notify.github_ops.post_issue_comment"):
+            result = notify_mod.run(config)
+
+        assert len(result) == 6
+        posted, stuck, needs_attention, stalled, liveness, phantom_healed = result
+        assert phantom_healed == [heal]
+
+
 # ── #448: advisory (0-commit clean exit) notify ─────────────────────────────
 
 
@@ -282,7 +362,7 @@ class TestAdvisoryNotify:
         }
         with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
              patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
-            posted, _stuck, _attn, _stalled, _liveness = notify_mod.run(config)
+            posted, _stuck, _attn, _stalled, _liveness, _phantom = notify_mod.run(config)
         assert len(posted) == 1, "advisory transition must appear in posted list"
         mock_post.assert_called_once()
         body = mock_post.call_args.args[2]
@@ -325,7 +405,7 @@ class TestAdvisoryNotify:
         with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
              patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
             notify_mod.run(config)
-            posted_again, _, _attn, _stalled, _liveness = notify_mod.run(config)
+            posted_again, _, _attn, _stalled, _liveness, _phantom = notify_mod.run(config)
         assert mock_post.call_count == 1, "advisory comment must be posted exactly once"
         assert posted_again == []
 
@@ -373,7 +453,7 @@ class TestRefusedPolicyNotify:
         }
         with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
              patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
-            posted, _stuck, _attn, _stalled, _liveness = notify_mod.run(config)
+            posted, _stuck, _attn, _stalled, _liveness, _phantom = notify_mod.run(config)
         assert len(posted) == 1, "refused_policy transition must appear in posted list"
         mock_post.assert_called_once()
         body = mock_post.call_args.args[2]
@@ -455,7 +535,7 @@ class TestRefusedPolicyNotify:
         with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
              patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
             notify_mod.run(config)
-            posted_again, _, _attn, _stalled, _liveness = notify_mod.run(config)
+            posted_again, _, _attn, _stalled, _liveness, _phantom = notify_mod.run(config)
         assert mock_post.call_count == 1, "refused_policy comment must post exactly once"
         assert posted_again == []
 
@@ -632,7 +712,7 @@ class TestReviewNotify:
         with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
              patch("coord.notify.github_ops.post_pr_review") as mock_review, \
              patch("coord.dispatch.github_ops.post_issue_comment"):
-            posted, _stuck, _attn, _stalled, _liveness = notify_mod.run(config)
+            posted, _stuck, _attn, _stalled, _liveness, _phantom = notify_mod.run(config)
 
         assert len(posted) == 1
         # #248: the body is now prefixed with a machine-readable header.
@@ -656,7 +736,7 @@ class TestReviewNotify:
         with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
              patch("coord.notify.github_ops.post_pr_review") as mock_review, \
              patch("coord.dispatch.github_ops.post_issue_comment"):
-            posted, _stuck, _attn, _stalled, _liveness = notify_mod.run(config)
+            posted, _stuck, _attn, _stalled, _liveness, _phantom = notify_mod.run(config)
 
         assert len(posted) == 1
         # #248: header is prefixed; verdict + prose preserved.
@@ -680,7 +760,7 @@ class TestReviewNotify:
         with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
              patch("coord.notify.github_ops.post_pr_review") as mock_review, \
              patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
-            posted, _stuck, _attn, _stalled, _liveness = notify_mod.run(config)
+            posted, _stuck, _attn, _stalled, _liveness, _phantom = notify_mod.run(config)
 
         assert len(posted) == 1
         mock_review.assert_not_called()
@@ -722,7 +802,7 @@ class TestReviewNotify:
              patch.object(notify_mod, "_agent_status", return_value=agent_status), \
              patch("coord.notify.github_ops.post_pr_review") as mock_review, \
              patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
-            posted, _stuck, _attn, _stalled, _liveness = notify_mod.run(config)
+            posted, _stuck, _attn, _stalled, _liveness, _phantom = notify_mod.run(config)
 
         assert len(posted) == 1
         mock_review.assert_not_called()
@@ -757,7 +837,7 @@ class TestReviewNotify:
         with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
              patch("coord.notify.github_ops.post_pr_review") as mock_review, \
              patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
-            posted, _stuck, _attn, _stalled, _liveness = notify_mod.run(config)
+            posted, _stuck, _attn, _stalled, _liveness, _phantom = notify_mod.run(config)
 
         assert len(posted) == 1
         mock_review.assert_not_called()
@@ -777,7 +857,7 @@ class TestReviewNotify:
         with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
              patch("coord.notify.github_ops.post_pr_review") as mock_review, \
              patch("coord.notify.github_ops.post_issue_comment") as mock_post:
-            posted, _stuck, _attn, _stalled, _liveness = notify_mod.run(config)
+            posted, _stuck, _attn, _stalled, _liveness, _phantom = notify_mod.run(config)
 
         assert len(posted) == 1
         mock_review.assert_not_called()
@@ -800,7 +880,7 @@ class TestReviewNotify:
              patch("coord.notify.github_ops.post_pr_review") as mock_review, \
              patch("coord.dispatch.github_ops.post_issue_comment"):
             notify_mod.run(config)
-            posted_again, _, _attn, _stalled, _liveness = notify_mod.run(config)
+            posted_again, _, _attn, _stalled, _liveness, _phantom = notify_mod.run(config)
 
         assert posted_again == []
         assert mock_review.call_count == 1
@@ -822,7 +902,7 @@ class TestReviewNotify:
                  side_effect=RuntimeError("GraphQL: Can't request changes on your own pull request"),
              ) as mock_pr_review, \
              patch("coord.notify.github_ops.post_issue_comment") as mock_post:
-            posted, _stuck, _attn, _stalled, _liveness = notify_mod.run(config)
+            posted, _stuck, _attn, _stalled, _liveness, _phantom = notify_mod.run(config)
 
         assert len(posted) == 1
         # PR review was attempted then failed.  #248: body carries the header.

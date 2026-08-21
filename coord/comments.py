@@ -53,6 +53,16 @@ EVENT_STALLED = "stalled_pipeline"
 # surfacing only, exactly like EVENT_NEEDS_ATTENTION/EVENT_STALLED: never
 # gates status/review_state/test_state.
 EVENT_LIVENESS_STALL = "liveness_stall"
+# #2536: a `running` row the fleet-wide sweep
+# (`coord.diagnose.sweep_dead_running_rows`) confirmed dead via its own
+# recorded machine's live status, found aged well past its own
+# EVENT_NEEDS_ATTENTION wall-clock threshold, and auto-healed with the same
+# non-destructive recovery `coord diagnose --reset` runs by hand — branch
+# and commits preserved, stage re-dispatchable, and (as a side effect of the
+# row leaving `running`) its repo's drive-queue concurrency slot freed.
+# Unlike every other EVENT_* above, this one narrates an action ALREADY
+# TAKEN, not only a finding.
+EVENT_PHANTOM_HEALED = "phantom_row_healed"
 
 
 @dataclass
@@ -475,6 +485,55 @@ def format_liveness_stall(
         "for pennies and is meant to be wrong sometimes — a human should "
         "take a look with `coord log <id>` and decide whether to "
         "intervene.",
+    ]
+    return "\n".join(lines)
+
+
+def format_phantom_row_healed(
+    *,
+    assignment_id: str,
+    machine_name: str,
+    repo_name: str,
+    issue_number: int,
+    stage: str,
+    detail: str,
+    action: str,
+) -> str:
+    """Format a "phantom row auto-healed" comment (#2536).
+
+    Mirrors :func:`format_needs_attention`'s shape (same headings, same
+    "detection ... human should look" register), with one deliberate
+    difference: this one is posted AFTER the automatic, non-destructive
+    ``coord diagnose --reset``-equivalent recovery already ran, not before
+    it — *detail* explains what was confirmed (dead session, aged past
+    threshold), *action* what was actually done.
+    """
+    marker = _marker(
+        EVENT_PHANTOM_HEALED,
+        assignment=assignment_id,
+        machine=machine_name,
+        repo=repo_name,
+        stage=stage,
+    )
+    lines = [
+        marker,
+        "## 🩹 Phantom row auto-healed",
+        f"**Machine:** {machine_name}",
+        f"**Assignment:** {assignment_id}",
+        f"**Issue:** #{issue_number}",
+        f"**Stage:** {stage}",
+        "",
+        detail.strip(),
+        "",
+        f"**Action taken:** {action.strip()}",
+        "",
+        "This session's own recorded machine reported nothing active for "
+        "it, and the row had already sat well past its own needs-attention "
+        "threshold — the same phantom-row recovery `coord diagnose "
+        "--reset` performs by hand ran automatically. The branch and any "
+        "commits are preserved, the stage is re-dispatchable, and this "
+        "repo's drive-queue slot is freed. If this looks wrong, `coord log "
+        "<id>` / `coord diagnose <repo> <issue>` can confirm what happened.",
     ]
     return "\n".join(lines)
 

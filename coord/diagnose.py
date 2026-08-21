@@ -1454,6 +1454,163 @@ def _is_stale(assignment: "Assignment", *, max_age_hours: float = 12.0) -> bool:
     return (time.time() - assignment.dispatched_at) > max_age_hours * 3600.0
 
 
+# ── #2536: fleet-wide phantom-row self-heal sweep ───────────────────────────
+#
+# `_cleanup_issue` above already recovers phantom `running` rows — but only
+# ONE issue at a time, and only when a human happens to run `coord diagnose
+# <repo> <issue> --reset`. Nothing runs that recovery on its own, so a
+# phantom row can sit indefinitely holding its repo's entire drive-queue
+# concurrency slot (`coord/drive_queue.py`'s own capacity comment: "a drive
+# whose observer died still holds its repo's slot until something reconciles
+# it"). :func:`sweep_dead_running_rows` is that "something" — a fleet-wide,
+# board-scanning counterpart callable periodically (see
+# `coord.notify._sweep_phantom_rows`, which piggybacks it on
+# `coord-notify.timer`'s existing 5-minute cadence) rather than only on
+# operator demand.
+
+# How far past a row's own needs-attention wall-clock threshold it must sit
+# before this sweep will treat a CONFIRMED-dead session as safe to
+# auto-heal. Two full `coord-notify.timer` cycles (5min cadence) of margin:
+# large enough that `coord.notify.detect_needs_attention` has already had a
+# full extra tick to flag (and a human a full extra tick to notice) the same
+# row via the existing `needs_attention` comment before this sweep ever
+# touches it, small enough that a genuinely dead row doesn't sit much longer
+# than it already would have. Never a substitute for the liveness check
+# below — a row can be arbitrarily old and still left alone if its session
+# reads "live" or "unknown".
+PHANTOM_HEAL_BUFFER_SECONDS = 600.0
+
+
+@dataclass
+class PhantomRowHeal:
+    """One board row this sweep confirmed dead, aged out past its own
+    needs-attention threshold, and healed automatically (or, in a dry run,
+    WOULD heal) — see :func:`sweep_dead_running_rows`."""
+
+    assignment_id: str
+    machine_name: str
+    repo_name: str
+    issue_number: int
+    stage: str
+    detail: str
+    action: str = ""
+
+
+def sweep_dead_running_rows(
+    board: "Board",
+    config: "Config",
+    *,
+    now: float | None = None,
+    dry_run: bool = False,
+) -> list[PhantomRowHeal]:
+    """The automatic counterpart to a human running ``coord diagnose <repo>
+    <issue> --reset`` on a phantom ``running`` row (#2536).
+
+    Scans every ``running``/``pending`` row on *board* (fleet-wide, not
+    scoped to one issue — unlike :func:`_cleanup_issue`) and, for each,
+    applies the same two guards a careful human would before touching a
+    row that merely *looks* wedged:
+
+    1. **Confirmed dead, never ambiguous** — liveness is read via
+       :func:`_session_state` (tmux first, local or remote, falling back to
+       the assignment's own recorded machine's ``/status``), and only a
+       ``"dead"`` verdict is actionable. ``"unknown"`` (an unresolvable or
+       unconfigured machine, an unreachable agent, a probe error) is always
+       left alone, exactly like ``"live"`` — the same #1870 caution
+       ``coord/drive_queue.py`` documents ("liveness cannot be verified from
+       here, so this is UNKNOWN, not dead") applies here too: only the
+       assignment's own recorded machine can make this call.
+    2. **Aged out, not merely between turns** — the row must be running
+       longer than its own ``config.pipeline.attention_threshold_for(...)``
+       (the same wall-clock threshold
+       :func:`coord.notify.detect_needs_attention` uses) PLUS
+       :data:`PHANTOM_HEAL_BUFFER_SECONDS` of margin, so a session that is
+       merely idle between turns or briefly disconnected is never raced.
+
+    Recovery, once both guards pass, is byte-for-byte
+    :func:`_finalize_dead` — the exact non-destructive action ``coord
+    diagnose --reset`` runs for a phantom row: branch and commits are always
+    preserved, and the stage becomes re-dispatchable. Writes go through the
+    same seam (``issue_store``, not ``save_board``) :func:`_cleanup_issue`
+    already uses, so this function never mutates *board* and the caller
+    does not need to persist it. Freeing the row's repo's drive-queue slot
+    is then a side effect of the write, not something this function or its
+    caller has to do explicitly — the next board read simply no longer
+    counts the row as ``running``.
+
+    Returns one :class:`PhantomRowHeal` per row healed (or, when *dry_run*,
+    per row that WOULD be healed), so the caller can post a GitHub comment
+    recording it — mirroring the existing ``needs_attention`` comment's
+    posture, but reporting an action already taken rather than only a
+    finding.
+    """
+    if now is None:
+        now = time.time()
+
+    healed: list[PhantomRowHeal] = []
+    seen_ids: set[str] = set()
+    for a in (board.active + board.completed):
+        if a.status not in ("running", "pending"):
+            continue
+        if not a.assignment_id or a.assignment_id in seen_ids:
+            continue
+        seen_ids.add(a.assignment_id)
+        if not a.dispatched_at:
+            continue  # nothing to compute an age from — never guess
+
+        threshold = config.pipeline.attention_threshold_for(
+            a.type or "work",
+            provider_name=a.provider_name,
+            review_of_assignment_id=a.review_of_assignment_id,
+        )
+        if threshold == float("inf"):
+            continue  # interactive session type — no wall-clock concept
+        running_for = now - a.dispatched_at
+        if running_for <= threshold + PHANTOM_HEAL_BUFFER_SECONDS:
+            continue  # not aged out yet — don't race a session between turns
+
+        if _session_state(a, config) != "dead":
+            # "unknown" or "live" — only ever act on a CONFIRMED-dead read,
+            # never an ambiguous one (#1870/#2536).
+            continue
+
+        detail = (
+            f"{a.type or 'work'} row running {running_for / 60.0:.0f}m "
+            f"(past its {threshold / 60.0:.0f}m needs-attention threshold + "
+            f"{PHANTOM_HEAL_BUFFER_SECONDS / 60.0:.0f}m buffer) — session "
+            f"confirmed dead on machine {a.machine_name!r}"
+        )
+        if dry_run:
+            healed.append(PhantomRowHeal(
+                assignment_id=a.assignment_id,
+                machine_name=a.machine_name or "unknown",
+                repo_name=a.repo_name,
+                issue_number=a.issue_number,
+                stage=a.type or "work",
+                detail=detail,
+                action="(dry-run) would finalize the phantom session",
+            ))
+            continue
+
+        try:
+            action = f"finalized phantom session ({_finalize_dead(a, config)})"
+        except Exception as exc:  # noqa: BLE001 — fall back to a direct terminal mark
+            _mark_terminal(a, config)
+            action = f"finalize failed ({exc}); marked row terminal directly"
+
+        healed.append(PhantomRowHeal(
+            assignment_id=a.assignment_id,
+            machine_name=a.machine_name or "unknown",
+            repo_name=a.repo_name,
+            issue_number=a.issue_number,
+            stage=a.type or "work",
+            detail=detail,
+            action=action,
+        ))
+
+    return healed
+
+
 # ── #618: orphaned worktree detection + pruning ──────────────────────────────
 
 
