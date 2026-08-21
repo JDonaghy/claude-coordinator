@@ -4981,6 +4981,119 @@ def _maybe_clear_expected_red(entry: QueuedMerge, board, gh_ops: GhOps) -> Merge
     return MergeEvent(entry, event_type, msg)
 
 
+def _maybe_push_design_round(
+    entry: QueuedMerge, config, gh_ops: GhOps
+) -> "MergeEvent | None":
+    """PDR-3 (#2508): right after a `type="mock-author"` (Gate A) PR has
+    actually merged into ``entry.target_branch``, push its rendered mock
+    bundle + contract to the portal as a design round — the epic-#2506
+    bridge's third leg, wiring PDR-1's link (``coord portal link``,
+    #2507) and PDR-2's upload route (coord-portal#120) into the one signal
+    ``coord/merge_queue.py`` already fires for any assignment type: a real
+    merge.
+
+    Returns ``None`` for every "nothing to do" reason — not a `mock-author`
+    entry, no ``portal:`` block configured, the tracking issue isn't under
+    a milestone, or (the common case pre-#2508) the milestone has no portal
+    link on file. That last one is the fail-open posture
+    ``coord.portal_bridge``'s module docstring already states for the rest
+    of this bridge: "a portal outage must never block a merge or a
+    dispatch" applies just as much to "there's simply no portal submission
+    for this milestone yet" — until an operator runs ``coord portal link``,
+    this is silently, correctly, a no-op. Every other failure (can't fetch
+    the tracking issue, can't collect the bundle, upload/enqueue rejected)
+    degrades to a ``design_round_push_failed`` event rather than raising —
+    called from ``process()`` inside its own try/except, same discipline as
+    :func:`_maybe_clear_expected_red` right above it, but belt-and-braces
+    here too since this reaches out to two different externals (GitHub's
+    Contents API and the portal itself).
+    """
+    if entry.assignment_type != "mock-author":
+        return None
+    portal_cfg = getattr(config, "portal", None)
+    if portal_cfg is None or not portal_cfg.enabled:
+        return None
+
+    # #1467-style optional probe: `get_issue` isn't part of the GhOps
+    # Protocol proper (most stubs in tests never need it), so a stub that
+    # doesn't implement it degrades to "nothing to do" rather than an
+    # AttributeError — mirrors `branch_has_merge_commit`'s optional-probe
+    # pattern used for the rebase→squash fallback above.
+    get_issue = getattr(gh_ops, "get_issue", None)
+    if get_issue is None:
+        return None
+    try:
+        issue_data = get_issue(entry.repo_github, entry.issue_number)
+    except Exception as e:  # noqa: BLE001 — best-effort, see docstring
+        return MergeEvent(
+            entry, "design_round_push_failed",
+            f"could not fetch tracking issue #{entry.issue_number}: {e}",
+        )
+    milestone = (issue_data or {}).get("milestone") or {}
+    milestone_number = milestone.get("number")
+    if milestone_number is None:
+        # A "mock-author" entry not scoped to a milestone at all (shouldn't
+        # happen via `coord acceptance mock`, which always resolves one —
+        # but this hook must survive a hand-dispatched entry that skips it).
+        return None
+
+    from coord import portal_store  # noqa: PLC0415
+
+    link = portal_store.get_milestone_link(
+        repo_name=entry.repo_name, milestone_number=milestone_number
+    )
+    if link is None:
+        # PDR-1: no `coord portal link` recorded for this milestone yet —
+        # the whole point of the fail-open posture (see docstring above).
+        return None
+
+    from coord.mock_author import build_design_round, collect_mock_bundle_files  # noqa: PLC0415
+    from coord.portal_bridge import PortalBridgeError, client_from_config  # noqa: PLC0415
+    from coord.portal_sync import PortalSyncError, enqueue_design_round  # noqa: PLC0415
+
+    client = client_from_config(portal_cfg)
+    if client is None:
+        return None
+
+    try:
+        files = collect_mock_bundle_files(
+            entry.repo_github, milestone_number, entry.target_branch
+        )
+    except Exception as e:  # noqa: BLE001 — best-effort, see docstring
+        return MergeEvent(
+            entry, "design_round_push_failed",
+            f"could not collect mock bundle: {e}",
+        )
+    if not files:
+        return MergeEvent(
+            entry, "design_round_push_skipped",
+            f"no rendered mock bundle found on {entry.target_branch} for "
+            f"ms-{milestone_number} — nothing to push",
+        )
+
+    try:
+        bundle_key = client.upload_bundle(link.submission_id, files)
+    except PortalBridgeError as e:
+        return MergeEvent(entry, "design_round_push_failed", f"bundle upload failed: {e}")
+
+    design_round = build_design_round(
+        milestone_title=milestone.get("title") or f"ms-{milestone_number}",
+        tracking_issue_title=issue_data.get("title") or "",
+        tracking_issue_body=issue_data.get("body") or "",
+        bundle_key=bundle_key,
+    )
+    try:
+        row = enqueue_design_round(link.submission_id, design_round)
+    except PortalSyncError as e:
+        return MergeEvent(entry, "design_round_push_failed", f"enqueue failed: {e}")
+
+    return MergeEvent(
+        entry, "design_round_queued",
+        f"queued design round for portal submission {link.submission_id} "
+        f"(seq={row.seq}, bundle_key={bundle_key})",
+    )
+
+
 def process(
     items: list[QueuedMerge],
     gh_ops: GhOps,
@@ -6205,6 +6318,20 @@ def process(
                     clear_event = MergeEvent(entry, "expected_red_clear_failed", str(e))
                 if clear_event is not None:
                     events.append(clear_event)
+                # PDR-3 (#2508): a merged Gate-A (`type="mock-author"`)
+                # branch auto-pushes a design round to the portal, if (and
+                # only if) its milestone has a portal link on file. Best
+                # effort, same as the expected_red clear above — a portal
+                # outage, or simply no `coord portal link` recorded, must
+                # never undo a real merge.
+                try:
+                    design_round_event = _maybe_push_design_round(entry, config, gh_ops)
+                except Exception as e:  # noqa: BLE001 — bookkeeping, never undoes a real merge
+                    design_round_event = MergeEvent(
+                        entry, "design_round_push_failed", str(e)
+                    )
+                if design_round_event is not None:
+                    events.append(design_round_event)
                 continue
             entry.state = CONFLICT
             entry.error = msg

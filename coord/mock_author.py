@@ -25,10 +25,18 @@ TYPES``) and the matching exemption from the acceptance-dir auto-forbid in
 Work → Test → Review → Merge pipeline as any other branch (`required_gates`
 is the repo's normal `default_gates`) — Gate A produces a normal reviewed
 commit, not a special-cased one.
+
+**PDR-3 (#2508):** :func:`collect_mock_bundle_files` and
+:func:`build_design_round` are the other end of Gate A's output — read back
+off a merged mock-author branch and reshaped into a portal design round by
+``coord.merge_queue``'s post-merge hook, so a Gate-A merge auto-pushes a
+design round to any milestone with a portal link (`coord portal link`,
+PDR-1/#2507) instead of that link sitting unread.
 """
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 import httpx
 
@@ -332,3 +340,97 @@ def dispatch_acceptance_mock(
         pass
 
     return assignment_id, machine.name
+
+
+# ── PDR-3 (#2508): reading a merged Gate-A branch back into a design round ──
+
+
+def collect_mock_bundle_files(
+    repo_github: str, milestone_number: int, branch: str
+) -> dict[str, str]:
+    """Read a rendered Gate-A bundle off *branch* (post-merge) via the
+    GitHub Contents API — no local checkout, the same "gh-only wire layer"
+    posture the merge queue's other post-merge reads already use (see e.g.
+    ``coord.acceptance.clear_expected_red_via_pr``'s docstring).
+
+    Returns a ``{relative_path: content}`` mapping — ``"contract.md"`` plus
+    every ``mocks/*.html`` fixture under
+    ``tests/acceptance/ms-<milestone_number>/`` — ready to hand straight to
+    :meth:`coord.portal_bridge.PortalBridgeClient.upload_bundle`. Empty
+    when the directory doesn't exist on *branch* (Gate A hasn't merged
+    anything there yet, or the repo's acceptance driver renders to a
+    different mock glob than ``*.html``) — callers treat that as "nothing
+    to push", not an error.
+    """
+    ms_dir = f"tests/acceptance/{ms_dirname(milestone_number)}"
+    files: dict[str, str] = {}
+    if github_ops.repo_file_exists(repo_github, f"{ms_dir}/contract.md", branch):
+        files["contract.md"] = github_ops.get_repo_file(
+            repo_github, f"{ms_dir}/contract.md", branch
+        )
+    try:
+        mock_names = github_ops.list_repo_dir(repo_github, f"{ms_dir}/mocks", branch)
+    except RuntimeError:
+        # No `mocks/` dir on this branch at all — same "nothing to push"
+        # case list_repo_dir already returns [] for a missing path; the
+        # explicit catch is only for a `gh` error shaped differently.
+        mock_names = []
+    for name in mock_names:
+        if name.endswith(".html"):
+            files[f"mocks/{name}"] = github_ops.get_repo_file(
+                repo_github, f"{ms_dir}/mocks/{name}", branch
+            )
+    return files
+
+
+def build_design_round(
+    *,
+    milestone_title: str,
+    tracking_issue_title: str,
+    tracking_issue_body: str,
+    bundle_key: str,
+    round_number: int = 1,
+) -> dict[str, Any]:
+    """Build the D1 metadata half of a design round from the same inputs
+    `coord milestone chat`'s steward already reads: the tracking issue's
+    title/body (source of the plain-language ``outcome_definition``) and its
+    ``## Work order`` block (source of the ``decomposition``).
+
+    *bundle_key* is the R2 object key
+    :meth:`coord.portal_bridge.PortalBridgeClient.upload_bundle` returned
+    for this round's rendered mock bundle + contract — see that method's
+    docstring and :func:`coord.portal_sync.enqueue_design_round`'s for why
+    the bundle itself is never inlined into this payload.
+
+    A missing/malformed ``## Work order`` block degrades to an empty
+    ``decomposition`` rather than raising — a milestone that hasn't written
+    one yet (or has a stale one that fails validation) should still get a
+    design round pushed with whatever plain-language description its
+    tracking issue carries; the portal shows a design round with no listed
+    decomposition just fine.
+    """
+    from coord.milestone_order import WorkOrderError, parse_work_order  # noqa: PLC0415
+
+    try:
+        work_order = parse_work_order(tracking_issue_body)
+    except WorkOrderError:
+        work_order = None
+    decomposition = [
+        {
+            "issue_number": node.issue_number,
+            "group": node.group,
+            "after": list(node.after),
+        }
+        for node in (work_order.nodes if work_order is not None else ())
+    ]
+    outcome_definition = (
+        tracking_issue_body.strip()
+        or tracking_issue_title.strip()
+        or milestone_title
+    )
+    return {
+        "round": round_number,
+        "outcome_definition": outcome_definition,
+        "decomposition": decomposition,
+        "bundle_key": bundle_key,
+    }
