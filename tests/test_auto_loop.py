@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import uuid
 from dataclasses import replace
 from typing import Any
@@ -2400,6 +2401,105 @@ class TestDispatchFixRemoteBranchGuard:
 
         assert result is not None
         assert result.machine_name == "server"
+
+
+# ── #2538: persistent "database is locked" must decline, not crash ─────────
+
+
+class TestDispatchFixDbContention:
+    """coord-portal#2538: a concurrent writer (the daemon's own passive
+    tick, another `coord merge`/`coord notify` invocation) can hold the DB
+    at the exact moment `record_dispatched_assignment` tries to record a
+    dispatched fix. `coord.state`'s own bounded retry
+    (`coord.db.retry_on_locked`) already rides out a short collision; this
+    covers what happens once that retry budget is well and truly exhausted
+    — `_dispatch_fix` must degrade to its documented "None on failure"
+    contract instead of letting the raw `sqlite3.OperationalError` crash
+    the caller (`coord merge`'s CI-fix queue, the review auto-loop, …)."""
+
+    def _work(self, machine: str = "laptop") -> Assignment:
+        return Assignment(
+            machine_name=machine,
+            repo_name="api",
+            issue_number=5,
+            issue_title="Fix thing",
+            briefing="Original briefing.",
+            assignment_id="work-2538",
+            status="done",
+            branch="issue-5-fix-thing",
+            dispatched_at=0.0,
+            finished_at=1.0,
+            type="work",
+        )
+
+    def test_persistent_lock_contention_returns_none_without_crashing(
+        self,
+    ) -> None:
+        cfg = _two_machine_config()
+        work = self._work()
+        board = Board(completed=[work])
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-2538-a"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+
+        with patch(
+            "coord.auto_loop.record_dispatched_assignment",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            result = _dispatch_fix(
+                work, "Fix briefing.", board, cfg, iteration=1,
+                http_client=mock_http,
+            )
+
+        assert result is None
+
+    def test_persistent_lock_contention_rolls_back_the_board_append(
+        self,
+    ) -> None:
+        """The fix assignment is appended to `board.active` before the DB
+        write is attempted (so a fully successful dispatch needs no extra
+        round trip) — a failed write must undo that append, or a later
+        `save_board` call (triggered by some OTHER entry succeeding in the
+        same `coord merge` tick) would persist a phantom row that was never
+        actually recorded."""
+        cfg = _two_machine_config()
+        work = self._work()
+        board = Board(completed=[work])
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-2538-b"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+
+        with patch(
+            "coord.auto_loop.record_dispatched_assignment",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            _dispatch_fix(
+                work, "Fix briefing.", board, cfg, iteration=1,
+                http_client=mock_http,
+            )
+
+        assert board.active == []
+
+    def test_unrelated_operational_error_still_propagates(self) -> None:
+        """A genuine bug (schema drift, a malformed statement) must not be
+        swallowed as if it were routine transient contention — only the
+        specific `database is locked` message is treated as declinable."""
+        cfg = _two_machine_config()
+        work = self._work()
+        board = Board(completed=[work])
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-2538-c"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+
+        with patch(
+            "coord.auto_loop.record_dispatched_assignment",
+            side_effect=sqlite3.OperationalError("no such column: bogus"),
+        ):
+            with pytest.raises(sqlite3.OperationalError, match="no such column"):
+                _dispatch_fix(
+                    work, "Fix briefing.", board, cfg, iteration=1,
+                    http_client=mock_http,
+                )
 
 
 # ── #1176: test-author bounce gets a type="test-author" fix, not "work" ─────

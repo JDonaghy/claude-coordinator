@@ -610,10 +610,24 @@ def _dispatch_ci_fixes(events, config, *, dry_run: bool) -> None:
                 details={"reason": "ci_fix_retry_cap", "error": entry.error},
             )
             dispatched_any = True  # the HUMAN_REQUIRED mutation needs saving
-        # else: budget remains but dispatch declined for another reason (no
-        # machine, an unrelated fix already in flight, agent unreachable) —
-        # leave the entry PENDING for the next tick to retry, exactly like a
-        # declined conflict-fix dispatch does.
+        else:
+            # Budget remains but dispatch declined for another reason (no
+            # machine, an unrelated fix already in flight, agent
+            # unreachable, or — #2538 — `_dispatch_fix` hit persistent
+            # "database is locked" contention recording the assignment
+            # after its own bounded retry budget was exhausted) — leave the
+            # entry PENDING for the next tick to retry, exactly like a
+            # declined conflict-fix dispatch does. Echoed (matching
+            # `_dispatch_conflict_fixes`'s equivalent branch) so an
+            # operator watching `coord merge` isn't left wondering why
+            # nothing happened for this entry — and so a transient DB lock
+            # collision on ONE entry is visibly a retry, not a silent drop,
+            # while every other entry keeps processing normally.
+            click.echo(
+                f"  {entry.repo_name} #{entry.issue_number}: "
+                "ci-fix not dispatched (no machine / already in flight / "
+                "transient DB contention — will retry next run)"
+            )
     if dispatched_any:
         save_board(fix_board)
 
