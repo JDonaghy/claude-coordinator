@@ -264,10 +264,36 @@ def compute_pipeline(
         # Evaluate from most advanced to least advanced.
         # #2498: an `mq_entry` (queued/merging/merged) no longer trumps
         # everything else when the linked review came back request-changes —
-        # fall through to the normal smoke/review evaluation below instead,
+        # fall through to the normal review/smoke evaluation below instead,
         # so a rejected review keeps showing as blocked even if it was
         # (incorrectly) enqueued before this fix, or by any other path that
         # doesn't re-check the verdict.
+        #
+        # #2498 (review 1): a *genuine* smoke/test failure or an
+        # in-progress smoke assignment must still be checked, and still win,
+        # BEFORE `review_assignment` — those are real, distinct signals
+        # (an infra failure, or a smoke run that hasn't finished yet) and
+        # existing coverage (test_failed_smoke_assignment_does_not_fall_
+        # through_to_review) depends on a failed smoke assignment surfacing
+        # even when a review also completed.
+        #
+        # But `assignment.smoke_test == "pass"` (and the sibling
+        # "smoke_assignment done → treat as passed" branch) is a different
+        # kind of signal: per `coord/state.py:_record_test_verdict_local`
+        # (#1384), recording `test_state="passed"` always mirrors to
+        # `smoke_test="pass"` on this same work assignment — the default
+        # behaviour on every ordinary Test-gate pass, not an edge case — and
+        # `auto_loop.py`'s `test_precedes_review` gate requires exactly that
+        # mirrored "passed" state before it will ever dispatch a review. So
+        # by the time `review_assignment` exists at all, `smoke_test` is
+        # already "pass" essentially every time — meaning checking it before
+        # `review_assignment` resolved `current_stage` to "smoke_passed" and
+        # never reached the review branch at all, leaving `review_rejected`
+        # unenforced on the realistic "Test passed, then Review rejected"
+        # path. A dispatched review is definitionally more advanced than a
+        # merely-passed Test gate (Test precedes Review), so the "pass"
+        # branches move below the review check while the failure/running
+        # branches stay above it.
         if mq_entry is not None and not review_rejected:
             from coord.merge_queue import MERGED, MERGING
 
@@ -277,8 +303,6 @@ def compute_pipeline(
                 current_stage = "merging"
             else:
                 current_stage = "merge_ready"
-        elif assignment.smoke_test == "pass":
-            current_stage = "smoke_passed"
         elif assignment.smoke_test == "fail":
             current_stage = "smoke_failed"
         elif smoke_assignment is not None and smoke_assignment.status in ("running", "pending"):
@@ -287,9 +311,6 @@ def compute_pipeline(
             # Smoke assignment itself failed (infra failure) — not the same as
             # the smoke *test* failing, but still unblocks the work assignment.
             current_stage = "smoke_failed"
-        elif smoke_assignment is not None and smoke_assignment.status in ("done",):
-            # Smoke assignment completed but smoke_test not yet set — treat as passed.
-            current_stage = "smoke_passed"
         elif review_assignment is not None:
             if review_assignment.status in ("running", "pending", "finalizing"):
                 # #1566: "finalizing" is a review row whose agent finished but
@@ -305,6 +326,11 @@ def compute_pipeline(
                 current_stage = "review_failed"
             else:
                 current_stage = "review_done"
+        elif assignment.smoke_test == "pass":
+            current_stage = "smoke_passed"
+        elif smoke_assignment is not None and smoke_assignment.status in ("done",):
+            # Smoke assignment completed but smoke_test not yet set — treat as passed.
+            current_stage = "smoke_passed"
         else:
             current_stage = "done"
     else:

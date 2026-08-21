@@ -1838,6 +1838,35 @@ class TestMergeQueueIgnoresRejectedReview:
         assert "enqueue" not in gate_actions
         assert "dispatch_fix" in gate_actions
 
+    def test_smoke_test_pass_then_rejected_review_is_not_smoke_passed(self) -> None:
+        """#2498 review 1: the realistic path. Per `_record_test_verdict_local`
+        (#1384), a passed Test gate always mirrors `smoke_test="pass"` onto
+        the parent work assignment BEFORE review ever dispatches (Test
+        precedes Review) — so `smoke_test == "pass"` is the normal state by
+        the time a review completes, not an edge case. The old elif-chain
+        checked `assignment.smoke_test == "pass"` before `review_assignment
+        is not None`, so it resolved to "smoke_passed" and never reached the
+        review_rejected guard at all: the review stage rendered "waiting"
+        (hiding that a review even ran) and the untouched `smoke_passed`
+        branch offered "enqueue" unconditionally — one click from queueing
+        rejected code. No `mq_entry` needed to trigger it."""
+        work = _work(aid="work-1", status="done", smoke_test="pass")
+        rev = _review(of_aid="work-1", status="done")
+        rev.review_verdict = "request-changes"
+        board = Board(completed=[work, rev])
+        pv = compute_pipeline(work, board, [], _config())
+
+        assert pv.current_stage not in ("smoke_passed", "merge_ready", "merging", "merged")
+        assert pv.current_stage == "review_done"
+
+        gate_actions = {g.action for g in pv.available_gates}
+        assert "enqueue" not in gate_actions
+        assert "dispatch_fix" in gate_actions
+
+        review = next(s for s in pv.stages if s.name == "review")
+        assert review.status != "waiting"
+        assert review.status != "completed"
+
     def test_review_done_approved_still_offers_enqueue_with_mq_entry_absent(self) -> None:
         """Sanity check the fix doesn't over-correct: an approved (or
         no-verdict-yet) review_done still offers enqueue, unaffected."""
