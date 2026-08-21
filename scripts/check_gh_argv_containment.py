@@ -17,6 +17,28 @@ not an AST walk -- cheap enough to run on every PR, and the invariant it
 guards ("does this file spell the literal string `gh` as its own quoted
 token") does not need a parser to detect.
 
+Supersedes `tests/test_no_direct_gh_calls.py` (#1483's original AST-based
+guard for this same invariant, added when only `github_ops.py`'s
+call-site shape needed catching). #2135 review flagged that the two
+guards were an undocumented split-brain: the AST walk only fires when a
+`["gh", ...]` literal is a *direct call argument*
+(`subprocess.run(["gh", ...])`), so it silently missed the
+variable-indirection shape (`cmd = ["gh", ...]; subprocess.run(cmd)`) that
+this regex scan does catch, since it matches the token wherever it sits on
+the line. Rather than keep two independently-maintained implementations of
+one invariant with two different blind spots, `test_no_direct_gh_calls.py`
+was deleted and this script is now the single implementation, exercised
+both by the dedicated `gh-argv-containment` CI job (`.github/workflows/
+test.yml`) and by the ordinary `pytest tests/` run, via
+`tests/test_check_gh_argv_containment.py::test_real_tree_is_clean` and
+friends -- one scan, reachable both ways, per the repo's "one question,
+one answer" rule (epic #2096). The trade-off this leaves: being a plain
+token scan rather than an AST walk, it can false-positive on a `"gh"`
+token that isn't argv (e.g. inside a docstring or an unrelated string
+literal) -- accepted deliberately, since a false positive costs an
+allowlist entry or a reword, while a false negative (the AST gap above)
+costs a silent regression of the epic's #1902 load-bearing assumption.
+
 Usage:
     python scripts/check_gh_argv_containment.py [repo-root]
 
@@ -97,7 +119,18 @@ def find_violations(repo_root: Path) -> list[Violation]:
             continue
         try:
             text = path.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, OSError):
+        except (UnicodeDecodeError, OSError) as exc:
+            # Every file under coord/ is expected to be UTF-8 Python
+            # source, so this should never actually fire -- but if it
+            # ever does, skipping silently would mean a real `gh` leak in
+            # that file goes undetected with no trace. Surface it on
+            # stderr rather than swallow it (#2135 review).
+            print(
+                f"check_gh_argv_containment: skipping {rel} "
+                f"(unreadable: {exc}) -- unable to scan for `gh` argv "
+                f"construction in this file",
+                file=sys.stderr,
+            )
             continue
         for lineno, line in enumerate(text.splitlines(), start=1):
             if _GH_TOKEN_RE.search(line) and not _is_allowlisted(rel, line):

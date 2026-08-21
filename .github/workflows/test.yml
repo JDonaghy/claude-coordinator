@@ -156,8 +156,15 @@ jobs:
   # #2135 (child of epic #1902): "every `gh` argv construction lives inside
   # coord/github_ops.py" is the load-bearing assumption under the #1902
   # forge-portability cost estimate — it's the fact that makes the eventual
-  # port a refactor instead of a rewrite. Before this job it was protected
-  # by nothing but convention (a grep someone remembered to run by hand).
+  # port a refactor instead of a rewrite. #1483 already guarded direct
+  # call-argument leaks with an AST scan (formerly
+  # tests/test_no_direct_gh_calls.py), but that walk missed the
+  # variable-indirection shape (`cmd = ["gh", ...]; subprocess.run(cmd)`).
+  # This job's dedicated regex scan catches that gap too, so
+  # test_no_direct_gh_calls.py was retired in its favor rather than kept
+  # running alongside it as a second, disagreeing implementation of the
+  # same invariant (#2135 review) — see scripts/check_gh_argv_containment.py's
+  # module docstring for the full reconciliation.
   #
   # scripts/check_gh_argv_containment.py scans coord/**/*.py for a bare
   # `"gh"`/`'gh'` token outside coord/github_ops.py, with one explicit,
