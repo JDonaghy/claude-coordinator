@@ -4373,7 +4373,7 @@ impl CoordApp {
 
     /// #2513 (PDR-5): local-filesystem check — whether
     /// `tests/acceptance/ms-NN/mocks/` exists and has at least one rendered
-    /// file in the issue's local checkout, where NN is the issue's
+    /// `.html` file in the issue's local checkout, where NN is the issue's
     /// milestone number (via `pipeline_issue_milestone`). Same shape as
     /// `gate_a_contract_exists_for` right above (#2501's "can't dispatch,
     /// so don't offer it" posture), checking the mocks directory instead of
@@ -4381,6 +4381,13 @@ impl CoordApp {
     /// disk to upload before Gate A has rendered at least one mock.
     /// Conservatively `false` when the issue has no resolvable milestone or
     /// no local checkout path is known.
+    ///
+    /// Filters on `.html` suffix to mirror the CLI's own
+    /// `_collect_local_mock_bundle_files` (`coord/commands/portal.py`),
+    /// which globs `mocks/*.html` — a `mocks/` dir containing only
+    /// non-`.html` junk (a stray file, an empty subdirectory, `.DS_Store`)
+    /// would otherwise enable this menu item only for the dispatched
+    /// `coord portal publish-mocks` to fail loud with "nothing to publish".
     pub(crate) fn gate_a_mocks_dir_exists_for(&self, issue: &PipelineIssue) -> bool {
         let Some((milestone_number, _)) = self.pipeline_issue_milestone(issue) else {
             return false;
@@ -4398,7 +4405,15 @@ impl CoordApp {
             .join("mocks");
         mocks_dir
             .read_dir()
-            .map(|mut entries| entries.next().is_some())
+            .map(|entries| {
+                entries.filter_map(Result::ok).any(|entry| {
+                    entry.path().is_file()
+                        && entry
+                            .path()
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("html"))
+                })
+            })
             .unwrap_or(false)
     }
 

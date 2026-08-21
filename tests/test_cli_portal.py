@@ -528,6 +528,28 @@ def test_publish_mocks_errors_when_bundle_is_empty(tmp_path, monkeypatch):
     assert "nothing to publish" in result.output
 
 
+def test_publish_mocks_errors_on_non_utf8_mock_file(tmp_path, monkeypatch):
+    """A stray non-UTF-8 file under ``mocks/`` must surface as a named CLI
+    error (#2513 review follow-up), not a raw ``UnicodeDecodeError``
+    traceback."""
+    from coord import portal_store
+
+    repo_dir = _mock_bundle_dir(tmp_path, milestone_number=9)
+    (repo_dir / "tests" / "acceptance" / "ms-9" / "mocks" / "binary.html").write_bytes(
+        b"\xff\xfe not valid utf-8"
+    )
+    cfg_path = _config_with_repo_path(tmp_path, repo_dir)
+    portal_store.link_milestone(
+        repo_name="coord", milestone_number=9, submission_id="sub_1"
+    )
+    monkeypatch.setattr("coord.github_ops.get_issue", _stub_get_issue())
+
+    result = run("portal", "publish-mocks", "--config", cfg_path, "coord", "3")
+    assert result.exit_code != 0
+    assert "could not read local mock bundle" in result.output
+    assert "binary.html" in result.output
+
+
 def test_publish_mocks_uploads_and_enqueues(tmp_path, monkeypatch):
     from coord import portal_store
 

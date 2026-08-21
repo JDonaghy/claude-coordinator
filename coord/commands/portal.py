@@ -369,7 +369,11 @@ def portal_publish_mocks(config_path, repo: str, tracking_issue: int) -> None:
         )
         raise SystemExit(1)
 
-    files = _collect_local_mock_bundle_files(repo_dir, milestone_number)
+    try:
+        files = _collect_local_mock_bundle_files(repo_dir, milestone_number)
+    except _MockBundleReadError as exc:
+        click.secho(f"could not read local mock bundle: {exc}", fg="red")
+        raise SystemExit(1) from exc
     if not files:
         click.secho(
             f"no mock bundle found under {repo_dir}/tests/acceptance/"
@@ -402,6 +406,17 @@ def portal_publish_mocks(config_path, repo: str, tracking_issue: int) -> None:
     )
 
 
+class _MockBundleReadError(Exception):
+    """A file under the local `ms-NN` acceptance dir could not be read as text.
+
+    Raised by `_collect_local_mock_bundle_files` in place of a raw
+    `UnicodeDecodeError` — mocks are machine-rendered HTML so this is
+    low-probability, but a stray non-UTF-8 file dropped in `mocks/` should
+    surface as a named CLI error like every other checked failure in this
+    command, not an unhandled traceback.
+    """
+
+
 def _collect_local_mock_bundle_files(repo_dir, milestone_number: int) -> dict:
     """Read a rendered Gate-A bundle off the LOCAL checkout at *repo_dir*.
 
@@ -427,13 +442,24 @@ def _collect_local_mock_bundle_files(repo_dir, milestone_number: int) -> dict:
     files: dict = {}
     contract_path = ms_dir / "contract.md"
     if contract_path.is_file():
-        files["contract.md"] = contract_path.read_text(encoding="utf-8")
+        files["contract.md"] = _read_text_or_raise(contract_path)
     mocks_dir = ms_dir / "mocks"
     if mocks_dir.is_dir():
         for p in sorted(mocks_dir.iterdir()):
             if p.is_file() and p.suffix == ".html":
-                files[f"mocks/{p.name}"] = p.read_text(encoding="utf-8")
+                files[f"mocks/{p.name}"] = _read_text_or_raise(p)
     return files
+
+
+def _read_text_or_raise(path) -> str:
+    """`Path.read_text(encoding="utf-8")`, wrapping a decode failure in the
+    named `_MockBundleReadError` instead of letting a raw
+    `UnicodeDecodeError` traceback reach the operator.
+    """
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise _MockBundleReadError(f"{path} is not valid UTF-8 text ({exc})") from exc
 
 
 # ── #1982: the sync loop's operator surface ─────────────────────────────────
