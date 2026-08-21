@@ -228,6 +228,17 @@ def compute_pipeline(
         None,
     )
 
+    # #2498: a review that came back "request-changes" must never read as
+    # mergeable, no matter what else is true about the assignment (including
+    # a stray `mq_entry` — see the `mq_entry is not None` branch below, and
+    # the unconditional "enqueue" gate this used to feed). Computed once here
+    # so both the stage-progression chain and the stage-status/gate-list
+    # logic further down share the same verdict check.
+    review_rejected = (
+        review_assignment is not None
+        and review_assignment.review_verdict == "request-changes"
+    )
+
     # ── Determine current_stage ──────────────────────────────────────────────
     current_stage: str
     if assignment.status == "running":
@@ -251,7 +262,13 @@ def compute_pipeline(
         current_stage = "merged"
     elif assignment.status in ("done", "pending"):
         # Evaluate from most advanced to least advanced.
-        if mq_entry is not None:
+        # #2498: an `mq_entry` (queued/merging/merged) no longer trumps
+        # everything else when the linked review came back request-changes —
+        # fall through to the normal smoke/review evaluation below instead,
+        # so a rejected review keeps showing as blocked even if it was
+        # (incorrectly) enqueued before this fix, or by any other path that
+        # doesn't re-check the verdict.
+        if mq_entry is not None and not review_rejected:
             from coord.merge_queue import MERGED, MERGING
 
             if mq_entry.state == MERGED:
@@ -327,6 +344,12 @@ def compute_pipeline(
             # This is the current stage.
             if current_stage == "merged":
                 status = "completed"  # final state, show as completed
+            elif current_stage == "review_done" and review_rejected:
+                # #2498: the review step finished, but a request-changes
+                # verdict means it did NOT clear the assignment for the next
+                # gate — show "active"/blocked, not a green "completed" that
+                # reads as "review passed."
+                status = "active"
             elif current_stage in ("smoke_passed", "review_done"):
                 status = "completed"  # sub-stage "done", ready for next gate
             elif current_stage == "failed":
@@ -367,7 +390,13 @@ def compute_pipeline(
     elif current_stage == "review_failed":
         available_gates.append(PipelineGate("dispatch_review", "Dispatch Review", _EP))
     elif current_stage == "review_done":
-        available_gates.append(PipelineGate("enqueue", "Queue for Merge", _EP))
+        # #2498: only offer "Queue for Merge" when the review is approved or
+        # hasn't produced a verdict yet — a request-changes verdict must not
+        # be one click from the merge queue. `dispatch_fix` just below is
+        # already correctly gated the mirror-image way (only offered ON
+        # request-changes); this makes `enqueue` its proper complement.
+        if not review_rejected:
+            available_gates.append(PipelineGate("enqueue", "Queue for Merge", _EP))
         if review_assignment is not None and review_assignment.review_posted_at is None:
             available_gates.append(PipelineGate("post_findings", "Post Findings", _EP))
         # Offer the phone a way to record a review verdict manually when the

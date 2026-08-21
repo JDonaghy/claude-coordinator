@@ -1787,3 +1787,70 @@ class TestDispatchFixGateForRequestChanges:
         pv = compute_pipeline(work, board, [], _config())
         gate_actions = {g.action for g in pv.available_gates}
         assert "dispatch_fix" not in gate_actions
+
+
+class TestMergeQueueIgnoresRejectedReview:
+    """#2498: coord-web showed a request-changes review as mergeable once
+    merge-queued — the top badge read "mergeable," the Review row in the
+    gate-status list read green/"completed," and "Merge" was enabled,
+    directly under a Review section whose own verdict said "Changes
+    requested." Root cause was `current_stage`'s `mq_entry is not None`
+    check firing unconditionally, before ever consulting
+    `review_assignment.review_verdict` — and a second bug feeding it: the
+    "enqueue" gate at review_done was offered unconditionally instead of
+    being gated on the verdict the way `dispatch_fix` already was."""
+
+    def test_mq_entry_with_rejected_review_is_not_merge_ready(self) -> None:
+        """An mq_entry existing (e.g. from before this fix, or any other path
+        that skipped the verdict check) must not make a request-changes
+        assignment read as merge_ready/merging/merged."""
+        work = _work(aid="work-1", status="done")
+        rev = _review(of_aid="work-1", status="done")
+        rev.review_verdict = "request-changes"
+        mq = [_mq_entry(state=PENDING)]
+        board = Board(completed=[work, rev])
+        pv = compute_pipeline(work, board, mq, _config())
+
+        assert pv.current_stage not in ("merge_ready", "merging", "merged")
+        assert pv.current_stage == "review_done"
+
+        gate_actions = {g.action for g in pv.available_gates}
+        assert "merge" not in gate_actions
+        assert "enqueue" not in gate_actions
+        assert "dispatch_fix" in gate_actions
+
+        review = next(s for s in pv.stages if s.name == "review")
+        assert review.status != "completed"
+
+    def test_review_done_rejected_does_not_offer_enqueue(self) -> None:
+        """Even with no mq_entry at all, "Queue for Merge" must not be
+        offered on a request-changes verdict (the bug's proximate cause: a
+        human — or an automated caller — one click from queueing rejected
+        code)."""
+        work = _work(aid="work-1", status="done")
+        rev = _review(of_aid="work-1", status="done")
+        rev.review_verdict = "request-changes"
+        board = Board(completed=[work, rev])
+        pv = compute_pipeline(work, board, [], _config())
+
+        assert pv.current_stage == "review_done"
+        gate_actions = {g.action for g in pv.available_gates}
+        assert "enqueue" not in gate_actions
+        assert "dispatch_fix" in gate_actions
+
+    def test_review_done_approved_still_offers_enqueue_with_mq_entry_absent(self) -> None:
+        """Sanity check the fix doesn't over-correct: an approved (or
+        no-verdict-yet) review_done still offers enqueue, unaffected."""
+        work = _work(aid="work-1", status="done")
+        rev = _review(of_aid="work-1", status="done")
+        rev.review_verdict = "approve"
+        board = Board(completed=[work, rev])
+        pv = compute_pipeline(work, board, [], _config())
+
+        assert pv.current_stage == "review_done"
+        gate_actions = {g.action for g in pv.available_gates}
+        assert "enqueue" in gate_actions
+        assert "dispatch_fix" not in gate_actions
+
+        review = next(s for s in pv.stages if s.name == "review")
+        assert review.status == "completed"
