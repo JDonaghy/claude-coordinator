@@ -25,8 +25,11 @@ tui/*.out
 .pytest.out
 .pytest.rerun.out
 .pytest.baseline.out
+.pytest-acceptance.out
+.pytest-populated-home.out
 .cargo.out
 .cargo-acceptance.out
+.coord-ci-home/
 
 # #1973: opt-in local quadraui path override (see
 # tui/cargo-config-local-quadraui.toml.example) — never commit a
