@@ -1493,6 +1493,206 @@ class TestExpectedRedClearOnMerge:
         assert "coord acceptance expected-red api --clear --issue 1" in events[-1].message
 
 
+class _StubResponse:
+    """Minimal `httpx.Response` stand-in — mirrors `test_portal_bridge.py`'s
+    `_Response`, needed here too since `_maybe_push_design_round` (PDR-3,
+    #2508) drives a real `PortalBridgeClient` over `httpx.post`."""
+
+    def __init__(self, status_code=200, json_body=None, text="") -> None:
+        self.status_code = status_code
+        self._json_body = json_body
+        self.text = text or (str(json_body) if json_body is not None else "")
+
+    def json(self):
+        if self._json_body is None:
+            raise ValueError("no body")
+        return self._json_body
+
+
+@dataclass
+class _MockAuthorGh(FakeGh):
+    """FakeGh + `get_issue` — the one extra surface
+    `_maybe_push_design_round` (PDR-3, #2508) needs to resolve a
+    `type="mock-author"` entry's milestone. Not part of `GhOps` proper (see
+    `_maybe_push_design_round`'s optional-probe docstring), so every other
+    `FakeGh`-based test in this file is unaffected."""
+
+    issue_milestone_number: int | None = 9
+    issue_title: str = "Q3 push"
+    issue_body: str = "Ship the thing."
+
+    def get_issue(self, repo: str, issue_number: int) -> dict:
+        milestone = (
+            {"number": self.issue_milestone_number, "title": "Q3 push"}
+            if self.issue_milestone_number is not None
+            else None
+        )
+        return {"title": self.issue_title, "body": self.issue_body, "milestone": milestone}
+
+
+class TestDesignRoundPushOnMerge:
+    """PDR-3 (#2508): a merged `type="mock-author"` (Gate A) PR auto-pushes
+    a design round to the portal — but only for a milestone with a portal
+    link on file (`coord portal link`, PDR-1/#2507). No link, no portal
+    config, or a GhOps stub that can't even resolve the tracking issue all
+    degrade to a no-op, matching `coord.portal_bridge`'s fail-open posture
+    for the rest of this bridge ("a portal outage must never block a
+    merge")."""
+
+    @staticmethod
+    def _board(completed=None):
+        from coord.models import Board
+        return Board(active=[], completed=list(completed or []))
+
+    @staticmethod
+    def _config(*, portal_enabled: bool = True):
+        """A minimal config-like object carrying only what
+        `_maybe_push_design_round` and the ordinary merge-gate defaults
+        read — same "build the smallest _Cfg that satisfies the gate
+        reads" pattern `TestReviewGate._config` uses just above."""
+        from coord.config import PortalConfig
+
+        @dataclass
+        class _Cfg:
+            portal: PortalConfig = field(default_factory=PortalConfig)
+
+        cfg = _Cfg()
+        cfg.portal = PortalConfig(
+            enabled=portal_enabled,
+            base_url="https://intake.example.com",
+            bridge_client_id="id-123",
+            bridge_client_secret="secret-456",
+        )
+        return cfg
+
+    def _link(self, submission_id: str = "sub_1", milestone_number: int = 9) -> None:
+        from coord import portal_store
+        portal_store.link_milestone(
+            repo_name="api", milestone_number=milestone_number, submission_id=submission_id,
+        )
+
+    def test_no_op_when_portal_not_configured(self) -> None:
+        self._link()
+        events = process(
+            [_q("w1", size=10, assignment_type="mock-author")], _MockAuthorGh(),
+            config=None, board=self._board(),
+        )
+        assert not [e for e in events if e.kind.startswith("design_round")]
+
+    def test_no_op_when_portal_disabled(self) -> None:
+        self._link()
+        cfg = self._config(portal_enabled=False)
+        events = process(
+            [_q("w1", size=10, assignment_type="mock-author")], _MockAuthorGh(),
+            config=cfg, board=self._board(),
+        )
+        assert not [e for e in events if e.kind.startswith("design_round")]
+
+    def test_no_op_when_milestone_has_no_portal_link(self) -> None:
+        # No `_link()` call — milestone 9 is never linked.
+        cfg = self._config()
+        events = process(
+            [_q("w1", size=10, assignment_type="mock-author")], _MockAuthorGh(),
+            config=cfg, board=self._board(),
+        )
+        assert not [e for e in events if e.kind.startswith("design_round")]
+        assert events[-1].kind == "merged"  # the ordinary "left open" event still fires
+
+    def test_no_op_for_a_plain_work_entry(self) -> None:
+        """Only `type="mock-author"` triggers this hook — a normal `work`
+        merge must never attempt a portal push."""
+        self._link()
+        cfg = self._config()
+        events = process(
+            [_q("w1", size=10, assignment_type="work")], _MockAuthorGh(),
+            config=cfg, board=self._board(),
+        )
+        assert not [e for e in events if e.kind.startswith("design_round")]
+
+    def test_gh_ops_lacking_get_issue_degrades_to_a_noop(self) -> None:
+        """An ordinary `FakeGh` (no `get_issue`) must not crash — same
+        optional-probe convention `branch_has_merge_commit` already uses."""
+        self._link()
+        cfg = self._config()
+        events = process(
+            [_q("w1", size=10, assignment_type="mock-author")], FakeGh(),
+            config=cfg, board=self._board(),
+        )
+        assert not [e for e in events if e.kind.startswith("design_round")]
+
+    def test_pushes_a_design_round_when_linked(self, monkeypatch) -> None:
+        self._link(submission_id="sub_1", milestone_number=9)
+        cfg = self._config()
+
+        monkeypatch.setattr(
+            "coord.mock_author.collect_mock_bundle_files",
+            lambda repo_github, milestone_number, branch: {"contract.md": "# contract"},
+        )
+        seen_upload = {}
+
+        def _post(url, json=None, headers=None, timeout=None):
+            seen_upload["url"] = url
+            seen_upload["json"] = json
+            return _StubResponse(200, {"bundle_key": "bundles/sub_1/r1.tar"})
+
+        monkeypatch.setattr("httpx.post", _post)
+
+        events = process(
+            [_q("w1", size=10, assignment_type="mock-author")], _MockAuthorGh(),
+            config=cfg, board=self._board(),
+        )
+
+        assert events[-1].kind == "design_round_queued"
+        assert "sub_1" in events[-1].message
+        assert seen_upload["url"] == "https://intake.example.com/api/bridge/upload"
+        assert seen_upload["json"]["submission_id"] == "sub_1"
+        assert seen_upload["json"]["files"] == {"contract.md": "# contract"}
+
+        from coord import portal_store
+        rows = portal_store.outbox_for_submission("sub_1")
+        assert len(rows) == 1
+        assert rows[0].kind == "design_round"
+        assert rows[0].fields["design_round"]["bundle_key"] == "bundles/sub_1/r1.tar"
+        assert "Ship the thing." in rows[0].fields["design_round"]["outcome_definition"]
+
+    def test_no_bundle_files_yields_a_skip_event(self, monkeypatch) -> None:
+        self._link()
+        cfg = self._config()
+        monkeypatch.setattr(
+            "coord.mock_author.collect_mock_bundle_files",
+            lambda repo_github, milestone_number, branch: {},
+        )
+
+        events = process(
+            [_q("w1", size=10, assignment_type="mock-author")], _MockAuthorGh(),
+            config=cfg, board=self._board(),
+        )
+
+        assert events[-1].kind == "design_round_push_skipped"
+
+    def test_upload_failure_degrades_to_a_failed_event_not_an_exception(
+        self, monkeypatch,
+    ) -> None:
+        self._link()
+        cfg = self._config()
+        monkeypatch.setattr(
+            "coord.mock_author.collect_mock_bundle_files",
+            lambda repo_github, milestone_number, branch: {"contract.md": "# contract"},
+        )
+        monkeypatch.setattr(
+            "httpx.post", lambda *a, **k: _StubResponse(401, {}, text="unauthorized"),
+        )
+
+        events = process(
+            [_q("w1", size=10, assignment_type="mock-author")], _MockAuthorGh(),
+            config=cfg, board=self._board(),
+        )
+
+        assert events[-1].kind == "design_round_push_failed"
+        # The merge itself still went through — this hook never undoes it.
+        assert any(e.kind == "merged" for e in events)
+
+
 class _TestAuthorGateGh(FakeGh):
     """#2191: FakeGh + the API-only manifest/issue-state surface
     `coord.acceptance.missing_expected_red_warning` needs. Defaults to a

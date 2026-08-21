@@ -13,7 +13,7 @@ from coord.agent import (
 )
 from coord.config import AcceptanceConfig, AcceptanceDriverConfig, Config, ModelsConfig
 from coord.models import Machine, Repo
-from coord import mock_author
+from coord import github_ops, mock_author
 
 
 # ── build_mock_author_briefing ───────────────────────────────────────────────
@@ -526,3 +526,90 @@ def test_mock_author_deny_list_blocks_gh_and_dangerous_git():
     assert "Bash(git push *)" not in MOCK_AUTHOR_DENY_COMMANDS
     assert "Bash(git push --force*)" in MOCK_AUTHOR_DENY_COMMANDS
     assert "Bash(git push * --force*)" in MOCK_AUTHOR_DENY_COMMANDS
+
+
+# ── collect_mock_bundle_files (PDR-3, #2508) ─────────────────────────────
+
+
+def test_collect_mock_bundle_files_reads_contract_and_html_mocks(monkeypatch):
+    monkeypatch.setattr(
+        github_ops, "repo_file_exists",
+        lambda repo, path, branch: path.endswith("contract.md"),
+    )
+    monkeypatch.setattr(
+        github_ops, "list_repo_dir",
+        lambda repo, path, branch: ["index.html", "detail.html", "notes.txt"],
+    )
+
+    def _get_repo_file(repo, path, branch):
+        return f"content of {path}"
+
+    monkeypatch.setattr(github_ops, "get_repo_file", _get_repo_file)
+
+    files = mock_author.collect_mock_bundle_files("acme/api", 9, "main")
+
+    assert files == {
+        "contract.md": "content of tests/acceptance/ms-9/contract.md",
+        "mocks/index.html": "content of tests/acceptance/ms-9/mocks/index.html",
+        "mocks/detail.html": "content of tests/acceptance/ms-9/mocks/detail.html",
+    }
+    # Non-html files under mocks/ are not part of the bundle.
+    assert "mocks/notes.txt" not in files
+
+
+def test_collect_mock_bundle_files_empty_when_nothing_rendered_yet(monkeypatch):
+    monkeypatch.setattr(github_ops, "repo_file_exists", lambda repo, path, branch: False)
+    monkeypatch.setattr(
+        github_ops, "list_repo_dir",
+        lambda repo, path, branch: (_ for _ in ()).throw(RuntimeError("404 not found")),
+    )
+
+    files = mock_author.collect_mock_bundle_files("acme/api", 9, "main")
+
+    assert files == {}
+
+
+# ── build_design_round (PDR-3, #2508) ────────────────────────────────────
+
+
+def test_build_design_round_carries_bundle_key_and_outcome_definition():
+    design_round = mock_author.build_design_round(
+        milestone_title="Q3 push",
+        tracking_issue_title="Q3 push",
+        tracking_issue_body="Ship the thing.\n\n## Work order\n- #101\n- #102 {after: #101}",
+        bundle_key="bundles/sub_1/r1.tar",
+    )
+
+    assert design_round["round"] == 1
+    assert design_round["bundle_key"] == "bundles/sub_1/r1.tar"
+    assert "Ship the thing." in design_round["outcome_definition"]
+    assert design_round["decomposition"] == [
+        {"issue_number": 101, "group": None, "after": []},
+        {"issue_number": 102, "group": None, "after": [101]},
+    ]
+
+
+def test_build_design_round_falls_back_to_title_when_body_empty():
+    design_round = mock_author.build_design_round(
+        milestone_title="Q3 push",
+        tracking_issue_title="Q3 push",
+        tracking_issue_body="",
+        bundle_key="bundles/sub_1/r1.tar",
+    )
+
+    assert design_round["outcome_definition"] == "Q3 push"
+    assert design_round["decomposition"] == []
+
+
+def test_build_design_round_degrades_to_empty_decomposition_on_bad_work_order():
+    # A malformed `## Work order` (an `after` edge to an issue never
+    # declared in the block) must not crash the push — just skip decomposition.
+    design_round = mock_author.build_design_round(
+        milestone_title="Q3 push",
+        tracking_issue_title="Q3 push",
+        tracking_issue_body="## Work order\n- #101 {after: #999}",
+        bundle_key="bundles/sub_1/r1.tar",
+    )
+
+    assert design_round["decomposition"] == []
+    assert "outcome_definition" in design_round

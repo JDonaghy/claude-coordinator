@@ -177,11 +177,16 @@ def enqueue_design_round(
 ) -> portal_store.OutboxRow:
     """Queue a design round (the D1 metadata half) for *submission_id*.
 
-    The mock bundle itself is an R2 object and is **not** uploaded here: the
-    portal's upload route is not part of the three bridge routes this side
-    speaks (:mod:`coord.portal_bridge`), so *design_round* is expected to
-    already carry whatever reference the customer's browser will follow. What
-    this function guarantees is the ordering — see :func:`enqueue_status`.
+    The mock bundle itself is an R2 object and is **not** uploaded here:
+    that goes through :meth:`coord.portal_bridge.PortalBridgeClient.
+    upload_bundle` (coord-portal#120, PDR-2) — a separate call from the
+    three ``push``/``pull``/``heartbeat`` D1-metadata routes this queue
+    drains — so *design_round* is expected to already carry whatever
+    reference (the returned bundle key) the customer's browser will follow.
+    The auto-push caller (:mod:`coord.merge_queue`'s post-merge hook,
+    PDR-3/#2508) uploads first and passes the resulting key through
+    :func:`coord.mock_author.build_design_round`. What this function
+    guarantees is the ordering — see :func:`enqueue_status`.
     """
     if not isinstance(design_round, dict) or not design_round:
         raise PortalSyncError("design_round payload must be a non-empty mapping")

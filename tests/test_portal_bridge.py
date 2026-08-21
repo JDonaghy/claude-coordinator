@@ -255,6 +255,44 @@ def test_pull_sends_cursor_and_limit_as_query_params(monkeypatch):
     assert data == {"events": [], "cursor": "abc", "has_more": False}
 
 
+# ── upload_bundle (PDR-3, #2508) ────────────────────────────────────────
+
+
+def test_upload_bundle_sends_files_and_returns_bundle_key(monkeypatch):
+    seen = {}
+
+    def _post(url, json=None, headers=None, timeout=None):
+        seen["url"] = url
+        seen["json"] = json
+        return _Response(200, {"bundle_key": "bundles/sub_1/r1.tar"})
+
+    monkeypatch.setattr("httpx.post", _post)
+    client = _client()
+    key = client.upload_bundle(
+        "sub_1", {"contract.md": "# contract", "mocks/index.html": "<html></html>"}
+    )
+
+    assert seen["url"] == "https://intake.heurontech.com/api/bridge/upload"
+    assert seen["json"] == {
+        "submission_id": "sub_1",
+        "files": {"contract.md": "# contract", "mocks/index.html": "<html></html>"},
+    }
+    assert key == "bundles/sub_1/r1.tar"
+
+
+def test_upload_bundle_rejects_empty_files():
+    client = _client()
+    with pytest.raises(PortalBridgeError, match="empty files"):
+        client.upload_bundle("sub_1", {})
+
+
+def test_upload_bundle_raises_when_response_has_no_bundle_key(monkeypatch):
+    monkeypatch.setattr("httpx.post", lambda *a, **k: _Response(200, {}))
+    client = _client()
+    with pytest.raises(PortalBridgeError, match="bundle_key"):
+        client.upload_bundle("sub_1", {"contract.md": "# contract"})
+
+
 # ── client_from_config ──────────────────────────────────────────────────
 
 

@@ -3,9 +3,12 @@
 **The gap this closes.** coord-portal has offered ``POST /api/bridge/push``
 since ms-1, and the entire ms-3 mail pipeline (``docs/CUSTOMER_PORTAL.md``) is
 live and waiting downstream of a queued outbox row — but nothing on this side
-has ever called it. This module is that client: a thin wrapper over the three
-bridge routes (``push``, ``pull``, ``heartbeat``), matching the wire contract
-coord-portal's ``src/bridge/*`` and ``src/routes/bridge.ts`` define.
+has ever called it. This module is that client: a thin wrapper over
+coord-portal's bridge routes (``push``, ``pull``, ``heartbeat``, and — as of
+PDR-3/#2508 — ``upload``), matching the wire contract coord-portal's
+``src/bridge/*`` and ``src/routes/bridge.ts`` define. ``upload`` is the one
+route that carries a bundle's raw content rather than D1 metadata — see
+:meth:`PortalBridgeClient.upload_bundle`.
 
 **What this module deliberately does NOT do**, per #2179's own framing —
 those are separate, harder design questions and belong to follow-up issues:
@@ -318,6 +321,45 @@ class PortalBridgeClient:
             return response.json()
         except ValueError as exc:
             raise PortalBridgeError(f"GET /api/bridge/pull: non-JSON response: {exc}") from exc
+
+    def upload_bundle(self, submission_id: str, files: dict[str, str]) -> str:
+        """``POST /api/bridge/upload`` — store a design round's rendered
+        mock bundle + contract in the portal's R2 (coord-portal#120, PDR-2).
+
+        Deliberately a fourth route, not folded into :meth:`push`: the
+        three ``/api/bridge/*`` routes this module otherwise speaks
+        (``push``/``pull``/``heartbeat``) carry only D1 metadata —
+        :func:`coord.portal_sync.enqueue_design_round`'s own docstring
+        already says the mock bundle itself "is not uploaded here". This is
+        that upload, kept separate so a bundle (arbitrarily large HTML) is
+        never accidentally routed through :data:`MAX_PUSH_UPDATES`-bounded
+        ``push`` batching.
+
+        *files* maps a path relative to the bundle root — e.g.
+        ``"contract.md"``, ``"mocks/index.html"`` — to its text content; see
+        :func:`coord.mock_author.collect_mock_bundle_files`, which builds
+        exactly this mapping by reading a merged Gate-A branch back off
+        GitHub. Returns the R2 object key the portal assigns the bundle —
+        callers thread that straight into the ``design_round`` payload
+        :func:`coord.portal_sync.enqueue_design_round` queues, so the
+        customer's browser has something to fetch. Raises
+        :class:`PortalBridgeError` the same way every other method here
+        does: a transport failure, a 401, a 4xx/5xx, or a response with no
+        usable ``bundle_key``.
+        """
+        if not files:
+            raise PortalBridgeError("upload_bundle() got an empty files mapping")
+        data = self._post(
+            "/api/bridge/upload",
+            {"submission_id": submission_id, "files": files},
+        )
+        bundle_key = data.get("bundle_key")
+        if not isinstance(bundle_key, str) or not bundle_key:
+            raise PortalBridgeError(
+                f"POST /api/bridge/upload: response had no 'bundle_key' "
+                f"string: {data!r}"
+            )
+        return bundle_key
 
 
 def _utcnow_iso() -> str:
