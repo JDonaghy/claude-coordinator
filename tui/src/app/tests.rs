@@ -16718,6 +16718,52 @@
         );
     }
 
+    // ── #2494: "Add to drive queue" Board row action ─────────────────────
+
+    /// #2494: `coord drive-queue add <repo> <issue>` — this repo's own
+    /// recommended dispatch path (docs/DRIVE_QUEUE.md), distinct from
+    /// "Send to Pipeline" above (`coord track`, the label-based `coord
+    /// plan`/`approve` flow). Offered alongside it on Backlog rows, reusing
+    /// the exact `"drive-queue-add"` action id (and menu item) the Pipeline
+    /// row's `PipelineRowLifecycle::New` block already offers via
+    /// `drive_queue_menu_items_for_pipeline_row`.
+    #[test]
+    fn backlog_row_context_menu_offers_add_to_drive_queue() {
+        let app = make_app_default();
+        let items = app.context_menu_items_for_board_row(
+            Some(99),
+            &BoardRowLifecycle::Backlog,
+            Some("repo-a"),
+        );
+        assert!(
+            items
+                .iter()
+                .any(|it| it.action_id.as_deref() == Some("drive-queue-add")),
+            "Backlog menu must include Add to drive queue; got {:?}",
+            items.iter().map(|it| &it.label).collect::<Vec<_>>(),
+        );
+    }
+
+    /// #2494: queuing something already in-flight doesn't make sense —
+    /// gated behind the same Backlog-only lifecycle as "Send to Pipeline"
+    /// (`drive_queue_menu_items_for_pipeline_row` is simply never called for
+    /// any other lifecycle).
+    #[test]
+    fn in_flight_row_context_menu_omits_add_to_drive_queue() {
+        let app = make_app_default();
+        let items = app.context_menu_items_for_board_row(
+            Some(99),
+            &BoardRowLifecycle::InFlight,
+            Some("repo-a"),
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|it| it.action_id.as_deref() == Some("drive-queue-add")),
+            "Add to drive queue must not appear on In-flight rows",
+        );
+    }
+
     #[test]
     fn dispatch_send_to_pipeline_without_target_data_toasts_and_no_ops() {
         let mut app = make_app_default();
@@ -32011,7 +32057,7 @@ Milestone tracking issue.
     fn milestone_header_context_menu_has_full_crud_item_set() {
         let app = make_milestone_dag_app();
         let items =
-            app.context_menu_items_for_milestone_header("coord-repo", 100, "v0.5", 5);
+            app.context_menu_items_for_milestone_header("coord-repo", 100, "v0.5", 5, &[]);
         let ids: Vec<String> = items.iter().filter_map(|i| i.action_id.clone()).collect();
         for expected in [
             "open-milestone-chat",
@@ -32029,6 +32075,57 @@ Milestone tracking issue.
                 "expected `{expected}` in milestone-header menu ids {ids:?}"
             );
         }
+    }
+
+    // ── #2494: Plans-panel epic-row "Send to Pipeline" ──────────────────────
+
+    /// #2494: an epic tracking issue created via `coord milestone
+    /// capture`/`chat` carries no `coord` label until something runs `coord
+    /// track` against it — until then it never appears in Pipeline at all,
+    /// so every Gate A action ("Dispatch Gate A mock", "Approve Gate A", …)
+    /// stays unreachable. The Plans-panel epic-row menu must offer "Send to
+    /// Pipeline" while the epic is still untracked, mirroring the Board row
+    /// menu's own `coord track` wrapper.
+    #[test]
+    fn untracked_epic_milestone_header_menu_offers_send_to_pipeline() {
+        let app = make_milestone_dag_app();
+        let items = app.context_menu_items_for_milestone_header(
+            "coord-repo",
+            100,
+            "v0.5",
+            5,
+            &["epic".to_string()],
+        );
+        assert!(
+            items
+                .iter()
+                .any(|it| it.action_id.as_deref() == Some("send-to-pipeline")),
+            "an untracked epic's menu must offer Send to Pipeline; got {:?}",
+            items.iter().map(|it| &it.label).collect::<Vec<_>>(),
+        );
+    }
+
+    /// #2494: once the epic already carries `coord` (already
+    /// Pipeline-tracked), "Send to Pipeline" would be a no-op — omit it,
+    /// mirroring `in_flight_row_context_menu_omits_send_to_pipeline`'s
+    /// Board-row gate on the identical action.
+    #[test]
+    fn coord_labeled_epic_milestone_header_menu_omits_send_to_pipeline() {
+        let app = make_milestone_dag_app();
+        let items = app.context_menu_items_for_milestone_header(
+            "coord-repo",
+            100,
+            "v0.5",
+            5,
+            &["epic".to_string(), "coord".to_string()],
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|it| it.action_id.as_deref() == Some("send-to-pipeline")),
+            "an already-tracked epic's menu must NOT offer Send to Pipeline; got {:?}",
+            items.iter().map(|it| &it.label).collect::<Vec<_>>(),
+        );
     }
 
     /// #1123 (contract §4b): the stub-row variant of the Plans "no epic
@@ -32405,7 +32502,7 @@ Milestone tracking issue.
     fn milestone_header_context_menu_has_add_sub_issue_item() {
         let app = make_milestone_dag_app();
         let items =
-            app.context_menu_items_for_milestone_header("coord-repo", 100, "v0.5", 5);
+            app.context_menu_items_for_milestone_header("coord-repo", 100, "v0.5", 5, &[]);
         let ids: Vec<String> = items.iter().filter_map(|i| i.action_id.clone()).collect();
         assert!(
             ids.iter().any(|id| id == "add-sub-issue-to-epic"),
@@ -32530,7 +32627,7 @@ Milestone tracking issue.
     fn milestone_header_context_menu_has_add_sub_issue_chat_item() {
         let app = make_milestone_dag_app();
         let items =
-            app.context_menu_items_for_milestone_header("coord-repo", 100, "v0.5", 5);
+            app.context_menu_items_for_milestone_header("coord-repo", 100, "v0.5", 5, &[]);
         let ids: Vec<String> = items.iter().filter_map(|i| i.action_id.clone()).collect();
         assert!(
             ids.iter().any(|id| id == "add-sub-issue-to-epic-chat"),
@@ -41102,6 +41199,191 @@ Milestone tracking issue.
                 .unwrap_or(false),
             "expected the success toast body, got: {:?}",
             app.toasts.last().map(|t| &t.0.body)
+        );
+    }
+
+    /// #2494 core acceptance: the Plans-panel epic-row equivalent of
+    /// `tuidriver_send_to_pipeline_posts_directly_to_daemon_no_subprocess`
+    /// above — right-click a rendered Plans row for an untracked epic
+    /// ("Substrate" #500, no matching `open_issues` entry so its labels
+    /// default to empty), click "Send to Pipeline", and prove it reaches
+    /// the same daemon `/issue-label` seam directly. This is the exact
+    /// reachability gap the issue reported: before this fix,
+    /// `context_menu_items_for_milestone_header` had no equivalent of the
+    /// Board row menu's `send-to-pipeline` action at all.
+    #[test]
+    fn tuidriver_plans_panel_send_to_pipeline_posts_directly_to_daemon() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(make_plan_roster_board_data());
+        app.active_view = SidebarView::Plans;
+
+        let mock = MockBoardService::start(r#"{"labels": ["coord", "status:ready"], "changed": true}"#);
+        let _guard = set_test_board_service(mock.url(), None);
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        let (x, y) = driver.find("Substrate").unwrap_or_else(|| {
+            panic!(
+                "#2494: could not find Plans row 'Substrate' on initial render:\n{}",
+                driver.screen()
+            )
+        });
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+        let menu_screen = driver.screen();
+        assert!(
+            menu_screen.contains("Send to Pipeline"),
+            "#2494: right-click on an untracked epic's Plans row must offer \
+             'Send to Pipeline':\n{}",
+            menu_screen
+        );
+
+        // "Open milestone chat" / "Dispatch milestone" / "Dispatch next…" /
+        // "View order / DAG" precede "Send to Pipeline" in the item list —
+        // four Downs from the pre-selected first item lands on it. Enter
+        // rather than a mouse click for the same hit-test-offset reason
+        // documented on `tuidriver_send_to_pipeline_posts_directly_to_daemon_no_subprocess`.
+        driver.press_named(NamedKey::Down);
+        driver.press_named(NamedKey::Down);
+        driver.press_named(NamedKey::Down);
+        driver.press_named(NamedKey::Down);
+        driver.press_named(NamedKey::Enter);
+
+        let requests = mock.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "expected exactly one request to reach the daemon; got {:?}",
+            requests
+        );
+        assert!(
+            requests[0].starts_with("POST /issue-label"),
+            "'Send to Pipeline' must POST /issue-label directly; got {:?}",
+            requests[0]
+        );
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("adding coord label"),
+            "expected the 'Send to Pipeline' success toast body \
+             ('#500 → Pipeline (adding coord label…)'), got:\n{}",
+            screen
+        );
+    }
+
+    /// #2494: companion unit test to
+    /// `dispatch_board_row_command_falls_back_to_subprocess_without_board_service`
+    /// — asserts the exact argv reaching `command_runner` when the
+    /// `"drive-queue-add"` action fires against a `BoardRow` target (not just
+    /// the `PipelineRow` target the action already supported). Confirms
+    /// `pipeline_menu_repo_issue`/`dispatch_drive_queue_add` really do treat
+    /// `BoardRow` and `PipelineRow` identically end-to-end through
+    /// `dispatch_context_menu_action` — the load-bearing assumption behind
+    /// reusing this action for the Board row menu instead of adding a new one.
+    #[test]
+    fn dispatch_context_menu_action_drive_queue_add_spawns_subprocess_for_board_row() {
+        let mut app = make_app_default();
+        let target = ContextMenuTarget::BoardRow {
+            issue_number: Some(42),
+            repo_name: Some("repo-a".to_string()),
+            lifecycle: BoardRowLifecycle::Backlog,
+        };
+        let handled = app.dispatch_context_menu_action("drive-queue-add", &target);
+        assert!(handled);
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "drive-queue".to_string(),
+                "add".to_string(),
+                "repo-a".to_string(),
+                "42".to_string(),
+            ]],
+            "unexpected spawned argv: {:?}",
+            app.command_runner.spawned_calls,
+        );
+    }
+
+    /// #2494 core acceptance: black-box `TuiDriver` coverage mirroring
+    /// `tuidriver_send_to_pipeline_posts_directly_to_daemon_no_subprocess` —
+    /// real right-click on a rendered Backlog board row, click "Add to
+    /// drive queue" in the rendered menu, and confirm the toast the
+    /// resulting `coord drive-queue add` spawn produces (`dispatch_drive_
+    /// queue_add`'s own toast body, "queuing {repo} #{issue}…"). The
+    /// TuiDriver shell adapter doesn't expose the wrapped `CoordApp` for a
+    /// typed `spawned_calls` check (same documented limitation as the
+    /// `send-to-pipeline` TuiDriver test) — that half of the acceptance
+    /// criterion is covered directly by
+    /// `dispatch_context_menu_action_drive_queue_add_spawns_subprocess_for_board_row`
+    /// above.
+    #[test]
+    fn tuidriver_add_to_drive_queue_spawns_subprocess_and_toasts() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_app_default();
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 42,
+            title: "Issue 42".to_string(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+            milestone_number: None,
+            milestone_title: None,
+        });
+        app.data.pipeline_repos = vec![("repo-a".to_string(), "org/repo-a".to_string())];
+        app.rebuild_board_sidebar();
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        // #857: a non-in-flight ("No milestone") group starts collapsed —
+        // click its header to reveal the issue row underneath.
+        let (mex, mey) = driver.find("No milestone").unwrap_or_else(|| {
+            panic!(
+                "#2494: 'No milestone' group header not found on initial render:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(mex, mey);
+
+        let (x, y) = driver.find("#42").or_else(|| driver.find("Issue 42")).unwrap_or_else(|| {
+            panic!(
+                "#2494: could not find Backlog board row '#42' / 'Issue 42' after expanding \
+                 'No milestone':\n{}",
+                driver.screen()
+            )
+        });
+
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+        let menu_screen = driver.screen();
+        assert!(
+            menu_screen.contains("Add to drive queue"),
+            "#2494: right-click on a Backlog row must offer 'Add to drive queue':\n{}",
+            menu_screen
+        );
+
+        // "Send to Pipeline" is the pre-selected first item; "Add to drive
+        // queue" is the second — one Down then Enter (same hit-test-offset
+        // rationale as the `send-to-pipeline` TuiDriver test for why Enter
+        // rather than a second mouse click).
+        driver.press_named(NamedKey::Down);
+        driver.press_named(NamedKey::Enter);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("queuing repo-a #42"),
+            "#2494: activating 'Add to drive queue' must toast a confirmation \
+             ('queuing repo-a #42…'), got:\n{}",
+            screen
         );
     }
 

@@ -296,6 +296,22 @@ pub(crate) fn labels_carry_epic_label(labels: &[String]) -> bool {
         .any(|l| l.eq_ignore_ascii_case(TRACKING_ISSUE_LABEL))
 }
 
+/// Mirrors `coord.commands.issues.track`'s `"coord"` label — the label that
+/// marks an issue as Pipeline-tracked (`coord/dispatch.py`'s
+/// `label_change_for_subcommand("track")` adds it, `board_row_lifecycle`
+/// reads it back).
+pub(crate) const COORD_LABEL: &str = "coord";
+
+/// Case-insensitive check for [`COORD_LABEL`] against an arbitrary label
+/// list, mirroring `labels_carry_epic_label`'s convention. #2494: an epic
+/// tracking issue created via `coord milestone capture`/`chat` never carries
+/// this label until something runs `coord track` against it — used to gate
+/// the Plans-panel epic-row menu's "Send to Pipeline" item so it only
+/// appears while the epic is still untracked.
+pub(crate) fn labels_carry_coord_label(labels: &[String]) -> bool {
+    labels.iter().any(|l| l.eq_ignore_ascii_case(COORD_LABEL))
+}
+
 /// The open issue in `repo_name`/`milestone_number` carrying the `"epic"`
 /// label — the milestone's tracking issue (mirrors
 /// `coord.milestone_order.TRACKING_ISSUE_LABEL` / the #645 convention).
@@ -622,19 +638,37 @@ impl CoordApp {
     /// doesn't depend on it — only the id matters); it's accepted for
     /// symmetry with the target's fields and because a future item may need
     /// it for a disabled-state check.
+    ///
+    /// #2494: `labels` is the epic tracking issue's current GitHub labels
+    /// (looked up by the caller from `data.open_issues`) — used solely to
+    /// gate "Send to Pipeline": an epic created via `coord milestone
+    /// capture`/`chat` carries neither `coord` nor `status:ready` until
+    /// something runs `coord track` against it, and until then it never
+    /// appears in Pipeline at all, so every Gate A action stays unreachable.
+    /// Shown only while the epic is still untracked (mirrors the Board row
+    /// menu's own Backlog-only gate on the same action).
     pub(crate) fn context_menu_items_for_milestone_header(
         &self,
         _repo_name: &str,
         _tracking_issue: u64,
         _milestone_title: &str,
         _milestone_number: i64,
+        labels: &[String],
     ) -> Vec<ContextMenuItem> {
-        vec![
+        let mut items = vec![
             ContextMenuItem::action("open-milestone-chat", "Open milestone chat"),
             ContextMenuItem::action("dispatch-milestone", "Dispatch milestone").with_shortcut("d"),
             ContextMenuItem::action("dispatch-milestone-next", "Dispatch next…"),
             ContextMenuItem::action("view-milestone-order", "View order / DAG"),
-            ContextMenuItem::separator(),
+        ];
+        if !labels_carry_coord_label(labels) {
+            items.push(ContextMenuItem::action(
+                "send-to-pipeline",
+                "Send to Pipeline",
+            ));
+        }
+        items.push(ContextMenuItem::separator());
+        items.extend([
             ContextMenuItem::action("edit-milestone", "Edit milestone…"),
             ContextMenuItem::action("add-issue-to-milestone", "Add issue to milestone…"),
             ContextMenuItem::action(
@@ -655,7 +689,8 @@ impl CoordApp {
             ContextMenuItem::action("close-plan", "Close / archive plan"),
             ContextMenuItem::separator(),
             ContextMenuItem::action("refresh", "Refresh").with_shortcut("r"),
-        ]
+        ]);
+        items
     }
 
     /// #1123 (contract §4b/§4c): context-menu items for a Plans-panel
