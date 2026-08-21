@@ -671,6 +671,59 @@ class TestMergeQueueCiFlakyRerunsColumn:
         conn.close()
 
 
+# ── merge_queue.ci_fix_dispatches column (#2510) ────────────────────────────
+
+# Same pre-migration shape as _PRE_2252_MERGE_QUEUE_TABLE, minus the columns
+# every migration after it (including this one) adds — exercises the #2510
+# migration landing on a DB that predates ci_flaky_reruns/ci_flaky_pending/
+# ci_unreadable_reruns/ci_fix_dispatches entirely.
+_PRE_2510_MERGE_QUEUE_TABLE = _PRE_2252_MERGE_QUEUE_TABLE
+
+
+class TestMergeQueueCiFixDispatchesColumn:
+    def test_fresh_database_has_it_from_the_create(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        assert "ci_fix_dispatches" in _merge_queue_columns(isolated_conn)
+
+    def test_existing_database_gains_it_in_place(self) -> None:
+        """The real path: a coord.db created before #2510, upgraded by
+        _ensure_schema."""
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(_PRE_2510_MERGE_QUEUE_TABLE)
+        conn.execute(
+            "INSERT INTO merge_queue "
+            "(assignment_id, repo_name, repo_github, branch, target_branch, "
+            "issue_number, issue_title) "
+            "VALUES ('w1', 'api', 'acme/api', 'b', 'main', 7, 't')"
+        )
+        conn.commit()
+        assert "ci_fix_dispatches" not in _merge_queue_columns(conn)
+
+        _ensure_schema(conn)
+
+        assert "ci_fix_dispatches" in _merge_queue_columns(conn)
+        # A pre-existing row survives and reads as "no ci-fix dispatched
+        # yet" — the same default a freshly-enqueued entry gets.
+        row = conn.execute(
+            "SELECT ci_fix_dispatches FROM merge_queue WHERE issue_number = 7"
+        ).fetchone()
+        assert row["ci_fix_dispatches"] == 0
+        conn.close()
+
+    def test_migration_is_idempotent(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(_PRE_2510_MERGE_QUEUE_TABLE)
+        conn.commit()
+        _ensure_schema(conn)
+        _ensure_schema(conn)
+        _ensure_schema(conn)
+        assert "ci_fix_dispatches" in _merge_queue_columns(conn)
+        conn.close()
+
+
 # ── override_connection ────────────────────────────────────────────────────────
 
 class TestOverrideConnection:

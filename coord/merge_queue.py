@@ -2524,6 +2524,29 @@ class QueuedMerge:
     # any of the other three ("what did CI say?"). 0 for every entry that
     # has never hit a fetch failure, and for rows predating this column.
     ci_unreadable_reruns: int = 0
+    # #2510: count of `type="ci-fix"`-shaped fix-worker dispatches the
+    # coordinator has issued for this entry's confirmed (non-infra,
+    # non-first-flake) `checks_failed` streak — capped at
+    # `coord.ci_fix.MAX_CI_FIX_DISPATCHES`. A CONFIRMED failure (see
+    # `process()`'s `msg = f"checks failed: {summary}"` block, reached only
+    # once the infra/flaky retry budgets above are exhausted or
+    # inapplicable) used to just leave the entry `PENDING` forever with no
+    # path back to a fix — this is the durable ceiling that lets
+    # `coord.commands.merge._dispatch_ci_fixes` dispatch a bounded number of
+    # fix attempts before giving up and promoting the entry to
+    # `HUMAN_REQUIRED`, mirroring how `ci_infra_reruns`/`ci_flaky_reruns`
+    # bound their own auto-remedies. 0 for every entry that has never hit a
+    # confirmed CI failure, and for rows predating this column. Unlike the
+    # rerun counters above (which reset once CI resolves cleanly — see the
+    # "genuinely resolved" reset block later in `process()`), this one is
+    # intentionally NOT auto-reset there: a fix dispatch's payoff is a FUTURE
+    # green run on a NEW commit, which as a side effect also resets
+    # ci_infra_reruns/ci_flaky_reruns/ci_unreadable_reruns — so by the time
+    # this entry could reach that reset block again, the fix either worked
+    # (merge proceeds, entry leaves the queue) or the retry budget is what
+    # stopped the loop; resetting it on an unrelated green tick would just
+    # reopen a budget a still-broken PR could re-exhaust forever.
+    ci_fix_dispatches: int = 0
 
 
 class GhOps(Protocol):
@@ -2848,6 +2871,10 @@ def load_queue() -> list[QueuedMerge]:
             # #2347: same NULL-to-0 decoding as ci_infra_reruns above, for
             # rows predating this column.
             ci_unreadable_reruns=row["ci_unreadable_reruns"] or 0,
+            # #2510: column added via migration; NULL (pre-migration rows)
+            # decodes to 0 — no CI-fix dispatches spent yet, same as a fresh
+            # entry.
+            ci_fix_dispatches=row["ci_fix_dispatches"] or 0,
         )
         for row in rows
     ]
@@ -2866,8 +2893,8 @@ def save_queue(items: list[QueuedMerge]) -> None:
                     pr_number, pr_url, size, last_attempt, error, enqueued_at,
                     assignment_type, required_gates, ci_infra_reruns,
                     ci_stale_reruns, ci_flaky_reruns, ci_flaky_pending,
-                    ci_unreadable_reruns
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    ci_unreadable_reruns, ci_fix_dispatches
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     item.assignment_id, item.repo_name, item.repo_github,
                     item.branch, item.target_branch, item.issue_number,
@@ -2876,7 +2903,7 @@ def save_queue(items: list[QueuedMerge]) -> None:
                     item.assignment_type, json.dumps(list(item.required_gates or [])),
                     item.ci_infra_reruns, item.ci_stale_reruns,
                     item.ci_flaky_reruns, item.ci_flaky_pending,
-                    item.ci_unreadable_reruns,
+                    item.ci_unreadable_reruns, item.ci_fix_dispatches,
                 ),
             )
 

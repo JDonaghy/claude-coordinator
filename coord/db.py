@@ -192,7 +192,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             ci_stale_reruns INTEGER NOT NULL DEFAULT 0,
             ci_flaky_reruns INTEGER NOT NULL DEFAULT 0,
             ci_flaky_pending TEXT NOT NULL DEFAULT '',
-            ci_unreadable_reruns INTEGER NOT NULL DEFAULT 0
+            ci_unreadable_reruns INTEGER NOT NULL DEFAULT 0,
+            ci_fix_dispatches INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS plans (
@@ -934,6 +935,13 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # NULL for a hand dispatch, a coordinator/brain-proposed dispatch,
         # and every row predating this column.
         "ALTER TABLE assignments ADD COLUMN dispatched_by_assignment_id TEXT",
+        # #2510: count of `coord.ci_fix.dispatch_ci_fix` fix-worker dispatches
+        # issued for this entry's CURRENT confirmed (non-infra, non-first-
+        # flake) `checks_failed` streak — see `QueuedMerge.ci_fix_dispatches`'s
+        # docstring and `coord.ci_fix.MAX_CI_FIX_DISPATCHES`. 0 for every row
+        # predating this migration, same as the column's own default for a
+        # freshly-enqueued entry.
+        "ALTER TABLE merge_queue ADD COLUMN ci_fix_dispatches INTEGER NOT NULL DEFAULT 0",
     ]
     for sql in migrations:
         try:
