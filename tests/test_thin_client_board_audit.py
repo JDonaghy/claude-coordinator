@@ -233,10 +233,26 @@ COMMANDS_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
     # (#1870), reaches it. Read-only: load_board only, no save_board, and the
     # whole block is wrapped in a fail-soft `except Exception: return {}` whose
     # empty result degrades to exactly the pre-#2350 `resumed` relaunch path.
+    # #2535-guarded: `_run_auto_revalidate_checks_stale` is the same shape and
+    # the same guard once more — it hands a board to
+    # `merge_queue.ci_revalidation_candidates` so the tick can fire the bounded
+    # CI re-run for a merge-queue entry blocked solely on stale-but-green
+    # checks against an already-approved review (PR #2534 sat there on nothing
+    # but 210 unrelated merges having landed since its CI last ran). The
+    # `if resolve_board_service() is not None: return` early return sits ABOVE
+    # the `from coord.state import load_board` import, so a thin client returns
+    # before the local read is even imported, let alone called; only the daemon
+    # host, where `coord drive-queue tick` runs and nowhere else (#1870),
+    # reaches it. Read-only with respect to the board: load_board only, no
+    # save_board (its one write is to the separate merge-queue table via
+    # `merge_queue.save_queue`, which the extended scan below already covers),
+    # and the whole block is wrapped in a fail-soft `except Exception: return`
+    # that degrades to exactly the pre-#2535 "wait for an operator" behaviour.
     "drive_queue.py": {
         ("_fetch_live_ci_gate", "load_board"),
         ("_fetch_live_blocked_gate", "load_board"),
         ("_fetch_merge_only_ready", "load_board"),
+        ("_run_auto_revalidate_checks_stale", "load_board"),
         ("drive_queue_diagnose", "build_board"),
     },
     # #1337: `coord test` no longer calls save_board at all — the verdict is
