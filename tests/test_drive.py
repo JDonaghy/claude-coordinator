@@ -4662,6 +4662,24 @@ def driver_factory(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     monkeypatch.setattr("coord.drive_state.scratch_dir", lambda: tmp_path)
     monkeypatch.setattr("coord.drive.scratch_dir", lambda: tmp_path)
+    # A per-test notify.lock, so a Driver test's `--notify` nudge never
+    # contends with the OPERATOR'S real ~/.coord/notify.lock — the same
+    # convention `tests/test_notify_drain.py`'s `lock_path` fixture already
+    # documents ("so tests never touch the real ~/.coord one").
+    #
+    # Without this, `Driver.run_notify()` takes the live lock for real: on
+    # any host that actually runs the fleet, `coord-notify.timer` (5-minute
+    # cadence) and the board daemon's own drain both hold it for the length
+    # of a full notify pass, so every nudge assertion here
+    # (`test_notify_nudges_coord_notify_under_the_shared_lock` and the two
+    # #1593 stall-nudge tests) was one unlucky overlap away from seeing
+    # LockBusy, logging "could not take ~/.coord/notify.lock within 5m —
+    # skipping nudge", and failing with an empty call list after a 5-minute
+    # stall. That is a race with whatever else is running on the machine,
+    # not a signal about the code under test.
+    monkeypatch.setattr(
+        "coord.drive.notify_lock_path", lambda: tmp_path / "notify.lock"
+    )
 
     def make(
         payloads, *, opts=None, verifier=None, config=None, oracle_gate=None,
