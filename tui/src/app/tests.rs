@@ -3091,6 +3091,41 @@
     }
 
     #[test]
+    fn publish_mocks_item_enables_for_uppercase_html_suffix() {
+        // Review follow-up (#2513): this gate's `.html` match is
+        // case-INSENSITIVE, and the CLI's `_collect_local_mock_bundle_files`
+        // (`coord/commands/portal.py`) now lowercases its suffix to match.
+        // Pinned on both sides so they cannot drift back apart: a
+        // `mocks/SCREEN.HTML` that enables this menu item must also be a file
+        // the dispatched `coord portal publish-mocks` actually publishes,
+        // rather than one it then rejects with "nothing to publish".
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let tmp = std::env::temp_dir().join(format!("coord-tui-test-publish-mocks-upper-{}", tid));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let mocks_dir = tmp.join("tests").join("acceptance").join("ms-9").join("mocks");
+        std::fs::create_dir_all(&mocks_dir).unwrap();
+        std::fs::write(mocks_dir.join("SCREEN.HTML"), "<html></html>").unwrap();
+
+        let app = make_pipeline_app_for_publish_mocks_menu_test(0, tmp.to_str().unwrap());
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(751),
+            &PipelineRowLifecycle::New,
+            Some("api"),
+        );
+        let publish_item = items
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("publish-mocks-to-portal"))
+            .expect("epic row must offer 'publish-mocks-to-portal'");
+        assert!(
+            !publish_item.disabled,
+            "an uppercase .HTML mock must enable the menu item, matching the CLI's glob"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn dispatch_publish_mocks_to_portal_action_spawns_command() {
         // The menu action fires `coord portal publish-mocks <repo>
         // <tracking_issue>` headlessly — same dispatch mechanism as
