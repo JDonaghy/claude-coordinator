@@ -584,6 +584,40 @@ def test_publish_mocks_uploads_and_enqueues(tmp_path, monkeypatch):
     assert rows[0].fields["design_round"]["bundle_key"] == "bundles/sub_1/r1.tar"
 
 
+def test_publish_mocks_includes_uppercase_html_suffix(tmp_path, monkeypatch):
+    """The `.html` suffix match is case-insensitive, matching the TUI's
+    `gate_a_mocks_dir_exists_for` enablement gate (#2513 review follow-up).
+
+    A `mocks/` dir holding only `SCREEN.HTML` enables the TUI menu item; if
+    this command's glob were case-sensitive it would then die with "nothing
+    to publish" — the exact enabled-button-does-nothing mismatch the gate
+    tightening was written to close.
+    """
+    from coord import portal_store
+
+    repo_dir = tmp_path / "repo"
+    mocks_dir = repo_dir / "tests" / "acceptance" / "ms-9" / "mocks"
+    mocks_dir.mkdir(parents=True)
+    (mocks_dir / "SCREEN.HTML").write_text("<html>shouty</html>")
+    cfg_path = _config_with_repo_path(tmp_path, repo_dir)
+    portal_store.link_milestone(
+        repo_name="coord", milestone_number=9, submission_id="sub_1"
+    )
+    monkeypatch.setattr("coord.github_ops.get_issue", _stub_get_issue())
+
+    seen_upload: dict = {}
+
+    def _post(url, json=None, headers=None, timeout=None):
+        seen_upload["files"] = (json or {}).get("files")
+        return _UploadResponse(200, {"bundle_key": "bundles/sub_1/r1.tar"})
+
+    monkeypatch.setattr("httpx.post", _post)
+
+    result = run("portal", "publish-mocks", "--config", cfg_path, "coord", "3")
+    assert result.exit_code == 0, result.output
+    assert set(seen_upload["files"]) == {"mocks/SCREEN.HTML"}
+
+
 def test_publish_mocks_reports_upload_failure(tmp_path, monkeypatch):
     from coord import portal_store
 

@@ -428,7 +428,12 @@ def _collect_local_mock_bundle_files(repo_dir, milestone_number: int) -> dict:
     Same ``{relative_path: content}`` shape: ``"contract.md"`` plus every
     ``mocks/*.html`` fixture — which, if #2512 (master index page) has
     landed, automatically picks up ``mocks/index.html`` too, since this
-    globs everything under ``mocks/`` rather than naming files. Empty when
+    globs everything under ``mocks/`` rather than naming files. The suffix
+    match is case-INSENSITIVE (``SCREEN.HTML`` counts) so that this stays
+    aligned with the TUI's `gate_a_mocks_dir_exists_for` enablement gate
+    (#2513 review follow-up) — a file that lights the menu item up must be
+    a file this command actually publishes, or the operator gets an
+    enabled button whose dispatch dies with "nothing to publish". Empty when
     the ``ms-NN`` acceptance directory doesn't exist locally at all —
     callers treat that as an error (unlike the merge-triggered path's
     "nothing to push", this command is operator-invoked and should say why
@@ -446,7 +451,7 @@ def _collect_local_mock_bundle_files(repo_dir, milestone_number: int) -> dict:
     mocks_dir = ms_dir / "mocks"
     if mocks_dir.is_dir():
         for p in sorted(mocks_dir.iterdir()):
-            if p.is_file() and p.suffix == ".html":
+            if p.is_file() and p.suffix.lower() == ".html":
                 files[f"mocks/{p.name}"] = _read_text_or_raise(p)
     return files
 
