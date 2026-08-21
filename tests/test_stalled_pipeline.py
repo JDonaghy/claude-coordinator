@@ -1425,6 +1425,172 @@ class TestDispatchPerReason:
         stub.assert_called_once()
 
 
+# ── #2537: merge_conflict_unresolved on a sealed-author row confined to the
+# sealed acceptance paths must not spend a worker session on a guaranteed
+# no-op conflict-fix dispatch ─────────────────────────────────────────────
+
+
+class TestMergeConflictSealedConfinement:
+    def _sealed_config(self, config: Config) -> Config:
+        from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+        config.acceptance = AcceptanceConfig(
+            drivers={"vimcode": AcceptanceDriverConfig(kind="cli-pytest", run="pytest")}
+        )
+        return config
+
+    def test_skips_dispatch_when_conflict_confined_to_sealed_paths(
+        self, config: Config, monkeypatch
+    ) -> None:
+        config.pipeline.auto_dispatch_stalled = True
+        config = self._sealed_config(config)
+        board = _board(
+            _mock_author_work("ma-work-1", test_state="passed"),
+            _review("ma-work-1", aid="ma-review-1", review_verdict="approve"),
+        )
+        queued = [QueuedMerge(
+            assignment_id="ma-work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="ms-65-gate-a", target_branch="main", issue_number=602,
+            issue_title="t", state=CONFLICT, error="could not be rebased onto main",
+        )]
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )[0]
+        assert detection.reason == "merge_conflict_unresolved"
+        assert work.type == "mock-author"
+
+        conflict_fix_stub = MagicMock()
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", conflict_fix_stub)
+        monkeypatch.setattr("coord.merge_queue.load_queue", lambda: queued)
+        monkeypatch.setattr(
+            "coord.github_ops.get_compare_files",
+            lambda repo, base, head: ["tests/acceptance/ms-4/manifest.yml"],
+        )
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "skipped_sealed_conflict"
+        assert "tests/acceptance/ms-4/manifest.yml" in action.detail
+        assert action.kind not in notify_mod._STALLED_DISPATCH_KINDS
+        conflict_fix_stub.assert_not_called()
+
+    def test_falls_back_to_conflict_fix_when_conflict_touches_outside_sealed_paths(
+        self, config: Config, monkeypatch
+    ) -> None:
+        config.pipeline.auto_dispatch_stalled = True
+        config = self._sealed_config(config)
+        board = _board(
+            _mock_author_work("ma-work-2", test_state="passed"),
+            _review("ma-work-2", aid="ma-review-2", review_verdict="approve"),
+        )
+        queued = [QueuedMerge(
+            assignment_id="ma-work-2", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="ms-65-gate-a", target_branch="main", issue_number=602,
+            issue_title="t", state=CONFLICT, error="could not be rebased onto main",
+        )]
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )[0]
+
+        fix_assignment = Assignment(
+            machine_name="mac-mini", repo_name="vimcode", issue_number=602,
+            issue_title="[conflict-fix] t", assignment_id="cf-2", status="pending",
+            type="conflict-fix",
+        )
+        conflict_fix_stub = MagicMock(return_value=fix_assignment)
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", conflict_fix_stub)
+        monkeypatch.setattr("coord.merge_queue.load_queue", lambda: queued)
+        monkeypatch.setattr(
+            "coord.github_ops.get_compare_files",
+            lambda repo, base, head: [
+                "tests/acceptance/ms-4/manifest.yml", "coord/some_module.py",
+            ],
+        )
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "conflict_fix_dispatched"
+        conflict_fix_stub.assert_called_once()
+
+    def test_falls_back_to_conflict_fix_when_compare_api_fails(
+        self, config: Config, monkeypatch
+    ) -> None:
+        config.pipeline.auto_dispatch_stalled = True
+        config = self._sealed_config(config)
+        board = _board(
+            _mock_author_work("ma-work-3", test_state="passed"),
+            _review("ma-work-3", aid="ma-review-3", review_verdict="approve"),
+        )
+        queued = [QueuedMerge(
+            assignment_id="ma-work-3", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="ms-65-gate-a", target_branch="main", issue_number=602,
+            issue_title="t", state=CONFLICT, error="could not be rebased onto main",
+        )]
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )[0]
+
+        fix_assignment = Assignment(
+            machine_name="mac-mini", repo_name="vimcode", issue_number=602,
+            issue_title="[conflict-fix] t", assignment_id="cf-3", status="pending",
+            type="conflict-fix",
+        )
+        conflict_fix_stub = MagicMock(return_value=fix_assignment)
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", conflict_fix_stub)
+        monkeypatch.setattr("coord.merge_queue.load_queue", lambda: queued)
+        monkeypatch.setattr(
+            "coord.github_ops.get_compare_files", lambda repo, base, head: None,
+        )
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "conflict_fix_dispatched"
+        conflict_fix_stub.assert_called_once()
+
+    def test_plain_work_row_never_gets_the_sealed_confinement_check(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """The confinement check only applies to SEALED_PATH_AUTHOR_TYPES —
+        a plain `work` row always goes straight to `dispatch_conflict_fix`,
+        even when its conflict happens to be confined to sealed paths (a
+        `work` row touching sealed paths at all is already a scope
+        violation caught elsewhere, not something to special-case here)."""
+        config.pipeline.auto_dispatch_stalled = True
+        config = self._sealed_config(config)
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        queued = [QueuedMerge(
+            assignment_id="work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="issue-602-fix", target_branch="main", issue_number=602,
+            issue_title="t", state=CONFLICT, error="could not be rebased onto main",
+        )]
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )[0]
+        assert work.type == "work"
+
+        fix_assignment = Assignment(
+            machine_name="mac-mini", repo_name="vimcode", issue_number=602,
+            issue_title="[conflict-fix] t", assignment_id="cf-4", status="pending",
+            type="conflict-fix",
+        )
+        conflict_fix_stub = MagicMock(return_value=fix_assignment)
+        get_compare_files_stub = MagicMock(
+            return_value=["tests/acceptance/ms-4/manifest.yml"]
+        )
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", conflict_fix_stub)
+        monkeypatch.setattr("coord.merge_queue.load_queue", lambda: queued)
+        monkeypatch.setattr("coord.github_ops.get_compare_files", get_compare_files_stub)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "conflict_fix_dispatched"
+        conflict_fix_stub.assert_called_once()
+        get_compare_files_stub.assert_not_called()
+
+
 # ── #2302: sealed-author rows bypass the auto_dispatch_stalled flag ─────────
 #
 # `pipeline.auto_dispatch_stalled` bounds blast radius on rows another loop
@@ -1434,6 +1600,10 @@ class TestDispatchPerReason:
 # with no drive run over it at all (#2289) — so THIS one reason+type
 # combination must dispatch regardless of the flag. `work` rows under the
 # same reason keep the opt-in gate unchanged.
+#
+# #2537 extends the SAME bypass to `merge_conflict_unresolved` on these row
+# types — see `TestDispatchSealedAuthorBypassesFlagCoversMergeConflict`
+# below.
 
 
 class TestDispatchSealedAuthorBypassesFlag:
@@ -1576,6 +1746,108 @@ class TestDispatchSealedAuthorBypassesFlag:
         assert action.kind == "no_action"
         assert action.kind not in notify_mod._STALLED_DISPATCH_KINDS
         stub.assert_called_once()
+
+
+class TestDispatchSealedAuthorBypassesFlagCoversMergeConflict:
+    """#2537: the #2302 bypass now also fires for `merge_conflict_unresolved`
+    on a SEALED_PATH_AUTHOR_TYPES row — the identical shape (`coord drive`
+    `_die()`s on these row types before ever reaching a merge, so nothing
+    else owns the stall)."""
+
+    def test_mock_author_conflict_stall_dispatches_with_flag_off(
+        self, config: Config, monkeypatch
+    ) -> None:
+        assert config.pipeline.auto_dispatch_stalled is False
+        board = _board(
+            _mock_author_work("ma-work-4", test_state="passed"),
+            _review("ma-work-4", aid="ma-review-4", review_verdict="approve"),
+        )
+        queued = [QueuedMerge(
+            assignment_id="ma-work-4", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="ms-65-gate-a", target_branch="main", issue_number=602,
+            issue_title="t", state=CONFLICT, error="could not be rebased onto main",
+        )]
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )[0]
+        assert detection.reason == "merge_conflict_unresolved"
+        assert work.type == "mock-author"
+
+        fix_assignment = Assignment(
+            machine_name="mac-mini", repo_name="vimcode", issue_number=602,
+            issue_title="[conflict-fix] t", assignment_id="cf-5", status="pending",
+            type="conflict-fix",
+        )
+        stub = MagicMock(return_value=fix_assignment)
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", stub)
+        monkeypatch.setattr("coord.merge_queue.load_queue", lambda: queued)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "conflict_fix_dispatched"
+        stub.assert_called_once()
+
+    def test_test_author_conflict_stall_dispatches_with_flag_off(
+        self, config: Config, monkeypatch
+    ) -> None:
+        assert config.pipeline.auto_dispatch_stalled is False
+        board = _board(
+            replace(_mock_author_work("ta-work-4", test_state="passed"), type="test-author"),
+            _review("ta-work-4", aid="ta-review-4", review_verdict="approve"),
+        )
+        queued = [QueuedMerge(
+            assignment_id="ta-work-4", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="ms-65-gate-a", target_branch="main", issue_number=602,
+            issue_title="t", state=CONFLICT, error="could not be rebased onto main",
+        )]
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )[0]
+        assert detection.reason == "merge_conflict_unresolved"
+        assert work.type == "test-author"
+
+        fix_assignment = Assignment(
+            machine_name="mac-mini", repo_name="vimcode", issue_number=602,
+            issue_title="[conflict-fix] t", assignment_id="cf-6", status="pending",
+            type="conflict-fix",
+        )
+        stub = MagicMock(return_value=fix_assignment)
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", stub)
+        monkeypatch.setattr("coord.merge_queue.load_queue", lambda: queued)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "conflict_fix_dispatched"
+        stub.assert_called_once()
+
+    def test_work_conflict_stall_still_disabled_with_flag_off(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """Regression guard: a plain `work` row under the identical reason
+        stays gated behind the flag — unchanged from before #2537."""
+        assert config.pipeline.auto_dispatch_stalled is False
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        queued = [QueuedMerge(
+            assignment_id="work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="issue-602-fix", target_branch="main", issue_number=602,
+            issue_title="t", state=CONFLICT, error="could not be rebased onto main",
+        )]
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )[0]
+        assert work.type == "work"
+
+        stub = MagicMock()
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", stub)
+        monkeypatch.setattr("coord.merge_queue.load_queue", lambda: queued)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "disabled"
+        stub.assert_not_called()
 
 
 class TestLiveSessionGuard:

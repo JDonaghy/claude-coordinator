@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import httpx
 
 if TYPE_CHECKING:
+    from coord.merge_queue import QueuedMerge
     from coord.models import Assignment, Board
     from coord.progress import SmokeVerdict
 
@@ -991,6 +992,14 @@ class StalledDispatchAction:
       (#602).
     - ``"skipped_human_required"``  — the conflict-fix retry cap was already
       hit; surfacing to a human, not auto-retrying.
+    - ``"skipped_sealed_conflict"`` (#2537) — ``merge_conflict_unresolved``
+      on a :data:`coord.models.SEALED_PATH_AUTHOR_TYPES` row whose conflict
+      was confirmed (:func:`_conflict_confined_to_sealed_paths`) to be
+      confined to the repo's sealed acceptance-oracle paths — a
+      conflict-fix worker is guaranteed to self-restrict and push nothing
+      there, so the dispatch was skipped rather than spending a worker
+      session on a known no-op; needs a sealed-path-aware rebase dispatcher
+      (a follow-up issue, not yet implemented).
     - ``"disabled"``                — ``pipeline.auto_dispatch_stalled`` is
       off; detection/narration still happened, dispatch did not.
     """
@@ -1044,6 +1053,50 @@ def _stalled_row_has_live_session(board: "Board", work: "Assignment") -> bool:
     return False
 
 
+def _conflict_confined_to_sealed_paths(
+    entry: "QueuedMerge", config: Config,
+) -> list[str] | None:
+    """#2537: best-effort check for whether *entry*'s merge conflict can
+    ONLY be within the repo's sealed acceptance-oracle paths
+    (:meth:`coord.config.AcceptanceConfig.sealed_paths`).
+
+    Returns the entry branch's changed-file list when every file it touches
+    (the three-dot compare of *entry.target_branch*...*entry.branch*, via
+    :func:`coord.github_ops.get_compare_files` — the SAME GitHub-API-only,
+    no-local-checkout seam #1720's dispatch-time overlap fence already uses)
+    falls under a sealed path. GitHub's conflicting-file set is necessarily
+    a SUBSET of this branch's own changed files — a file can only conflict
+    if *this* branch touches it too — so confining the WHOLE branch diff to
+    sealed paths is sufficient to guarantee the conflict is, without needing
+    a local checkout or a `git merge-tree` call.
+
+    Returns ``None`` — "can't confirm confinement, don't skip the ordinary
+    dispatch" — when: the repo has no acceptance driver configured (nothing
+    is sealed); the compare API call fails or reports no files; or anything
+    is touched outside every sealed path. This is a pure availability
+    signal, never a hard "not confined" claim — a caller that gets ``None``
+    falls back to :func:`coord.conflict_fix.dispatch_conflict_fix` exactly
+    as before, which is always safe: a genuinely sealed-confined conflict
+    just makes that dispatch a no-op (the conflict-fix worker self-restricts
+    per CLAUDE.md's own sealed-path rule), so the only cost of a missed
+    detection here is one wasted worker session, never an incorrect action.
+    """
+    sealed = config.acceptance.sealed_paths(entry.repo_name)
+    if not sealed:
+        return None
+    from coord import github_ops  # noqa: PLC0415
+    from coord.review import _path_is_sealed  # noqa: PLC0415
+
+    files = github_ops.get_compare_files(
+        entry.repo_github, entry.target_branch, entry.branch,
+    )
+    if not files:
+        return None
+    if all(any(_path_is_sealed(f, s) for s in sealed) for f in files):
+        return files
+    return None
+
+
 def dispatch_stalled_pipeline_action(
     detection: StalledDetection,
     work: "Assignment",
@@ -1058,11 +1111,12 @@ def dispatch_stalled_pipeline_action(
     Gated by ``config.pipeline.auto_dispatch_stalled`` (default ``False`` —
     detection/narration via :func:`post_stalled_pipeline` is unconditional;
     this is the opt-in action half) — EXCEPT for a ``review_request_changes_
-    no_fix`` stall on a :data:`coord.models.SEALED_PATH_AUTHOR_TYPES` row
-    (``test-author``/``mock-author``), which dispatches regardless of the
-    flag: no loop owns that row (#2302), so the flag would only leave it
-    stalled forever with no alternative dispatcher to race. ``work`` rows
-    under the same reason keep the opt-in gate — ``coord drive`` owns those.
+    no_fix`` OR (#2537) ``merge_conflict_unresolved`` stall on a
+    :data:`coord.models.SEALED_PATH_AUTHOR_TYPES` row (``test-author``/
+    ``mock-author``), which dispatches regardless of the flag: no loop owns
+    that row (#2302), so the flag would only leave it stalled forever with
+    no alternative dispatcher to race. ``work`` rows under the same reasons
+    keep the opt-in gate — ``coord drive`` owns those.
     Mutates *board* in place exactly like
     the auto-loop / review-dispatch helpers it delegates to — the caller is
     responsible for persisting it.
@@ -1091,7 +1145,15 @@ def dispatch_stalled_pipeline_action(
       the same bulk gate-checked enqueue the daemon passive tick already
       runs on every interval.
     - ``merge_conflict_unresolved`` → :func:`coord.conflict_fix.dispatch_conflict_fix`,
-      the #1474 ``_dispatch_conflict_fixes`` path.
+      the #1474 ``_dispatch_conflict_fixes`` path — UNLESS (#2537) *work* is a
+      :data:`coord.models.SEALED_PATH_AUTHOR_TYPES` row AND the conflict can
+      be confirmed (via :func:`_conflict_confined_to_sealed_paths`, a
+      compare-API-only check) to be confined to the repo's sealed
+      acceptance-oracle paths — a conflict-fix worker is REQUIRED by
+      CLAUDE.md's own sealed-path rule to self-restrict from editing those,
+      so it is guaranteed to push nothing; that case returns
+      ``"skipped_sealed_conflict"`` instead of spending a worker session on
+      a known no-op.
     - ``review_failed_no_verdict`` (#1584) → :func:`coord.review.dispatch_review`
       again, the SAME call as ``done_no_review`` — the failed review left no
       verdict behind, so recovery is identical to "no review was ever
@@ -1116,10 +1178,20 @@ def dispatch_stalled_pipeline_action(
     # no drive run over it at all (see #2289). So this one reason+type
     # combination bypasses the flag — every other reason, and `work` rows
     # under this same reason, keep the opt-in gate unchanged.
+    #
+    # #2537: a `merge_conflict_unresolved` stall on the SAME row types is the
+    # identical shape — `coord drive` has no conflict-fix arm for
+    # test-author/mock-author rows either (it `_die()`s on them before ever
+    # reaching a merge), and the passive tick only re-enqueues, never
+    # dispatches a conflict-fix. Without this, the row bounces
+    # PENDING → CONFLICT → parked forever with nobody attempting a fix
+    # (observed live: coord-portal#132). So this reason joins the bypass for
+    # these row types too — every other reason, and `work` rows under either
+    # reason, keep the opt-in gate unchanged.
     from coord.models import SEALED_PATH_AUTHOR_TYPES  # noqa: PLC0415
 
     sealed_author_stall = (
-        detection.reason == "review_request_changes_no_fix"
+        detection.reason in ("review_request_changes_no_fix", "merge_conflict_unresolved")
         and work.type in SEALED_PATH_AUTHOR_TYPES
     )
     if not config.pipeline.auto_dispatch_stalled and not sealed_author_stall:
@@ -1423,6 +1495,35 @@ def dispatch_stalled_pipeline_action(
                 kind="skipped_human_required",
                 detail="conflict-fix already active or its retry cap was already hit",
             )
+        # #2537: dispatch_conflict_fix is guaranteed to no-op on a conflict
+        # confined to the repo's sealed acceptance-oracle paths — the
+        # conflict-fix worker is REQUIRED by CLAUDE.md's own sealed-path
+        # rule to self-restrict from editing them (the additive carve-out
+        # applies only to test-author/mock-author dispatches, never
+        # conflict-fix), so it pushes nothing and the entry just re-stalls
+        # next tick. Confirmed live on coord-portal#132/#135: a manually
+        # forced dispatch_conflict_fix restored its worktree clean and
+        # pushed nothing. Skip the known-wasted dispatch when we can
+        # confirm confinement in advance; resolving it for real needs a
+        # sealed-path-aware re-dispatch (tracked as a follow-up issue, not
+        # yet implemented) — dispatch_conflict_fix stays the fallback for
+        # every other case (can't confirm confinement, or genuinely not
+        # confined).
+        if work.type in SEALED_PATH_AUTHOR_TYPES:
+            sealed_files = _conflict_confined_to_sealed_paths(entry, config)
+            if sealed_files is not None:
+                return StalledDispatchAction(
+                    kind="skipped_sealed_conflict",
+                    detail=(
+                        "conflict is confined to sealed acceptance paths ("
+                        + ", ".join(sealed_files)
+                        + ") — a conflict-fix worker is required to "
+                        "self-restrict from editing them (CLAUDE.md's "
+                        "sealed-path rule) and would push nothing; needs a "
+                        "sealed-path-aware rebase dispatcher (follow-up "
+                        "issue), not dispatch_conflict_fix"
+                    ),
+                )
         fix = dispatch_conflict_fix(entry, board, config, prefer_machine=work.machine_name)
         if fix is None:
             return StalledDispatchAction(
