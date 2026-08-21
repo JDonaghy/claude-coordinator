@@ -18,3 +18,8 @@ tui/*.out
 # tui/cargo-config-local-quadraui.toml.example) — never commit a
 # machine-local co-development override.
 tui/.cargo/config.toml
+
+# scratch $HOME created inside disposable worktrees by the CI-mode
+# acceptance runner (scripts/coord-test-runner.sh) — never meant to
+# leave the throwaway worktree, let alone land in git history (#2527).
+.coord-ci-home/
