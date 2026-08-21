@@ -2932,7 +2932,11 @@
                 repo_slug: "acme/api".to_string(),
                 coord_repo: Some("api".to_string()),
                 matched_labels: vec!["coord".to_string(), "epic".to_string()],
-                all_labels: vec!["coord".to_string(), "epic".to_string(), "status:ready".to_string()],
+                all_labels: vec![
+                    "coord".to_string(),
+                    "epic".to_string(),
+                    "status:ready".to_string(),
+                ],
                 is_closed: false,
                 body_truncated: false,
                 body_len: None,
@@ -2954,6 +2958,26 @@
         app.active_view = SidebarView::Pipeline;
         app.pipeline_sel = Some(selected_idx);
         app
+    }
+
+    // ── #2501: "View Gate A mock (local)" ──────────────────────────────────
+    // The PR route (`view-gate-a-mock`, above) can never actually show the
+    // rendered mock(s) — GitHub renders `.html` as a source diff in "Files
+    // changed", never a live page. These tests cover the local counterpart:
+    // gated on the mocks dir having a rendered `.html` on disk (the same
+    // `gate_a_mocks_dir_exists_for` gate #2513 uses for "Publish mocks to
+    // portal"), and — since the whole point is to see the *latest* render —
+    // fast-forward-pulling the checkout's default branch before ever opening
+    // anything, aborting untouched on any dirty/diverged working tree.
+
+    /// #2501's fixture: identical board shape to
+    /// `make_pipeline_app_for_publish_mocks_menu_test` above (epic #751 with
+    /// milestone #9, `pipeline_repo_paths["api"] = repo_path`), kept under
+    /// its own name so the local-mock tests read against the feature they
+    /// cover rather than the portal-publish one they happen to share a
+    /// fixture with.
+    fn make_pipeline_app_for_local_mock_menu_test(selected_idx: usize, repo_path: &str) -> CoordApp {
+        make_pipeline_app_for_publish_mocks_menu_test(selected_idx, repo_path)
     }
 
     #[test]
@@ -3091,6 +3115,47 @@
     }
 
     #[test]
+    fn view_gate_a_mock_local_item_disabled_until_mocks_dir_exists_on_disk() {
+        // #2501: the local viewer shares #2513's `gate_a_mocks_dir_exists_for`
+        // gate — the click-time pull is what catches a mock that landed
+        // upstream but was never locally fetched; this gate just answers "is
+        // there a rendered mock here yet worth offering the item for".
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let tmp = std::env::temp_dir().join(format!("coord-tui-test-gate-a-mocks-gate-{}", tid));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let app = make_pipeline_app_for_local_mock_menu_test(0, tmp.to_str().unwrap());
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(751),
+            &PipelineRowLifecycle::New,
+            Some("api"),
+        );
+        let item = items
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("view-gate-a-mock-local"))
+            .expect("epic row must offer 'view-gate-a-mock-local'");
+        assert!(item.disabled, "must be disabled before mocks/ exists on disk");
+
+        let mocks_dir = tmp.join("tests").join("acceptance").join("ms-9").join("mocks");
+        std::fs::create_dir_all(&mocks_dir).unwrap();
+        std::fs::write(mocks_dir.join("screen-a.html"), "<html></html>").unwrap();
+
+        let app = make_pipeline_app_for_local_mock_menu_test(0, tmp.to_str().unwrap());
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(751),
+            &PipelineRowLifecycle::New,
+            Some("api"),
+        );
+        let item = items
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("view-gate-a-mock-local"))
+            .expect("epic row must offer 'view-gate-a-mock-local'");
+        assert!(!item.disabled, "must enable once a rendered mock exists on disk");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn publish_mocks_item_enables_for_uppercase_html_suffix() {
         // Review follow-up (#2513): this gate's `.html` match is
         // case-INSENSITIVE, and the CLI's `_collect_local_mock_bundle_files`
@@ -3148,6 +3213,265 @@
                 "751".to_string(),
             ]],
         );
+    }
+
+    /// Test-only git plumbing: run a `git` subcommand in `dir`, panicking
+    /// with the captured stderr on failure so a broken fixture fails loudly
+    /// at the setup step rather than surfacing as a confusing assertion
+    /// failure later in the test body.
+    fn test_git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn git {:?} in {:?}: {}", args, dir, e));
+        assert!(
+            out.status.success(),
+            "git {:?} in {:?} failed:\nstdout: {}\nstderr: {}",
+            args,
+            dir,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    /// Build a bare `origin` repo and a clone of it at `local`, both under
+    /// `root` (caller-supplied, unique per test). `origin`'s HEAD is pinned
+    /// to `refs/heads/main` *before* cloning so the clone's initial branch
+    /// (and `refs/remotes/origin/HEAD`) resolve to "main" deterministically,
+    /// regardless of this machine's `init.defaultBranch`. Returns
+    /// `(origin_dir, local_dir)`; `local` has one commit on `main`, already
+    /// pushed, with a configured `user.name`/`user.email` so further
+    /// commits made in the test body don't need to.
+    fn init_test_origin_and_local_clone(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        std::fs::create_dir_all(root).unwrap();
+        let origin = root.join("origin.git");
+        let local = root.join("local");
+        std::fs::create_dir_all(&origin).unwrap();
+        test_git(&origin, &["init", "--bare", "-q"]);
+        test_git(&origin, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        test_git(root, &["clone", "-q", origin.to_str().unwrap(), local.to_str().unwrap()]);
+        test_git(&local, &["config", "user.email", "coord-tui-test@example.com"]);
+        test_git(&local, &["config", "user.name", "coord-tui-test"]);
+        // A brand-new clone of an empty repo has no branch checked out
+        // until the first commit; the symbolic-ref pin above makes that
+        // first commit land on "main" rather than whatever this machine's
+        // `init.defaultBranch` happens to be.
+        std::fs::write(local.join("README.md"), "hello\n").unwrap();
+        test_git(&local, &["add", "README.md"]);
+        test_git(&local, &["commit", "-q", "-m", "initial"]);
+        test_git(&local, &["push", "-q", "-u", "origin", "main"]);
+        (origin, local)
+    }
+
+    #[test]
+    fn view_gate_a_mock_local_action_pulls_ff_only_then_opens_mocks() {
+        // #2501: the whole point of the local viewer is to show the
+        // *latest* render — so the click must fast-forward-pull the
+        // checkout's default branch before checking for (and opening) the
+        // mocks dir, catching a mock that landed on the remote after this
+        // checkout was last refreshed. Covers both halves of the "opens
+        // mocks/index.html when present, falls back to the raw directory
+        // otherwise" requirement via `opened_what` riding along in the
+        // status message (there's no way to observe what the real OS
+        // opener was actually handed).
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let root = std::env::temp_dir().join(format!("coord-tui-test-gate-a-pull-ok-{}", tid));
+        let _ = std::fs::remove_dir_all(&root);
+        let (origin, local) = init_test_origin_and_local_clone(&root);
+
+        // A second clone stands in for "the mock-author's push that already
+        // landed on the remote" — the fixture's `local` (the operator's
+        // checkout under test) never sees it until the dispatch pulls.
+        let pusher = root.join("pusher");
+        test_git(&root, &["clone", "-q", origin.to_str().unwrap(), pusher.to_str().unwrap()]);
+        test_git(&pusher, &["config", "user.email", "coord-tui-test@example.com"]);
+        test_git(&pusher, &["config", "user.name", "coord-tui-test"]);
+        let mocks_dir = pusher.join("tests").join("acceptance").join("ms-9").join("mocks");
+        std::fs::create_dir_all(&mocks_dir).unwrap();
+        std::fs::write(mocks_dir.join("index.html"), "<html>index</html>").unwrap();
+        test_git(&pusher, &["add", "."]);
+        test_git(&pusher, &["commit", "-q", "-m", "gate a mock"]);
+        test_git(&pusher, &["push", "-q", "origin", "main"]);
+
+        // Before dispatch: the operator's checkout hasn't pulled yet, so
+        // the mocks dir genuinely doesn't exist there — the "first pull
+        // that just produced the mocks dir still works" case from #2501's
+        // amendment.
+        let local_mocks_dir = local.join("tests").join("acceptance").join("ms-9").join("mocks");
+        assert!(!local_mocks_dir.exists(), "sanity: mocks dir must not exist before the pull");
+
+        let mut app = make_pipeline_app_for_local_mock_menu_test(0, local.to_str().unwrap());
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(751),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::New,
+        };
+        let toasts_before = app.toasts.len();
+        let handled = app.dispatch_context_menu_action("view-gate-a-mock-local", &target);
+        assert!(handled, "view-gate-a-mock-local must be a recognised action");
+        assert_eq!(
+            app.toasts.len(),
+            toasts_before,
+            "a clean fast-forward must not toast a warning; toasts: {:?}",
+            app.toasts.iter().map(|t| &t.0.title).collect::<Vec<_>>(),
+        );
+        assert!(
+            local_mocks_dir.join("index.html").is_file(),
+            "the ff-only pull must have brought the mock-author's commit into the local checkout"
+        );
+        let (status_msg, _) = app.pipeline_status.expect("must set a status message on success");
+        assert!(
+            status_msg.contains("index.html"),
+            "status must record that index.html was opened, got: {status_msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn view_gate_a_mock_local_action_falls_back_to_directory_without_index_html() {
+        // #2501 (amendment 2): until #2512 ships `mocks/index.html`, the
+        // fallback is the raw mocks directory — not a hunt for "the first
+        // .html file".
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let root = std::env::temp_dir().join(format!("coord-tui-test-gate-a-pull-nofallback-{}", tid));
+        let _ = std::fs::remove_dir_all(&root);
+        let (_origin, local) = init_test_origin_and_local_clone(&root);
+
+        let mocks_dir = local.join("tests").join("acceptance").join("ms-9").join("mocks");
+        std::fs::create_dir_all(&mocks_dir).unwrap();
+        std::fs::write(mocks_dir.join("screen-a.html"), "<html>a</html>").unwrap();
+        test_git(&local, &["add", "."]);
+        test_git(&local, &["commit", "-q", "-m", "gate a mock, no index"]);
+        test_git(&local, &["push", "-q", "origin", "main"]);
+
+        let mut app = make_pipeline_app_for_local_mock_menu_test(0, local.to_str().unwrap());
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(751),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::New,
+        };
+        let handled = app.dispatch_context_menu_action("view-gate-a-mock-local", &target);
+        assert!(handled, "view-gate-a-mock-local must be a recognised action");
+        let (status_msg, _) = app.pipeline_status.expect("must set a status message on success");
+        assert!(
+            status_msg.contains("mocks/") && !status_msg.contains("index.html"),
+            "without an index.html, must fall back to the raw mocks dir, got: {status_msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn view_gate_a_mock_local_action_aborts_with_toast_on_dirty_checkout() {
+        // #2501 (amendment 1): never pull over a dirty tree — abort with a
+        // toast telling the operator to sort out the checkout themselves,
+        // same posture as every other destructive-git-operation gate in
+        // this repo. Must NOT dispatch anything (no merge, nothing opened).
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let root = std::env::temp_dir().join(format!("coord-tui-test-gate-a-pull-dirty-{}", tid));
+        let _ = std::fs::remove_dir_all(&root);
+        let (_origin, local) = init_test_origin_and_local_clone(&root);
+
+        // Dirty the working tree: an uncommitted modification to the
+        // tracked README.
+        std::fs::write(local.join("README.md"), "uncommitted local edit\n").unwrap();
+
+        let mut app = make_pipeline_app_for_local_mock_menu_test(0, local.to_str().unwrap());
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(751),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::New,
+        };
+        let toasts_before = app.toasts.len();
+        let handled = app.dispatch_context_menu_action("view-gate-a-mock-local", &target);
+        assert!(handled, "view-gate-a-mock-local must be a recognised action");
+        assert!(
+            app.toasts.len() > toasts_before,
+            "a dirty checkout must toast a warning rather than silently no-op"
+        );
+        assert!(
+            app.toasts
+                .last()
+                .unwrap()
+                .0
+                .body
+                .to_lowercase()
+                .contains("uncommitted"),
+            "toast should explain the dirty-checkout reason, got: {:?}",
+            app.toasts.last().unwrap().0.body,
+        );
+        assert_eq!(
+            std::fs::read_to_string(local.join("README.md")).unwrap(),
+            "uncommitted local edit\n",
+            "the dirty file must be left exactly as it was — never discarded"
+        );
+        assert!(
+            !local.join("tests").join("acceptance").join("ms-9").join("mocks").exists(),
+            "no pull must have happened, so no mocks dir can have appeared"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn view_gate_a_mock_local_action_aborts_with_toast_on_diverged_checkout() {
+        // #2501 (amendment 1): a clean but diverged working tree is just as
+        // much a "never force" case as a dirty one — a fast-forward isn't
+        // possible, so abort rather than merge/rebase on the operator's
+        // behalf.
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let root = std::env::temp_dir().join(format!("coord-tui-test-gate-a-pull-diverged-{}", tid));
+        let _ = std::fs::remove_dir_all(&root);
+        let (origin, local) = init_test_origin_and_local_clone(&root);
+
+        // Diverge: a second clone pushes a commit to `main` on the remote...
+        let pusher = root.join("pusher");
+        test_git(&root, &["clone", "-q", origin.to_str().unwrap(), pusher.to_str().unwrap()]);
+        test_git(&pusher, &["config", "user.email", "coord-tui-test@example.com"]);
+        test_git(&pusher, &["config", "user.name", "coord-tui-test"]);
+        std::fs::write(pusher.join("README.md"), "remote-side change\n").unwrap();
+        test_git(&pusher, &["commit", "-aq", "-m", "remote-side change"]);
+        test_git(&pusher, &["push", "-q", "origin", "main"]);
+        // ...while `local` commits something different on top of the same
+        // parent, clean (committed, not dirty) but now unmergeable via
+        // fast-forward.
+        std::fs::write(local.join("README.md"), "local-side change\n").unwrap();
+        test_git(&local, &["commit", "-aq", "-m", "local-side change"]);
+
+        let mut app = make_pipeline_app_for_local_mock_menu_test(0, local.to_str().unwrap());
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(751),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::New,
+        };
+        let toasts_before = app.toasts.len();
+        let handled = app.dispatch_context_menu_action("view-gate-a-mock-local", &target);
+        assert!(handled, "view-gate-a-mock-local must be a recognised action");
+        assert!(
+            app.toasts.len() > toasts_before,
+            "a diverged checkout must toast a warning rather than silently no-op"
+        );
+        assert!(
+            app.toasts
+                .last()
+                .unwrap()
+                .0
+                .body
+                .to_lowercase()
+                .contains("diverged"),
+            "toast should explain the diverged-checkout reason, got: {:?}",
+            app.toasts.last().unwrap().0.body,
+        );
+        assert_eq!(
+            std::fs::read_to_string(local.join("README.md")).unwrap(),
+            "local-side change\n",
+            "an aborted diverged pull must leave the local commit exactly as it was"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -393,8 +393,16 @@ Phase 0 steps 1–2 and Phase 1 step 6 above are also reachable by right-clickin
   not a live session). The CLI's own claim-detection refuses a duplicate dispatch while one is
   already in flight. This *is* Phase 0 step 1.
 - **"View Gate A mock (PR)"** 👁 → opens that worker's PR in the browser so a human can read
-  `contract.md` + the rendered mock(s). Disabled until a PR exists. **Merging that PR does not
-  satisfy Gate A** (#2063) — it is only how you *see* what you are signing off on.
+  `contract.md` and review/merge the branch. Disabled until a PR exists. **This does not show the
+  rendered mock(s)** (#2501) — GitHub's "Files changed" view renders `.html` as a source diff,
+  never a live page; use "View Gate A mock (local)" below for that. **Merging that PR does not
+  satisfy Gate A** (#2063) — it is only how you review/merge what you are signing off on.
+- **"View Gate A mock (local)"** 👁 → the actual mock viewer (#2501). Fast-forward-pulls the local
+  checkout's default branch (never forcing, never touching a dirty or diverged tree — aborts with
+  a toast instead, same as everywhere else this repo touches git destructively) and then opens
+  `tests/acceptance/ms-NN/mocks/` from disk in the OS's default browser, where `.html` actually
+  renders. Disabled until that mocks directory exists locally. Opens `mocks/index.html` once #2512
+  ships it; falls back to opening the mocks directory itself until then.
 - **"Approve Gate A"** ✓ → `coord gate-a --approved <repo> <tracking_issue>` — records the verdict
   that actually satisfies Gate A. Sits directly beside the 👁 on purpose: reviewing and recording
   are one gesture.

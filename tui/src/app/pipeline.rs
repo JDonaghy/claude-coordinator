@@ -632,6 +632,207 @@ pub(crate) struct PendingGateAChangesNote {
     pub(crate) buf: String,
 }
 
+/// #2501: outcome of [`pull_default_branch_ff_only`] — gates "View Gate A
+/// mock (local)". Every non-`Ok` variant means the working tree was left
+/// completely untouched: never force, never touch a dirty tree, never
+/// switch branches on the operator's behalf — the same posture this repo
+/// already takes everywhere else around destructive/ambiguous git
+/// operations. The caller turns each variant into a toast telling the
+/// operator to sort out the checkout themselves.
+enum LocalPullOutcome {
+    /// Already up to date, or fast-forwarded cleanly onto the remote
+    /// default branch.
+    Ok,
+    /// `git status --porcelain` reported uncommitted changes.
+    Dirty,
+    /// The checked-out branch isn't the remote's default branch. Carries
+    /// the branch name actually checked out, for the toast.
+    WrongBranch(String),
+    /// The default branch has diverged from `origin/<default>` — a
+    /// fast-forward merge isn't possible.
+    Diverged,
+    /// Some other git failure (no `origin` remote, detached HEAD, spawn
+    /// failure, ...). Carries a short reason for the toast.
+    Failed(String),
+}
+
+/// #2501: fetch `origin` and fast-forward the local checkout at `repo_dir`
+/// onto the remote's default branch.
+///
+/// Synchronous/blocking by design: an async job queue (mirroring
+/// `spawn_test_build`/`test_build_jobs`) would need a new field on `App`
+/// itself (`app/mod.rs`), out of scope for this fix. This is a rare,
+/// explicit user click — not a per-tick operation — and a local `git fetch`
+/// against these repos is sub-second, so a brief block is an acceptable
+/// trade against the scope this change stays within.
+///
+/// Sequence, each step aborting before the next on failure:
+/// 1. `git status --porcelain` — any output at all means a dirty working
+///    tree, and we never pull over one (`Dirty`).
+/// 2. Resolve the currently checked-out branch (`Failed` on a detached HEAD
+///    or any other resolution failure).
+/// 3. `git fetch origin <branch>` — safe regardless of working-tree state;
+///    updates `refs/remotes/origin/<branch>` via the default clone refspec.
+/// 4. Resolve the remote's default branch via
+///    `refs/remotes/origin/HEAD` (running `git remote set-head origin
+///    --auto` once, if that ref isn't set yet, to populate it from what was
+///    just fetched — a local bookkeeping ref, not a working-tree mutation).
+/// 5. If the checked-out branch isn't that default branch, abort
+///    (`WrongBranch`) rather than merging into the wrong branch or
+///    switching branches ourselves.
+/// 6. `git merge --ff-only origin/<default>` — `Diverged` when this isn't a
+///    fast-forward, `Ok` otherwise (including "already up to date").
+fn pull_default_branch_ff_only(repo_dir: &std::path::Path) -> LocalPullOutcome {
+    use std::process::{Command, Stdio};
+
+    fn run(repo_dir: &std::path::Path, args: &[&str]) -> Result<std::process::Output, String> {
+        Command::new("git")
+            .current_dir(repo_dir)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("git {}: {}", args.join(" "), e))
+    }
+
+    fn first_reason(out: &std::process::Output, fallback: &str) -> String {
+        String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .unwrap_or_else(|| fallback.to_string())
+    }
+
+    // 1. Dirty check first — before anything else touches this repo at all.
+    let status = match run(repo_dir, &["status", "--porcelain"]) {
+        Ok(out) => out,
+        Err(e) => return LocalPullOutcome::Failed(e),
+    };
+    if !status.status.success() {
+        return LocalPullOutcome::Failed(first_reason(&status, "git status failed"));
+    }
+    if !status.stdout.is_empty() {
+        return LocalPullOutcome::Dirty;
+    }
+
+    // 2. Current branch.
+    let branch_out = match run(repo_dir, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+        Ok(out) => out,
+        Err(e) => return LocalPullOutcome::Failed(e),
+    };
+    if !branch_out.status.success() {
+        return LocalPullOutcome::Failed(first_reason(&branch_out, "git rev-parse HEAD failed"));
+    }
+    let branch = String::from_utf8_lossy(&branch_out.stdout).trim().to_string();
+    if branch.is_empty() || branch == "HEAD" {
+        return LocalPullOutcome::Failed("checkout has no branch checked out (detached HEAD)".to_string());
+    }
+
+    // 3. Fetch — safe regardless of working-tree state.
+    let fetch = match run(repo_dir, &["fetch", "origin", &branch]) {
+        Ok(out) => out,
+        Err(e) => return LocalPullOutcome::Failed(e),
+    };
+    if !fetch.status.success() {
+        return LocalPullOutcome::Failed(first_reason(&fetch, "git fetch origin failed"));
+    }
+
+    // 4. Resolve the remote's default branch, populating the ref if a
+    //    non-`clone` checkout never set it.
+    let default_branch = resolve_remote_default_branch(repo_dir).or_else(|| {
+        let _ = run(repo_dir, &["remote", "set-head", "origin", "--auto"]);
+        resolve_remote_default_branch(repo_dir)
+    });
+    let Some(default_branch) = default_branch else {
+        return LocalPullOutcome::Failed(
+            "cannot determine the remote's default branch (refs/remotes/origin/HEAD unset)"
+                .to_string(),
+        );
+    };
+
+    // 5. Refuse to merge into / switch off of the wrong branch.
+    if branch != default_branch {
+        return LocalPullOutcome::WrongBranch(branch);
+    }
+
+    // 6. Fast-forward only.
+    let merge = match run(
+        repo_dir,
+        &["merge", "--ff-only", &format!("origin/{default_branch}")],
+    ) {
+        Ok(out) => out,
+        Err(e) => return LocalPullOutcome::Failed(e),
+    };
+    if !merge.status.success() {
+        return LocalPullOutcome::Diverged;
+    }
+    LocalPullOutcome::Ok
+}
+
+/// #2501: resolve the remote's default branch name (e.g. `"main"`) via
+/// `refs/remotes/origin/HEAD`, stripping the `origin/` prefix.  `None` when
+/// that ref isn't set (a checkout that was never `git clone`d, or had it
+/// pruned) — the caller tries `git remote set-head origin --auto` once and
+/// retries before giving up.
+fn resolve_remote_default_branch(repo_dir: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .current_dir(repo_dir)
+        .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let short = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    short.strip_prefix("origin/").map(|s| s.to_string())
+}
+
+/// #2501: fire-and-forget open of a local filesystem path in the OS's
+/// default browser — the `file://` counterpart to
+/// `dispatch_open_pr_for_selected_pipeline_row`'s `gh pr view --web`. `gh`
+/// handles cross-platform opening for the PR case; there's no `gh`
+/// equivalent for a bare local path, so this shells out to the OS opener
+/// directly. Same "don't care about exit code" posture — the user sees the
+/// browser open, not a coord-tui status.
+fn open_local_path_in_browser(path: &std::path::Path) {
+    let url = format!("file://{}", percent_encode_file_url_path(path));
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", ""]);
+        c
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut cmd = std::process::Command::new("xdg-open");
+    let _ = cmd
+        .arg(&url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// #2501: minimal percent-encoding for a filesystem path used in a
+/// `file://` URL — escapes everything outside the URL-safe unreserved set
+/// (preserving `/` as the path separator) so a mocks directory containing
+/// spaces or other punctuation still opens correctly.
+fn percent_encode_file_url_path(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy();
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
 // ─── Pipeline impl CoordApp ─────────────────────────────────────────────────
 
 impl CoordApp {
@@ -4388,6 +4589,16 @@ impl CoordApp {
     /// non-`.html` junk (a stray file, an empty subdirectory, `.DS_Store`)
     /// would otherwise enable this menu item only for the dispatched
     /// `coord portal publish-mocks` to fail loud with "nothing to publish".
+    ///
+    /// #2501 shares this same gate for "View Gate A mock (local)": that
+    /// action opens a *rendered* `.html` mock, so the identical "at least
+    /// one `.html` on disk" question is the right one there too.
+    /// Deliberately cheap and synchronous (no network, no pull) for both
+    /// callers — #2501's action itself fast-forward-pulls the local checkout
+    /// before opening (see `pull_default_branch_ff_only`) to catch a mock
+    /// that landed upstream after this checkout was last refreshed, so this
+    /// check only needs to answer "is there anything here yet worth offering
+    /// the menu item for".
     pub(crate) fn gate_a_mocks_dir_exists_for(&self, issue: &PipelineIssue) -> bool {
         let Some((milestone_number, _)) = self.pipeline_issue_milestone(issue) else {
             return false;
@@ -4415,6 +4626,150 @@ impl CoordApp {
                 })
             })
             .unwrap_or(false)
+    }
+
+    /// #2501: "View Gate A mock (local)" — the actual dispatch behind the
+    /// menu item gated by `gate_a_mocks_dir_exists_for` above. Opens the
+    /// mock-author's rendered mock(s) straight from the local checkout
+    /// rather than the worker's PR, which GitHub can never render live
+    /// (`.html` shows as a source diff in "Files changed" — there has never
+    /// actually been a way to *see* the rendered mock through the PR route).
+    ///
+    /// Freshness first: the whole point of this action is to see the
+    /// *latest* render, and the operator's local checkout can be stale (the
+    /// "I had to git pull myself" gap this issue exists to close) — so this
+    /// fast-forward-pulls the checkout's default branch via
+    /// `pull_default_branch_ff_only` before ever touching the mocks
+    /// directory. That helper never forces and never touches a dirty or
+    /// diverged working tree; any non-clean outcome aborts here with a
+    /// toast telling the operator to sort out the checkout themselves,
+    /// exactly the posture this repo already takes everywhere else around
+    /// destructive git operations. Only once the pull is clean (or already
+    /// up to date) do we check for the mocks directory — deliberately
+    /// *after* the pull, not before, so a first-ever pull that just
+    /// produced the mocks dir locally still works, not only a refresh of an
+    /// already-existing one.
+    ///
+    /// #2512 will add a deterministic `mocks/index.html` linking every
+    /// screen-state together; once it exists we open that, otherwise we
+    /// fall back to opening the mocks directory itself so this issue isn't
+    /// blocked on #2512 landing first.
+    pub(crate) fn dispatch_view_gate_a_mock_local_for_selected_pipeline_row(&mut self) -> bool {
+        let title = "View Gate A mock (local)";
+        let Some(idx) = self.pipeline_sel else {
+            return false;
+        };
+        let Some(issue) = self.pipeline_issues.get(idx).cloned() else {
+            return false;
+        };
+        let Some((milestone_number, _)) = self.pipeline_issue_milestone(&issue) else {
+            self.push_toast(
+                title,
+                "No resolvable milestone for this issue — cannot locate its mocks.",
+                ToastSeverity::Warning,
+            );
+            return false;
+        };
+        let Some(repo) = issue.coord_repo.clone() else {
+            self.push_toast(
+                title,
+                "No local repo mapping for this issue.",
+                ToastSeverity::Warning,
+            );
+            return false;
+        };
+        let Some(local_path) = self.data.pipeline_repo_paths.get(&repo).cloned() else {
+            self.push_toast(
+                title,
+                "No local checkout path known for this repo.",
+                ToastSeverity::Warning,
+            );
+            return false;
+        };
+        let repo_dir = std::path::Path::new(&local_path);
+
+        match pull_default_branch_ff_only(repo_dir) {
+            LocalPullOutcome::Dirty => {
+                self.push_toast(
+                    title,
+                    "Local checkout has uncommitted changes — sort out the \
+                     checkout yourself, then retry (never auto-discarding \
+                     local work).",
+                    ToastSeverity::Warning,
+                );
+                return false;
+            }
+            LocalPullOutcome::WrongBranch(branch) => {
+                self.push_toast(
+                    title,
+                    &format!(
+                        "Local checkout has '{branch}' checked out, not the \
+                         remote's default branch — switch and pull yourself, \
+                         then retry."
+                    ),
+                    ToastSeverity::Warning,
+                );
+                return false;
+            }
+            LocalPullOutcome::Diverged => {
+                self.push_toast(
+                    title,
+                    "Local checkout has diverged from the remote default \
+                     branch — sort out the checkout yourself, then retry \
+                     (never force-pulling).",
+                    ToastSeverity::Warning,
+                );
+                return false;
+            }
+            LocalPullOutcome::Failed(reason) => {
+                self.push_toast(
+                    title,
+                    &format!("git pull failed: {reason}"),
+                    ToastSeverity::Warning,
+                );
+                return false;
+            }
+            LocalPullOutcome::Ok => {}
+        }
+
+        let mocks_dir = repo_dir
+            .join("tests")
+            .join("acceptance")
+            .join(format!("ms-{}", milestone_number))
+            .join("mocks");
+        if !mocks_dir.is_dir() {
+            self.push_toast(
+                title,
+                "No mocks found for this milestone after pulling — dispatch \
+                 Gate A mock first, or wait for the worker to push its \
+                 branch.",
+                ToastSeverity::Warning,
+            );
+            return false;
+        }
+        // #2512: once the deterministic master index lands, open that so
+        // every screen-state is reachable from one page; until then (or for
+        // a milestone whose mock predates #2512) fall back to the mocks
+        // directory itself.
+        let index = mocks_dir.join("index.html");
+        // `opened_what` rides along in the status message purely so this is
+        // observable from a test without needing to mock the OS opener
+        // (`open_local_path_in_browser` fires a real subprocess and doesn't
+        // report back what it opened).
+        let (target, opened_what) = if index.is_file() {
+            (index, "index.html")
+        } else {
+            (mocks_dir, "mocks/")
+        };
+        open_local_path_in_browser(&target);
+        self.pipeline_status = Some((
+            format!(
+                "opening Gate A mock for ms-{} ({}) in browser…",
+                milestone_number, opened_what
+            ),
+            Instant::now(),
+        ));
+        true
     }
 
     /// #1174: resolve `(issue, repo, tracking_issue, for_path)` for the

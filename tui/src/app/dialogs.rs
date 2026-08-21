@@ -896,13 +896,21 @@ impl CoordApp {
                 // headlessly (an independent mock-author agent renders the
                 // viewable mock + writes tests/acceptance/ms-NN/contract.md —
                 // the CLI's own claim-detection refuses a duplicate dispatch).
-                // "View Gate A mock" opens that worker's PR in the browser
-                // (same mechanism as the Done-lifecycle "Open PR" below) so a
-                // human can read contract.md + the rendered mock(s) and
-                // review/merge the branch — the Test → Review → Merge round
-                // trip that constitutes sign-off — before `coord acceptance
-                // author` (out of scope here) is run against the merged
-                // contract.
+                // "View Gate A mock (PR)" opens that worker's PR in the
+                // browser (same mechanism as the Done-lifecycle "Open PR"
+                // below) so a human can read contract.md and review/merge
+                // the branch — the Test → Review → Merge round trip that
+                // constitutes sign-off — before `coord acceptance author`
+                // (out of scope here) is run against the merged contract.
+                // #2501: the PR route was NEVER a way to see the rendered
+                // mock(s) themselves — GitHub's "Files changed" view renders
+                // `.html` as a source diff, not a live page. "View Gate A
+                // mock (local)" sits beside it for that: it fast-forward-
+                // pulls the local checkout's default branch (never forcing,
+                // never touching a dirty tree — see
+                // `pull_default_branch_ff_only`) and then opens
+                // tests/acceptance/ms-NN/mocks/ from disk in the OS's
+                // default browser, where `.html` actually renders.
                 items.push(ContextMenuItem::action(
                     "dispatch-gate-a-mock",
                     "Dispatch Gate A mock",
@@ -912,6 +920,14 @@ impl CoordApp {
                 view_gate_a_item.disabled =
                     epic_issue.and_then(|iss| self.pipeline_pr_number(iss)).is_none();
                 items.push(view_gate_a_item);
+                let mut view_gate_a_local_item = ContextMenuItem::action(
+                    "view-gate-a-mock-local",
+                    "View Gate A mock (local)",
+                );
+                view_gate_a_local_item.disabled = !epic_issue
+                    .map(|iss| self.gate_a_mocks_dir_exists_for(iss))
+                    .unwrap_or(false);
+                items.push(view_gate_a_local_item);
                 // #2063: the sign-off itself, right beside the 👁 that opens
                 // the thing being signed off on — reviewing and recording are
                 // one gesture. Until now "merging that PR is what satisfies
@@ -6980,6 +6996,16 @@ impl CoordApp {
                         ToastSeverity::Warning,
                     );
                 }
+                true
+            }
+            // #2501: local counterpart to "view-gate-a-mock" — pulls the
+            // local checkout's default branch (fast-forward only) and opens
+            // the rendered mock(s) from disk, since the PR route can never
+            // actually show them (GitHub renders `.html` as source, not a
+            // live page). All toasting on abort/failure happens inside
+            // `dispatch_view_gate_a_mock_local_for_selected_pipeline_row`.
+            "view-gate-a-mock-local" => {
+                self.dispatch_view_gate_a_mock_local_for_selected_pipeline_row();
                 true
             }
             // #2063: record the human Gate-A verdict. `--approved` is what
