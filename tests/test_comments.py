@@ -8,9 +8,11 @@ from coord.comments import (
     EVENT_BRIEFING,
     EVENT_COMPLETION,
     EVENT_FAILURE,
+    EVENT_PHANTOM_HEALED,
     format_briefing,
     format_completion,
     format_failure,
+    format_phantom_row_healed,
     parse_coord_comment_marker,
     parse_marker,
 )
@@ -138,6 +140,46 @@ class TestFailure:
         assert marker is not None
         # exit_code with empty value is dropped from marker
         assert "exit_code" not in marker.fields
+
+
+class TestPhantomRowHealed:
+    """#2536: the fleet-wide phantom-row self-heal sweep's comment —
+    mirrors format_needs_attention's shape, but narrates an action already
+    taken rather than only a finding."""
+
+    def test_includes_required_fields_and_marker(self) -> None:
+        body = format_phantom_row_healed(
+            assignment_id="w1",
+            machine_name="dellserver",
+            repo_name="claude-coordinator",
+            issue_number=2527,
+            stage="work",
+            detail="work row running 70m (past its 45m needs-attention "
+            "threshold + 10m buffer) — session confirmed dead on machine "
+            "'dellserver'",
+            action="finalized phantom session (advisory)",
+        )
+        assert "w1" in body
+        assert "#2527" in body
+        assert "dellserver" in body
+        assert "70m" in body
+        assert "finalized phantom session (advisory)" in body
+        marker = parse_marker(body)
+        assert marker is not None
+        assert marker.event == EVENT_PHANTOM_HEALED
+        assert marker.fields["assignment"] == "w1"
+        assert marker.fields["stage"] == "work"
+
+    def test_narrates_action_taken_not_only_a_finding(self) -> None:
+        """Distinct from format_needs_attention's "nothing was killed or
+        reassigned" disclaimer — this one already did something."""
+        body = format_phantom_row_healed(
+            assignment_id="w1", machine_name="m", repo_name="r",
+            issue_number=1, stage="work", detail="detail here",
+            action="finalized phantom session (advisory)",
+        )
+        assert "**Action taken:**" in body
+        assert "ran automatically" in body
 
 
 class TestMarkerParsing:

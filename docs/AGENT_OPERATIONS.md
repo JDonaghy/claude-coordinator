@@ -827,6 +827,28 @@ auto-loop dispatch path. Low risk today (flat headless-only dispatch has no
 than blocking this timer — flag it if it ever bites (a fix worker firing while
 someone is mid-`--fix-of` on the same issue).
 
+**Phantom-row self-heal rides the same timer (#2536).** Every `coord notify`
+pass this timer fires also sweeps the board for a `status='running'` row
+whose recorded machine's own `/status` shows nothing active for it — a
+session that finished or died without the board ever finding out. Left
+alone, that phantom row sits forever (nothing else notices) and — per
+`coord/drive_queue.py`'s own capacity comment — holds its repo's *entire*
+drive-queue concurrency slot, blocking every other queued issue in that
+repo. The sweep only ever acts on a **confirmed**-dead session (never an
+"unknown" read — an unresolvable machine, an unreachable agent, a probe
+error all count as "leave it alone", same as "live"), and only once the row
+is aged well past its own `needs_attention` wall-clock threshold plus a
+buffer, so it can never race a session that's merely idle between turns.
+When both hold, it runs the exact same non-destructive recovery a human
+would via `coord diagnose <repo> <issue> --reset` — branch and commits are
+always preserved, the stage becomes re-dispatchable — and posts a GitHub
+comment recording that it happened (`coord.diagnose.sweep_dead_running_rows`,
+`coord.notify._sweep_phantom_rows`). Governed by
+`pipeline.auto_heal_phantom_rows` in `coordinator.yml` (**default `true`**,
+unlike most other auto-dispatch flags in this file — see
+`PipelineConfig`'s docstring in `coord/config.py` for why); set it `false`
+to go back to requiring a human to run `--reset` by hand.
+
 ## Periodic `coord drive-queue tick` (`coord-drive-queue` timer, #1756)
 
 Same shape as the `coord-notify` timer above — a `Type=oneshot` unit fired on

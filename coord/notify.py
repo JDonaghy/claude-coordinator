@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import httpx
 
 if TYPE_CHECKING:
+    from coord.diagnose import PhantomRowHeal
     from coord.merge_queue import QueuedMerge
     from coord.models import Assignment, Board
     from coord.progress import SmokeVerdict
@@ -3544,6 +3545,106 @@ def _sweep_stalled_pipeline(
     return posted
 
 
+# ── #2536: fleet-wide phantom-row self-heal sweep ───────────────────────────
+#
+# See `coord.diagnose.sweep_dead_running_rows`'s docstring for the full
+# rationale. This is the thin `coord notify` glue around it: read the board,
+# run the sweep (which does the actual recovery write per row), post one
+# comment per row it healed, and audit-log it. No board write-back is needed
+# here — the sweep writes through `issue_store` directly (the same seam
+# `_cleanup_issue` uses), never mutating the in-memory `board` object.
+
+
+def post_phantom_row_healed(heal: "PhantomRowHeal", config: Config) -> None:
+    """Post the #2536 auto-heal comment for one board row
+    :func:`_sweep_phantom_rows` just recovered."""
+    from coord.comments import (  # noqa: PLC0415
+        format_phantom_row_healed,
+    )
+
+    repo = config.repo(heal.repo_name)
+    repo_github = repo.github if repo is not None else None
+    if not repo_github:
+        return
+    body = format_phantom_row_healed(
+        assignment_id=heal.assignment_id,
+        machine_name=heal.machine_name,
+        repo_name=heal.repo_name,
+        issue_number=heal.issue_number,
+        stage=heal.stage,
+        detail=heal.detail,
+        action=heal.action,
+    )
+    github_ops.post_issue_comment(repo_github, heal.issue_number, body)
+
+
+def _sweep_phantom_rows(config: Config) -> list["PhantomRowHeal"]:
+    """Scan the board for ``running``/``pending`` rows whose session is
+    CONFIRMED dead and aged well past their own needs-attention threshold,
+    auto-heal them with the same non-destructive recovery ``coord diagnose
+    --reset`` performs by hand, and post one comment per row recovered
+    (#2536).
+
+    Gated by ``config.pipeline.auto_heal_phantom_rows`` (**default
+    ``True``** — see that field's docstring for why this ships lit unlike
+    ``auto_dispatch_stalled``/``escalate_semantic_conflicts``: every action
+    here is gated behind a confirmed-dead liveness read plus an aged-out
+    wall-clock buffer, and the recovery itself never dispatches work or
+    touches a branch).
+
+    Best-effort per row, mirroring :func:`_sweep_stalled_pipeline`'s
+    contract: a comment-posting failure for one row must not stop the sweep
+    from reaching the rest, and does not block the row's own recovery
+    (already durably written by the time this posts) — it just means the
+    GitHub comment is missing, which a future manual `coord diagnose` can
+    still explain.
+    """
+    if not config.pipeline.auto_heal_phantom_rows:
+        return []
+
+    from coord.board_service import read_board  # noqa: PLC0415
+    from coord.diagnose import sweep_dead_running_rows  # noqa: PLC0415
+
+    board = read_board()
+    healed = sweep_dead_running_rows(board, config)
+
+    posted: list["PhantomRowHeal"] = []
+    for heal in healed:
+        try:
+            post_phantom_row_healed(heal, config)
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "post_phantom_row_healed failed for %s", heal.assignment_id,
+            )
+            continue
+        posted.append(heal)
+
+        try:
+            from coord.audit import record_audit  # noqa: PLC0415
+
+            record_audit(
+                tier="business",
+                category="pipeline",
+                event_type="phantom_row_auto_healed",
+                actor="coordinator",
+                summary=(
+                    f"phantom-row sweep healed {heal.stage} row "
+                    f"{heal.assignment_id} for {heal.repo_name}#{heal.issue_number}"
+                ),
+                repo=heal.repo_name,
+                issue=heal.issue_number,
+                assignment_id=heal.assignment_id,
+                machine=heal.machine_name,
+                details={"detail": heal.detail, "action": heal.action},
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "record_audit failed for phantom-row heal %s", heal.assignment_id,
+            )
+
+    return posted
+
+
 @dataclass(frozen=True)
 class DrainResult:
     """What one :func:`run_drain` pass actually did.
@@ -3828,23 +3929,27 @@ def run(
     list[NeedsAttentionDetection],
     list[StalledDetection],
     list[LivenessStallDetection],
+    list["PhantomRowHeal"],
 ]:
     """Detect and post all pending transitions, stuck signals, #846
-    needs-attention detections, #1441 stalled-pipeline detections, and
-    #2048 liveness-auditor stalls.
+    needs-attention detections, #1441 stalled-pipeline detections, #2048
+    liveness-auditor stalls, and #2536 phantom-row auto-heals.
 
     Also dispatches any pending reviews found on the saved board so that
     ``coord notify`` acts as a reliable review-dispatch trigger in addition
     to ``coord status --reconcile``.
 
     Returns (posted_transitions, posted_stuck, posted_needs_attention,
-    posted_stalled, posted_liveness). The liveness entry is new in #2048 —
-    appended rather than inserted, following #1441's own precedent: any
-    existing caller unpacking a 4-tuple positionally breaks loudly, which
-    is a good thing (it means the CLI/board/TUI surfacing was actually
-    wired up, not silently skipped). ``posted_liveness`` is always ``[]``
-    when ``config.pipeline.liveness_auditor.enabled`` is ``False`` (the
-    default).
+    posted_stalled, posted_liveness, posted_phantom_healed). Each of the
+    liveness and phantom-healed entries was appended rather than inserted,
+    following #1441's own precedent: any existing caller unpacking a
+    shorter tuple positionally breaks loudly, which is a good thing (it
+    means the CLI/board/TUI surfacing was actually wired up, not silently
+    skipped). ``posted_liveness`` is always ``[]`` when
+    ``config.pipeline.liveness_auditor.enabled`` is ``False`` (the
+    default); ``posted_phantom_healed`` is always ``[]`` when
+    ``config.pipeline.auto_heal_phantom_rows`` is ``False`` (not the
+    default — see that field's docstring).
     """
     # Refresh the agent-host cache so _try_parse_and_post_review (and any
     # other helper using _agent_host) can resolve hostnames without
@@ -3928,6 +4033,20 @@ def run(
             needs_attention_posted.append(detection)
     except Exception:  # noqa: BLE001
         log.exception("detect_needs_attention: unexpected error")
+
+    # #2536: fleet-wide phantom-row self-heal — a `running` row whose
+    # session its own recorded machine confirms is dead, aged well past its
+    # own needs-attention threshold, gets the same non-destructive recovery
+    # `coord diagnose --reset` performs by hand, automatically. Runs right
+    # after the needs-attention scan above (same "long-running row" concern,
+    # acted on rather than only narrated) and before the dispatch steps
+    # below, so a slot this sweep frees is visible to them in the same pass.
+    # Best-effort, non-fatal — mirrors every other sweep in this function.
+    phantom_healed_posted: list["PhantomRowHeal"] = []
+    try:
+        phantom_healed_posted = _sweep_phantom_rows(config)
+    except Exception:  # noqa: BLE001
+        log.exception("_sweep_phantom_rows: unexpected error")
 
     # Dispatch pending Test-stage smoke from the saved board (#1426;
     # best-effort, non-fatal). Runs BEFORE review dispatch to mirror the
@@ -4036,4 +4155,11 @@ def run(
     except Exception:  # noqa: BLE001
         log.exception("detect_liveness_stall: unexpected error")
 
-    return posted, stuck_posted, needs_attention_posted, stalled_posted, liveness_posted
+    return (
+        posted,
+        stuck_posted,
+        needs_attention_posted,
+        stalled_posted,
+        liveness_posted,
+        phantom_healed_posted,
+    )

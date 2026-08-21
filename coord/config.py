@@ -989,6 +989,25 @@ class PipelineConfig:
     stands. Costs one real suite run per Test-stage completion where it
     *can* apply; set ``false`` (or ``COORD_CONFIRM_TEST_VERDICT=0``) to opt
     back out.
+
+    ``auto_heal_phantom_rows`` (#2536) controls whether
+    ``coord.notify._sweep_phantom_rows`` gets to act, on
+    ``coord-notify.timer``'s existing cadence, on a ``running`` board row
+    its own recorded machine confirms is dead (see
+    ``coord.diagnose.sweep_dead_running_rows``). **Defaults to ``True``**,
+    the same posture as ``confirm_test_verdict`` and for the same reason:
+    this closes a real bug (a phantom row silently holding its repo's
+    entire drive-queue concurrency slot indefinitely — #2536) rather than
+    adding a new capability, and every action it takes is gated behind a
+    CONFIRMED-dead liveness read (never an ambiguous "unknown" one — #1870)
+    plus a wall-clock buffer past the row's own ``needs_attention``
+    threshold, so it never races a session that is merely idle between
+    turns. Unlike ``auto_dispatch_stalled``/``escalate_semantic_conflicts``,
+    it never dispatches new work and never touches a branch — the recovery
+    is the same non-destructive one ``coord diagnose --reset`` already
+    performs by hand (branch/commits preserved, stage re-dispatchable). Set
+    ``false`` to require a human to run ``coord diagnose --reset``
+    themselves, as before #2536.
     """
 
     default_gates: list[str] = field(default_factory=lambda: ["test", "review", "merge"])
@@ -1009,6 +1028,8 @@ class PipelineConfig:
     liveness_auditor: LivenessAuditorConfig = field(default_factory=LivenessAuditorConfig)
     # #2464 — DEFAULT ON. See the class docstring.
     confirm_test_verdict: bool = True
+    # #2536 — DEFAULT ON. See the class docstring.
+    auto_heal_phantom_rows: bool = True
 
     def attention_threshold_for(
         self,
@@ -2725,6 +2746,12 @@ def _parse_pipeline(raw: Any) -> PipelineConfig:
         if not isinstance(value, bool):
             raise ConfigError("pipeline.confirm_test_verdict must be a boolean")
         cfg.confirm_test_verdict = value
+
+    if "auto_heal_phantom_rows" in raw:
+        value = raw["auto_heal_phantom_rows"]
+        if not isinstance(value, bool):
+            raise ConfigError("pipeline.auto_heal_phantom_rows must be a boolean")
+        cfg.auto_heal_phantom_rows = value
 
     if "max_review_iterations" in raw:
         value = raw["max_review_iterations"]
