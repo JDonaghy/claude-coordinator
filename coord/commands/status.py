@@ -55,6 +55,30 @@ def _cordon_stall_suffix(cordons: dict) -> str:
     return f" ({described})" if described else ""
 
 
+def _stuck_in_cooldown_hosts() -> dict[str, str | None]:
+    """Machine name -> target version, for hosts stuck-in-cooldown (#2490).
+
+    Thin wrapper around :func:`coord.commands.release._stuck_hosts_from_journal`
+    — same journal, same "newest record only" reading, reused rather than
+    reimplemented. A host in this dict is behind the target version, was
+    idle as of the last `coord release propagate` tick, and is NOT cordoned
+    (the #2240 cooldown is suppressing it) — which is exactly why it shows
+    up everywhere else in this command as a flatly ordinary `online • idle`.
+    That silence is the whole finding of #2490: a human noticed only because
+    they happened to be watching `coord status` themselves.
+
+    Degrades to ``{}`` on any error (no journal, an unreadable one, a thin
+    client) — never load-bearing, same contract as `_cordon_stall_suffix`.
+    """
+    from coord.commands.release import _stuck_hosts_from_journal  # noqa: PLC0415
+
+    try:
+        hosts, target = _stuck_hosts_from_journal()
+    except Exception:  # noqa: BLE001 — a status render must never fail on this
+        return {}
+    return {h: target for h in hosts}
+
+
 def _live_advisory_entries(
     entries: list[dict],
     cfg: "Config",
@@ -187,6 +211,9 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
     # same, which is why the 70-minute stall was invisible.
     cordon_stall = _cordon_stall_suffix(cordons)
     quiet_windows = effective_quiet_hours(cfg.machines)
+    # #2490: hosts the last propagate run flagged as behind + idle + stuck
+    # behind an active #2240 cooldown — see `_stuck_in_cooldown_hosts`.
+    stuck_in_cooldown = _stuck_in_cooldown_hosts()
 
     statuses = check_all(machines, timeout=timeout)
     agent_completed: dict[str, dict] = {}
@@ -313,6 +340,22 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
         if degraded:
             for repo_name, reason in degraded.items():
                 click.echo(f"    ⚠ degraded: {repo_name} — {reason}")
+
+        # #2490: this host is behind the release, was idle last tick, and
+        # nothing is cordoning it because a #2240 deadlock-release cooldown
+        # is suppressing all new cordons fleet-wide. Without this line the
+        # machine above reads as a plain `online • idle` — indistinguishable
+        # from a machine with nothing to do, which is exactly how the
+        # 2026-08-20 incident went unnoticed for the length of the cooldown.
+        if m.name in stuck_in_cooldown:
+            stuck_target = stuck_in_cooldown[m.name]
+            stuck_version = f"v{stuck_target}" if stuck_target else "the release"
+            click.echo(
+                f"    ⚠ STUCK: behind {stuck_version} and idle, but cordoning "
+                "is suppressed by an active #2240 deadlock-release cooldown "
+                "(#2490) — no automatic path back to rolling until it lifts; "
+                f"consider `coord agent update --machine {m.name}`"
+            )
 
         if status_result and status_result.ok and status_result.data:
             for entry in status_result.data.get("active", []):

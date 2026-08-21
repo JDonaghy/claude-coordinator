@@ -664,6 +664,26 @@ def test_a_real_roll_is_never_collapsed():
     assert "verify: ok" in out
 
 
+def test_a_stuck_in_cooldown_host_is_named_in_history():
+    """#2490: a host that's behind, idle, and left uncordoned only by an
+    active #2240 cooldown must be visible in `coord release history`, not
+    just in the raw JSON — this is the surface an operator reaches for after
+    `coord status` looked ordinary."""
+    records = [
+        {"started_at": 1.0, "status": rp.STATUS_DEFERRED,
+         "target_version": "0.5.192",
+         "quiescence": {"reason": "busy"},
+         "cordons": {"cooling_seconds": 900.0, "stuck_in_cooldown": ["precision"]}},
+        {"started_at": 2.0, "status": rp.STATUS_VERIFIED, "target_version": "0.4.111",
+         "lanes": [{"lane": "python", "host": "dellserver", "ok": True, "detail": "now v0.4.111"}],
+         "verification": {"severity": "ok", "findings": []}},
+    ]
+    out = rp.render_history(records)
+    assert "STUCK" in out
+    assert "precision" in out
+    assert "#2490" in out
+
+
 def test_a_rollback_is_rendered():
     record = rp.PropagationRecord(
         started_at=1.0, target_version="0.4.111", status=rp.STATUS_ROLLED_BACK,
