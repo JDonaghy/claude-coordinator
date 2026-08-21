@@ -49,6 +49,32 @@ from coord.milestone_dispatch import pick_machine
 from coord.models import Machine, Proposal
 
 
+def _wants_mock_index(driver_mock_glob: str) -> bool:
+    """#2512: the navigation-index post-render step only makes sense for
+    HTML mocks — an `index.html` full of `<a href>`s to `.screen` text-grid
+    dumps (tui-tuidriver) or whatever cli-pytest renders isn't navigable in
+    a browser anyway. Gate on the mock glob rather than the driver name so
+    this stays correct if a future driver also renders `.html`."""
+    return driver_mock_glob.strip().lower().endswith(".html")
+
+
+def _mock_index_instruction(ms_dir: str) -> str:
+    """#2512: the instruction text both briefing builders below hand the
+    mock-author worker, verbatim — a *provided script* the worker runs as
+    its last step before committing, not something it free-hands per
+    milestone (see `scripts/gen_mock_index.py`'s docstring for why: every
+    Gate-A mock set should look the same, and nothing should drift by
+    taste)."""
+    return (
+        f"As your LAST step before committing, run `python "
+        f"scripts/gen_mock_index.py {ms_dir}/mocks` to (re)generate "
+        f"`{ms_dir}/mocks/index.html` — a plain navigation page linking "
+        "every mock by its own `<title>` tag (#2512). Do not hand-write "
+        "this file yourself; the script is the single source of truth so "
+        "every milestone's mock set gets the same glue page."
+    )
+
+
 def build_mock_author_briefing(
     *,
     repo_slug: str,
@@ -94,6 +120,8 @@ def build_mock_author_briefing(
         "not authoring it from scratch — read it first and edit in place. "
         "Commit and push both to this branch when done."
     )
+    if _wants_mock_index(driver_mock_glob):
+        parts.append(_mock_index_instruction(ms_dir))
     return "\n".join(parts)
 
 
@@ -104,6 +132,7 @@ def build_mock_author_amend_briefing(
     milestone_number: int,
     tracking_issue_number: int,
     amend_text: str,
+    driver_mock_glob: str,
 ) -> str:
     """#1315: seed briefing for a *targeted* Gate-A contract amendment.
 
@@ -120,6 +149,15 @@ def build_mock_author_amend_briefing(
     the ``tests/acceptance/**`` sealing guard — see ``coord/dispatch.py``
     and #1315's ``_sealed_write_guard_tools`` in ``coord/agent.py``), so a
     contract correction never needs to fall back to ``type="work"`` again.
+
+    *driver_mock_glob* (#2512) is the repo's resolved acceptance-driver mock
+    glob (e.g. ``"*.html"``, ``"*.screen"``) — already resolved by the
+    caller (:func:`dispatch_acceptance_mock` always resolves ``driver_cfg``
+    before either briefing builder runs). Threaded through purely to gate
+    whether the mock-navigation-index instruction below is worth including;
+    an amendment that only touches ``contract.md`` still gets the
+    instruction, phrased conditionally, since this function has no way to
+    know in advance whether the correction will touch ``mocks/``.
     """
     ms_dir = f"tests/acceptance/{ms_dirname(milestone_number)}"
 
@@ -137,6 +175,16 @@ def build_mock_author_amend_briefing(
         f"do not touch any file outside `{ms_dir}/`. Commit and push both "
         "to this branch when done."
     )
+    if _wants_mock_index(driver_mock_glob):
+        parts.append(
+            f"If this correction touches any file under `{ms_dir}/mocks/`, "
+            f"regenerate `{ms_dir}/mocks/index.html` before committing by "
+            f"running `python scripts/gen_mock_index.py {ms_dir}/mocks` "
+            "(#2512) — a plain navigation page linking every mock by its "
+            "own `<title>` tag. Do not hand-write this file yourself; the "
+            "script is the single source of truth so every milestone's "
+            "mock set gets the same glue page."
+        )
     parts.append("")
     parts.append("--- Requested correction ---")
     parts.append(amend_text.strip())
@@ -260,6 +308,7 @@ def dispatch_acceptance_mock(
             milestone_number=milestone_number,
             tracking_issue_number=tracking_issue_number,
             amend_text=amend_briefing,
+            driver_mock_glob=driver_cfg.mock,
         )
         proposal = Proposal(
             id=0,
