@@ -339,6 +339,73 @@ class TestConfirmBranch:
             "attempted, same as a real build failure"
         )
 
+    def test_every_kind_the_module_emits_lands_in_exactly_one_bucket(
+        self,
+    ) -> None:
+        """#2527: no kind may fall through all four `ConfirmationResult`
+        predicates.
+
+        `_confirmed_pass_verdict` (coord/notify.py) dispatches on `.confirmed`
+        / `.refuted` / `.baseline_red` / `.inconclusive`, so a kind that
+        answers False to all four has no defined verdict at all — which is
+        precisely how `KIND_SIGNAL` would have been born broken had it been
+        added as a constant without also being added to `INCONCLUSIVE_KINDS`.
+        Enumerating the kinds here means the next one cannot be half-added.
+        """
+        kinds = [
+            KIND_OK,
+            KIND_SETUP,
+            KIND_INFRA,
+            KIND_TIMEOUT,
+            ct.KIND_SIGNAL,
+            KIND_BASELINE_RED,
+            KIND_BUILD,
+            KIND_SUITE,
+        ]
+        for kind in kinds:
+            result = ct.ConfirmationResult(kind=kind, reason="x")
+            buckets = [
+                name
+                for name, flag in (
+                    ("confirmed", result.confirmed),
+                    ("refuted", result.refuted),
+                    ("baseline_red", result.baseline_red),
+                    ("inconclusive", result.inconclusive),
+                )
+                if flag
+            ]
+            assert len(buckets) == 1, (
+                f"kind {kind!r} must answer True to exactly one verdict "
+                f"predicate, got {buckets!r}"
+            )
+
+    def test_signal_is_inconclusive_and_never_refuting(self) -> None:
+        """The #2527 safety property, pinned on the sets themselves.
+
+        The two behavioural tests above go through `confirm_branch`, so they
+        would both still pass if someone *also* added `KIND_SIGNAL` to
+        `REFUTING_KINDS` and the membership check happened to be ordered in
+        `KIND_SIGNAL`'s favour. This pins the invariant directly instead.
+        """
+        assert ct.KIND_SIGNAL in ct.INCONCLUSIVE_KINDS
+        assert ct.KIND_SIGNAL not in ct.REFUTING_KINDS
+        assert not (ct.REFUTING_KINDS & ct.INCONCLUSIVE_KINDS), (
+            "a kind that both refutes and is inconclusive makes the verdict "
+            "depend on which property notify.py happens to test first"
+        )
+
+    def test_refuting_kinds_is_exactly_build_and_suite(self) -> None:
+        """Deliberately a change-detector.
+
+        coord/confirm_test.py's own comment says this frozenset IS the
+        fail-direction safety property: only a command that RAN TO COMPLETION
+        and returned nonzero may overturn a worker's PASS claim. Widening it
+        is the one edit in this module that can fail every branch in the
+        fleet, so it must not be possible to do by accident — a reviewer has
+        to see this assertion change too.
+        """
+        assert ct.REFUTING_KINDS == frozenset({KIND_BUILD, KIND_SUITE})
+
     def test_ci_command_wins_over_test_command(self, checkout: Path) -> None:
         """#2091: when a repo declares what CI runs, confirm with THAT."""
         repo = _StubRepo(ci_command="the-ci-suite")
