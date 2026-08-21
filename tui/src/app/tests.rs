@@ -3037,6 +3037,60 @@
     }
 
     #[test]
+    fn publish_mocks_item_stays_disabled_for_non_html_junk_in_mocks_dir() {
+        // Review follow-up (#2513): `gate_a_mocks_dir_exists_for` filters on
+        // `.html` suffix, mirroring the CLI's `_collect_local_mock_bundle_files`
+        // (`coord/commands/portal.py`), which globs `mocks/*.html`. A
+        // `mocks/` dir containing only non-`.html` junk (a stray file, an
+        // empty subdirectory) must NOT enable this menu item — otherwise the
+        // dispatched `coord portal publish-mocks` would fail loud with
+        // "nothing to publish" against an apparently-enabled action.
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let tmp = std::env::temp_dir().join(format!("coord-tui-test-publish-mocks-junk-{}", tid));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let mocks_dir = tmp.join("tests").join("acceptance").join("ms-9").join("mocks");
+        std::fs::create_dir_all(&mocks_dir).unwrap();
+        std::fs::write(mocks_dir.join(".DS_Store"), b"junk").unwrap();
+        std::fs::create_dir_all(mocks_dir.join("empty-subdir")).unwrap();
+
+        let app = make_pipeline_app_for_publish_mocks_menu_test(0, tmp.to_str().unwrap());
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(751),
+            &PipelineRowLifecycle::New,
+            Some("api"),
+        );
+        let publish_item = items
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("publish-mocks-to-portal"))
+            .expect("epic row must offer 'publish-mocks-to-portal'");
+        assert!(
+            publish_item.disabled,
+            "non-.html junk in mocks/ must not enable the menu item"
+        );
+
+        // Now add a real rendered mock alongside the junk and confirm it
+        // flips to enabled — the filter is on suffix, not "dir is non-empty".
+        std::fs::write(mocks_dir.join("screen.html"), "<html></html>").unwrap();
+        let app = make_pipeline_app_for_publish_mocks_menu_test(0, tmp.to_str().unwrap());
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(751),
+            &PipelineRowLifecycle::New,
+            Some("api"),
+        );
+        let publish_item = items
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("publish-mocks-to-portal"))
+            .expect("epic row must offer 'publish-mocks-to-portal'");
+        assert!(
+            !publish_item.disabled,
+            "must enable once a real .html mock exists alongside the junk"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn dispatch_publish_mocks_to_portal_action_spawns_command() {
         // The menu action fires `coord portal publish-mocks <repo>
         // <tracking_issue>` headlessly — same dispatch mechanism as
