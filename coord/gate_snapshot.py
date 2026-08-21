@@ -250,8 +250,8 @@ class GateSnapshotRefresher:
 
     def __init__(self) -> None:
         self._snapshot = GateSnapshot()
-        self._ci_type: str | None = None
-        self._inner_ci = None  # CiStore | None — rebuilt when config type changes
+        self._ci_key: tuple[str, str, str] | None = None
+        self._inner_ci = None  # CiStore | None — rebuilt when config type/host/token_env changes
 
     def snapshot(self) -> GateSnapshot:
         return self._snapshot
@@ -287,10 +287,17 @@ class GateSnapshotRefresher:
         from coord.pr_body_lint import find_closing_references  # noqa: PLC0415
 
         ci_type = getattr(getattr(config, "ci_store", None), "type", "none")
-        if ci_type != self._ci_type:
-            self._ci_type = ci_type
+        # #1897: `host`/`token_env` only matter for the `gitlab` backend, but
+        # are read unconditionally — a config edit that changes either while
+        # `type` stays `gitlab` must still rebuild `_inner_ci`, not keep
+        # talking to the old host/token forever.
+        ci_host = getattr(getattr(config, "ci_store", None), "host", "") or ""
+        ci_token_env = getattr(getattr(config, "ci_store", None), "token_env", "") or ""
+        ci_key = (ci_type, ci_host, ci_token_env)
+        if ci_key != self._ci_key:
+            self._ci_key = ci_key
             try:
-                self._inner_ci = build_ci_store(ci_type)
+                self._inner_ci = build_ci_store(ci_type, host=ci_host, token_env=ci_token_env)
             except Exception:  # noqa: BLE001 — unknown type: disable the CI gate
                 self._inner_ci = None
         inner = self._inner_ci

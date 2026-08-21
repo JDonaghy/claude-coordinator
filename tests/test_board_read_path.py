@@ -679,7 +679,7 @@ def test_gate_refresher_populates_snapshot_from_queue(rw_db, monkeypatch) -> Non
             calls.append(("expects_checks", repo, number))
             return True
 
-    monkeypatch.setattr(gs, "build_ci_store", lambda t: _FakeCi())
+    monkeypatch.setattr(gs, "build_ci_store", lambda t, **_kw: _FakeCi())
 
     import coord.github_ops as github_ops
 
@@ -753,7 +753,7 @@ def test_gate_refresher_populates_all_checks_from_list_all_checks_for_pr(
         def expects_checks(self, repo: str, number: int) -> bool:
             return True
 
-    monkeypatch.setattr(gs, "build_ci_store", lambda t: _FakeCi())
+    monkeypatch.setattr(gs, "build_ci_store", lambda t, **_kw: _FakeCi())
 
     refresher = gs.GateSnapshotRefresher()
     snap = refresher.refresh(Config(repos=[], machines=[]))
@@ -791,7 +791,7 @@ def test_gate_refresher_all_checks_falls_back_without_the_capability(
         def expects_checks(self, repo: str, number: int) -> bool:
             return True
 
-    monkeypatch.setattr(gs, "build_ci_store", lambda t: _FakeCi())
+    monkeypatch.setattr(gs, "build_ci_store", lambda t, **_kw: _FakeCi())
 
     refresher = gs.GateSnapshotRefresher()
     snap = refresher.refresh(Config(repos=[], machines=[]))
@@ -828,7 +828,7 @@ def test_gate_refresher_publishes_branch_freshness_anchors(
         pid_calls.append((repo, base, branch))
         return "pid-1"
 
-    monkeypatch.setattr(gs, "build_ci_store", lambda t: None)
+    monkeypatch.setattr(gs, "build_ci_store", lambda t, **_kw: None)
     monkeypatch.setattr(github_ops, "get_branch_sha", _sha)
     monkeypatch.setattr(github_ops, "get_branch_patch_id", _pid)
     monkeypatch.setattr(github_ops, "get_pr_commit_messages", lambda repo, n: [])
@@ -877,7 +877,7 @@ def test_gate_refresher_publishes_branch_commit_timestamp(
         ts_calls.append((repo, branch))
         return 1234.0
 
-    monkeypatch.setattr(gs, "build_ci_store", lambda t: None)
+    monkeypatch.setattr(gs, "build_ci_store", lambda t, **_kw: None)
     monkeypatch.setattr(github_ops, "get_branch_sha", lambda repo, branch: None)
     monkeypatch.setattr(github_ops, "get_branch_patch_id", lambda r, b, h: None)
     monkeypatch.setattr(github_ops, "get_branch_commit_timestamp", _ts)
@@ -913,7 +913,7 @@ def test_gate_refresher_branch_commit_timestamp_failure_is_fail_open(
     def _boom(*args, **kwargs):  # noqa: ANN002, ANN003
         raise RuntimeError("gh exploded")
 
-    monkeypatch.setattr(gs, "build_ci_store", lambda t: None)
+    monkeypatch.setattr(gs, "build_ci_store", lambda t, **_kw: None)
     monkeypatch.setattr(github_ops, "get_branch_sha", lambda repo, branch: None)
     monkeypatch.setattr(github_ops, "get_branch_patch_id", lambda r, b, h: None)
     monkeypatch.setattr(github_ops, "get_branch_commit_timestamp", _boom)
@@ -936,7 +936,7 @@ def test_gate_refresher_branch_sha_failure_is_fail_open(rw_db, monkeypatch) -> N
     def _boom(*args, **kwargs):  # noqa: ANN002, ANN003
         raise RuntimeError("gh exploded")
 
-    monkeypatch.setattr(gs, "build_ci_store", lambda t: None)
+    monkeypatch.setattr(gs, "build_ci_store", lambda t, **_kw: None)
     monkeypatch.setattr(github_ops, "get_branch_sha", _boom)
     monkeypatch.setattr(github_ops, "get_branch_patch_id", _boom)
     monkeypatch.setattr(github_ops, "get_pr_commit_messages", lambda repo, n: [])
