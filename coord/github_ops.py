@@ -103,6 +103,23 @@ def _is_label_not_found(exc: Exception) -> bool:
     )
 
 
+def _classify_gh_exit(stderr: str) -> str:
+    """Classify a non-zero ``gh`` exit's stderr for forge-availability
+    recording: ``"transient"`` (auth/network/rate-limit -- an availability
+    signal, per :func:`_is_transient_error`) or ``"app_error"`` (``gh`` ran
+    fine and reported an ordinary application-level failure, e.g. "label not
+    found" -- business as usual, not a forge problem).
+
+    Factored out of :func:`_gh` so the handful of call sites in this module
+    that shell out to ``gh`` directly instead of through :func:`_gh` (#1896
+    review: each documents why it bypasses ``_gh`` -- idempotent-on-a-
+    specific-stderr-message semantics ``_gh``'s raise-only contract can't
+    express) can record the same classification :func:`_gh` does, rather
+    than silently producing no forge-availability observation at all.
+    """
+    return "transient" if _is_transient_error(RuntimeError(stderr)) else "app_error"
+
+
 def _gh(*args: str) -> str:
     """Run ``gh`` with *args* and return its stdout, or raise :class:`GhError`.
 
@@ -148,10 +165,8 @@ def _gh(*args: str) -> str:
         stderr = result.stderr.strip()
         # #1896: distinguish a transient forge/auth/network failure (an
         # availability signal) from an ordinary application-level error like
-        # "label not found" (not one) — same classification
-        # `_is_transient_error` already applies for auto-create suppression.
-        outcome = "transient" if _is_transient_error(RuntimeError(stderr)) else "app_error"
-        record_gh_call(args, outcome=outcome, duration_s=duration, detail=stderr)
+        # "label not found" (not one) — see `_classify_gh_exit`.
+        record_gh_call(args, outcome=_classify_gh_exit(stderr), duration_s=duration, detail=stderr)
         raise RuntimeError(f"gh {' '.join(args)} failed: {stderr}")
     record_gh_call(args, outcome="ok", duration_s=duration)
     return result.stdout.strip()
@@ -330,7 +345,13 @@ def edit_issue(
     """Edit an issue's title and/or body. The GitHub backend of the
     issue-tracker seam (`state.edit_issue_content`) — GitLab / bare-DB adapters
     slot in alongside this later. The body is piped via stdin (`--body-file -`)
-    to avoid arg-length and shell-quoting issues on long markdown bodies."""
+    to avoid arg-length and shell-quoting issues on long markdown bodies.
+
+    Shells out directly rather than through :func:`_gh` because of the
+    ``input=`` (stdin) parameter :func:`_gh` doesn't support — but still
+    records the same #1896 forge-availability observation :func:`_gh` would
+    have, so this call site isn't a silent gap in that measurement.
+    """
     if title is None and body is None:
         return
     args = ["issue", "edit", str(issue_number), "--repo", repo]
@@ -338,17 +359,28 @@ def edit_issue(
         args += ["--title", title]
     if body is not None:
         args += ["--body-file", "-"]
-    result = subprocess.run(
-        ["gh", *args],
-        input=body if body is not None else None,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"gh issue edit #{issue_number} failed: {result.stderr.strip()}"
+    _t0 = time.monotonic()
+    try:
+        result = subprocess.run(
+            ["gh", *args],
+            input=body if body is not None else None,
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        record_gh_call(tuple(args), outcome="unreachable",
+                        duration_s=time.monotonic() - _t0, detail=str(exc))
+        raise
+    duration = time.monotonic() - _t0
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        record_gh_call(tuple(args), outcome=_classify_gh_exit(stderr),
+                        duration_s=duration, detail=stderr)
+        raise RuntimeError(
+            f"gh issue edit #{issue_number} failed: {stderr}"
+        )
+    record_gh_call(tuple(args), outcome="ok", duration_s=duration)
 
 
 def create_milestone(
@@ -575,6 +607,13 @@ def close_issue(
     while its sub-issues are still open/unstarted. Every deterministic
     close path in the codebase funnels through here, so this single guard
     covers all of them.
+
+    Shells out directly rather than through :func:`_gh` because idempotency
+    on "already closed" needs the exit code + stderr text *without*
+    :func:`_gh`'s raise-on-nonzero contract in the way — but still records
+    the same #1896 forge-availability observation :func:`_gh` would have
+    (see :func:`_classify_gh_exit`), so this call site isn't a silent gap in
+    that measurement.
     """
     if not force:
         open_children = get_open_children(repo, issue_number)
@@ -586,16 +625,30 @@ def close_issue(
             )
     if comment:
         post_issue_comment(repo, issue_number, comment)
-    result = subprocess.run(
-        ["gh", "issue", "close", str(issue_number), "--repo", repo],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    if result.returncode != 0 and "already closed" not in result.stderr.lower():
-        raise RuntimeError(
-            f"gh issue close #{issue_number} failed: {result.stderr.strip()}"
+    args = ["issue", "close", str(issue_number), "--repo", repo]
+    _t0 = time.monotonic()
+    try:
+        result = subprocess.run(
+            ["gh", *args],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        record_gh_call(tuple(args), outcome="unreachable",
+                        duration_s=time.monotonic() - _t0, detail=str(exc))
+        raise
+    duration = time.monotonic() - _t0
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        record_gh_call(tuple(args), outcome=_classify_gh_exit(stderr),
+                        duration_s=duration, detail=stderr)
+        if "already closed" not in stderr.lower():
+            raise RuntimeError(
+                f"gh issue close #{issue_number} failed: {stderr}"
+            )
+    else:
+        record_gh_call(tuple(args), outcome="ok", duration_s=duration)
 
 
 def reopen_issue(
@@ -609,19 +662,36 @@ def reopen_issue(
     (#806).
 
     Mirror of :func:`close_issue` for the complement operation (issue #1078).
+    Shells out directly rather than through :func:`_gh` for the same
+    idempotency reason as :func:`close_issue` — see that docstring — but
+    still records the same #1896 forge-availability observation.
     """
     if comment:
         post_issue_comment(repo, issue_number, comment)
-    result = subprocess.run(
-        ["gh", "issue", "reopen", str(issue_number), "--repo", repo],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    if result.returncode != 0 and "already open" not in result.stderr.lower():
-        raise RuntimeError(
-            f"gh issue reopen #{issue_number} failed: {result.stderr.strip()}"
+    args = ["issue", "reopen", str(issue_number), "--repo", repo]
+    _t0 = time.monotonic()
+    try:
+        result = subprocess.run(
+            ["gh", *args],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        record_gh_call(tuple(args), outcome="unreachable",
+                        duration_s=time.monotonic() - _t0, detail=str(exc))
+        raise
+    duration = time.monotonic() - _t0
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        record_gh_call(tuple(args), outcome=_classify_gh_exit(stderr),
+                        duration_s=duration, detail=stderr)
+        if "already open" not in stderr.lower():
+            raise RuntimeError(
+                f"gh issue reopen #{issue_number} failed: {stderr}"
+            )
+    else:
+        record_gh_call(tuple(args), outcome="ok", duration_s=duration)
 
 
 def check_pr_mergeable(repo: str, number: int) -> bool | None:
@@ -1684,15 +1754,30 @@ def rerun_workflow_run(repo: str, run_id: str) -> bool:
     is already in progress, or the id is stale/invalid) returns ``False``
     rather than raising, matching this module's other best-effort mutators
     (:func:`merge_pr`, :func:`edit_pr_body`).
+
+    Shells out directly rather than through :func:`_gh` because it needs
+    "any failure -> False" rather than a raise — but still records the same
+    #1896 forge-availability observation :func:`_gh` would have.
     """
+    args = ["run", "rerun", str(run_id), "--repo", repo]
+    _t0 = time.monotonic()
     try:
         result = subprocess.run(
-            ["gh", "run", "rerun", str(run_id), "--repo", repo],
+            ["gh", *args],
             capture_output=True, text=True, timeout=30,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        record_gh_call(tuple(args), outcome="unreachable",
+                        duration_s=time.monotonic() - _t0, detail=str(exc))
         return False
-    return result.returncode == 0
+    duration = time.monotonic() - _t0
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        record_gh_call(tuple(args), outcome=_classify_gh_exit(stderr),
+                        duration_s=duration, detail=stderr)
+        return False
+    record_gh_call(tuple(args), outcome="ok", duration_s=duration)
+    return True
 
 
 def rerun_workflow_run_failed(repo: str, run_id: str) -> bool:
@@ -1710,15 +1795,30 @@ def rerun_workflow_run_failed(repo: str, run_id: str) -> bool:
     (missing ``gh``, timeout, non-zero exit — e.g. the run is already in
     progress, or the id is stale/invalid) returns ``False`` rather than
     raising, matching :func:`rerun_workflow_run`'s own best-effort contract.
+
+    Shells out directly rather than through :func:`_gh` for the same reason
+    as :func:`rerun_workflow_run` — see that docstring — but still records
+    the same #1896 forge-availability observation.
     """
+    args = ["run", "rerun", str(run_id), "--repo", repo, "--failed"]
+    _t0 = time.monotonic()
     try:
         result = subprocess.run(
-            ["gh", "run", "rerun", str(run_id), "--repo", repo, "--failed"],
+            ["gh", *args],
             capture_output=True, text=True, timeout=30,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        record_gh_call(tuple(args), outcome="unreachable",
+                        duration_s=time.monotonic() - _t0, detail=str(exc))
         return False
-    return result.returncode == 0
+    duration = time.monotonic() - _t0
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        record_gh_call(tuple(args), outcome=_classify_gh_exit(stderr),
+                        duration_s=duration, detail=stderr)
+        return False
+    record_gh_call(tuple(args), outcome="ok", duration_s=duration)
+    return True
 
 
 def truncate_diff_text(diff: str, max_chars: int = 60000) -> str:

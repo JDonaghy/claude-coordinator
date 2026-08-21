@@ -1692,6 +1692,120 @@ class TestGhForgeAvailabilityRecording:
             assert github_ops._gh("issue", "view", "1") == "hi"
 
 
+def _forge_availability_rows(coord_db) -> list[dict]:
+    rows = coord_db.execute(
+        "SELECT * FROM audit_log WHERE category='forge_availability'"
+        " ORDER BY id"
+    ).fetchall()
+    return [json.loads(r["details_json"]) for r in rows]
+
+
+class TestDirectGhCallSitesRecordForgeAvailability:
+    """#1896 review: `close_issue`, `reopen_issue`, `edit_issue`,
+    `rerun_workflow_run`, and `rerun_workflow_run_failed` all shell out to
+    `gh` directly instead of through `_gh` (each for a documented,
+    behavior-preserving reason), so they used to be a silent gap in the
+    forge-availability measurement — a real outage coinciding with a wave of
+    issue-close/reopen/rerun calls would have been invisible. Each now
+    records the same observation `_gh` would have."""
+
+    def test_close_issue_records_ok(self, coord_db) -> None:
+        with patch("coord.github_ops.subprocess.run",
+                    return_value=MagicMock(returncode=0, stdout="", stderr="")):
+            github_ops.close_issue("acme/api", 42, force=True)
+        details = _forge_availability_rows(coord_db)
+        assert details[-1]["outcome"] == "ok"
+        assert details[-1]["argv0"] == "issue"
+
+    def test_close_issue_already_closed_still_records_and_does_not_raise(
+        self, coord_db,
+    ) -> None:
+        with patch(
+            "coord.github_ops.subprocess.run",
+            return_value=MagicMock(returncode=1, stdout="", stderr="GraphQL: Issue already closed"),
+        ):
+            github_ops.close_issue("acme/api", 42, force=True)  # must not raise
+        details = _forge_availability_rows(coord_db)
+        assert details[-1]["outcome"] == "app_error"
+
+    def test_close_issue_gh_missing_records_unreachable(self, coord_db) -> None:
+        with patch("coord.github_ops.subprocess.run", side_effect=FileNotFoundError):
+            with pytest.raises(FileNotFoundError):
+                github_ops.close_issue("acme/api", 42, force=True)
+        details = _forge_availability_rows(coord_db)
+        assert details[-1]["outcome"] == "unreachable"
+
+    def test_reopen_issue_records_ok(self, coord_db) -> None:
+        with patch("coord.github_ops.subprocess.run",
+                    return_value=MagicMock(returncode=0, stdout="", stderr="")):
+            github_ops.reopen_issue("acme/api", 42)
+        details = _forge_availability_rows(coord_db)
+        assert details[-1]["outcome"] == "ok"
+
+    def test_reopen_issue_transient_failure_records_transient_and_raises(
+        self, coord_db,
+    ) -> None:
+        with patch(
+            "coord.github_ops.subprocess.run",
+            return_value=MagicMock(returncode=1, stdout="", stderr="HTTP 401: Bad credentials"),
+        ):
+            with pytest.raises(RuntimeError):
+                github_ops.reopen_issue("acme/api", 42)
+        details = _forge_availability_rows(coord_db)
+        assert details[-1]["outcome"] == "transient"
+
+    def test_edit_issue_records_ok(self, coord_db) -> None:
+        with patch("coord.github_ops.subprocess.run",
+                    return_value=MagicMock(returncode=0, stdout="", stderr="")):
+            github_ops.edit_issue("acme/api", 42, title="new title")
+        details = _forge_availability_rows(coord_db)
+        assert details[-1]["outcome"] == "ok"
+        assert details[-1]["argv0"] == "issue"
+
+    def test_edit_issue_failure_records_app_error_and_raises(self, coord_db) -> None:
+        with patch(
+            "coord.github_ops.subprocess.run",
+            return_value=MagicMock(returncode=1, stdout="", stderr="some error"),
+        ):
+            with pytest.raises(RuntimeError):
+                github_ops.edit_issue("acme/api", 42, title="new title")
+        details = _forge_availability_rows(coord_db)
+        assert details[-1]["outcome"] == "app_error"
+
+    def test_rerun_workflow_run_records_ok(self, coord_db) -> None:
+        with patch("coord.github_ops.subprocess.run",
+                    return_value=MagicMock(returncode=0, stdout="", stderr="")):
+            assert github_ops.rerun_workflow_run("acme/api", "12345") is True
+        details = _forge_availability_rows(coord_db)
+        assert details[-1]["outcome"] == "ok"
+        assert details[-1]["argv0"] == "run"
+
+    def test_rerun_workflow_run_gh_missing_records_unreachable(self, coord_db) -> None:
+        with patch("coord.github_ops.subprocess.run", side_effect=FileNotFoundError):
+            assert github_ops.rerun_workflow_run("acme/api", "12345") is False
+        details = _forge_availability_rows(coord_db)
+        assert details[-1]["outcome"] == "unreachable"
+
+    def test_rerun_workflow_run_failed_records_ok(self, coord_db) -> None:
+        with patch("coord.github_ops.subprocess.run",
+                    return_value=MagicMock(returncode=0, stdout="", stderr="")):
+            assert github_ops.rerun_workflow_run_failed("acme/api", "12345") is True
+        details = _forge_availability_rows(coord_db)
+        assert details[-1]["outcome"] == "ok"
+        assert details[-1]["argv0"] == "run"
+
+    def test_rerun_workflow_run_failed_nonzero_exit_records_app_error(
+        self, coord_db,
+    ) -> None:
+        with patch(
+            "coord.github_ops.subprocess.run",
+            return_value=MagicMock(returncode=1, stdout="", stderr="run already in progress"),
+        ):
+            assert github_ops.rerun_workflow_run_failed("acme/api", "12345") is False
+        details = _forge_availability_rows(coord_db)
+        assert details[-1]["outcome"] == "app_error"
+
+
 class TestGhJsonHelper:
     """#1353: `_gh` treats a `gh` call that exits 0 with empty stdout as a
     success, indistinguishable from a real empty payload — so a bare
