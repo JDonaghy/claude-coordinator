@@ -10,18 +10,22 @@ One pass, in this order:
 1. **Pull** — customer-authored events since the stored cursor (new
    submissions · sign-off verdicts · answers to open questions) into the
    local inbox, then advance the cursor.
-2. **Consume verdicts** (#2509, PDR-4) — drain events pulled but not yet
-   acted on (:func:`coord.portal_store.unhandled_events`) and, for each
-   ``changes-requested`` sign-off, resolve the linked ``(repo, milestone)``
-   (#2507, PDR-1) and dispatch a targeted Gate-A contract amendment
+2. **Consume verdicts** (#2509, PDR-4) — walk events pulled but not yet
+   *scanned by this consumer* (its own watermark —
+   :func:`coord.portal_store.events_after_verdict_watermark`, independent of
+   the shared ``handled_at`` column) and, for each ``changes-requested``
+   sign-off, resolve the linked ``(repo, milestone)`` (#2507, PDR-1) and
+   dispatch a targeted Gate-A contract amendment
    (:func:`coord.mock_author.dispatch_acceptance_mock` with
    ``amend_briefing`` set to the client's own comment) — the same
    ``coord acceptance mock --amend`` path an operator would type by hand,
    now triggered by the portal event instead. An event is marked consumed
-   only once the dispatch itself has succeeded, so a crash mid-drain
-   re-processes it next tick rather than dropping the client's feedback.
-   An ``approved`` verdict is deliberately left alone here — see
-   :func:`_consume_verdicts`.
+   (``handled_at``) only once the dispatch itself has succeeded, and the
+   watermark stops advancing at the first dispatch failure in a page, so a
+   crash — or a stuck dispatch (no idle machine, Gate A already claimed) —
+   re-processes that event next tick rather than dropping the client's
+   feedback or skipping past it. An ``approved`` verdict is deliberately
+   left alone here — see :func:`_consume_verdicts`.
 3. **Push** — coord-authored facts from the outbox (design rounds · status ·
    open questions), one row at a time, in per-submission FIFO order.
 4. **Heartbeat** — say the daemon is alive.
@@ -70,6 +74,7 @@ before can be confirmed that way.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -142,13 +147,29 @@ MAX_PUSH_PER_TICK = 25
 #: former freezes a customer's queue forever behind a request that will never
 #: succeed.
 MAX_PUSH_ATTEMPTS = 8
-#: Unhandled events walked per pass by the verdict consumer (#2509). Bounded
-#: for the same reason as the push/pull budgets above — a large backlog must
-#: not make one tick unbounded. Events this pass does not act on (anything
-#: that isn't a `changes-requested` sign-off) are left unhandled and simply
-#: seen again next tick, so a full backlog drains over several passes rather
-#: than being skipped.
+#: Events walked per page by the verdict consumer (#2509). Bounded for the
+#: same reason as the push/pull budgets above — a large backlog must not make
+#: one tick unbounded.
+#:
+#: This consumer tracks its OWN watermark into `portal_events`
+#: (`portal_store.get_verdict_watermark` / `set_verdict_watermark`),
+#: independent of the shared `handled_at` column: a `changes-requested`
+#: sign-off is the only kind ever stamped `handled_at` here, so relying on
+#: `handled_at IS NULL` to decide what is left to scan would mean the
+#: never-marked backlog of every OTHER kind (new submissions, `approved`
+#: verdicts, Q&A answers) piles up ahead of anything newer forever, and once
+#: it exceeds one page a genuinely new `changes-requested` event behind it
+#: would never be seen again by ANY future tick. The watermark advances past
+#: every event this pass has looked at, acted on or not, so a backlog of
+#: non-actionable events cannot block the ones behind it. See
+#: :func:`_consume_verdicts`.
 MAX_VERDICTS_PER_TICK = 100
+#: Pages of `MAX_VERDICTS_PER_TICK` walked in one tick before leaving the
+#: rest for the next — the verdict-consumer counterpart to `MAX_PULL_PAGES`,
+#: for the same reason: a one-time backlog (e.g. the first tick after this
+#: consumer shipped) should drain in a handful of ticks, not one page a
+#: tick forever.
+MAX_VERDICT_PAGES = 10
 
 
 @dataclass(frozen=True)
@@ -548,14 +569,31 @@ def _mirror_event(event: dict[str, Any], *, now: float | None) -> None:
 # The counterpart to `enqueue_*` above: those put coord-owned facts on the
 # outbound queue, this acts on customer-owned ones the portal already sent.
 # `portal_store.unhandled_events()` / `mark_event_handled()` have existed as
-# pull-side plumbing since #1982 with zero callers — this is the first.
+# pull-side plumbing since #1982 with zero callers — this consumer is the
+# first, but does NOT scan through `unhandled_events()` (see below).
 #
 # Scope, deliberately narrow: only a `changes-requested` sign-off is acted on
 # here. Every other event kind (a new submission, an `approved` sign-off, an
-# answer to an open question) is left unhandled — not lost, just not this
-# ticket's job — so a future consumer can still read it, and nothing here
-# silently decides a question it wasn't asked. See the "approved" branch
-# below for the specific open question this deliberately does not resolve.
+# answer to an open question) never gets `handled_at` stamped by this
+# consumer — not lost, just not this ticket's job — so a future consumer can
+# still read it via `unhandled_events()`, and nothing here silently decides a
+# question it wasn't asked. See the "approved" branch below for the specific
+# open question this deliberately does not resolve.
+#
+# That is also exactly why this consumer cannot scan `unhandled_events()`
+# (`handled_at IS NULL`, oldest first) to find its own work: every kind above
+# piles up there FOREVER, always sorted ahead of anything newer, so once that
+# backlog exceeds one page a genuinely new `changes-requested` event behind
+# it would never be returned — not this tick, not any future one (found in
+# review; reproduced by seeding 150 non-actionable events ahead of one
+# `changes_requested` event and running 5 ticks: `consumed == 0` every time,
+# and the targeted event never appeared in `unhandled_events()`'s result at
+# all). Instead this consumer tracks its OWN watermark
+# (`portal_store.get_verdict_watermark` / `set_verdict_watermark`,
+# `events_after_verdict_watermark`) into `portal_events`, which advances past
+# every event it has looked at regardless of what it decided — so a pile of
+# events it will never mark `handled_at` cannot block it from reaching what
+# comes after them.
 
 
 def _signoff_verdict(event: "portal_store.PortalEvent") -> str | None:
@@ -671,10 +709,28 @@ def _amend_from_verdict(config: Any, event: "portal_store.PortalEvent") -> None:
     )
 
 
+#: Matches a sign-off verdict's separator, whichever the portal actually
+#: used — a literal hyphen (`"changes-requested"`) or a space
+#: (`"changes requested"`). The portal's own event contract for this field
+#: is not fully pinned down (see `_signoff_verdict`'s docstring), so both are
+#: folded to `_` before comparing against `"changes_requested"` rather than
+#: risking a silent no-match on a contract detail neither side has confirmed.
+_VERDICT_SEPARATOR_RE = re.compile(r"[-\s]+")
+
+
+def _normalize_verdict(verdict: str) -> str:
+    return _VERDICT_SEPARATOR_RE.sub("_", verdict.strip().lower()).strip("_")
+
+
 def _consume_verdicts(
-    config: Any, *, limit: int = MAX_VERDICTS_PER_TICK, now: float | None = None
+    config: Any,
+    *,
+    limit: int = MAX_VERDICTS_PER_TICK,
+    pages: int = MAX_VERDICT_PAGES,
+    now: float | None = None,
 ) -> tuple[int, list[str]]:
-    """Drain unhandled events and act on every `changes-requested` sign-off.
+    """Walk the inbox from this consumer's own watermark, acting on every
+    `changes-requested` sign-off found.
 
     Requires *config* (a real :class:`coord.config.Config`) to resolve the
     linked repo and dispatch through — a bare *client* (the test/CLI bypass
@@ -683,41 +739,83 @@ def _consume_verdicts(
 
     Returns ``(consumed, errors)``. Never raises: every event is handled
     inside its own try/except so one bad event (an unresolved link, a
-    machine-picking failure) cannot stop the rest of the page — mirroring
-    `_push`'s per-row isolation.
+    machine-picking failure) cannot stop the rest of the *page* — mirroring
+    `_push`'s per-row isolation. It CAN, deliberately, stop the watermark: the
+    first dispatch failure freezes it at the position just before that event,
+    so a still-broken link or a still-claimed Gate A is retried every tick
+    rather than silently skipped — the same "an event is marked consumed only
+    once the dispatch itself has succeeded" guarantee this module's docstring
+    promises, just enforced by a cursor now instead of a shared flag. Events
+    already looked at earlier are still walked (and, if newly actionable,
+    still acted on) even while frozen — only the PERSISTED watermark holds
+    still, so isolation and no-silent-drop both hold at once.
     """
     if config is None:
         return 0, []
     consumed = 0
     errors: list[str] = []
-    for event in portal_store.unhandled_events(limit=limit):
-        verdict = _signoff_verdict(event)
-        if verdict is None:
-            continue
-        normalized = verdict.strip().lower().replace("-", "_")
-        if normalized != "changes_requested":
-            # Includes "approved". Whether an approved verdict should
-            # auto-record `coord gate-a --approved` (coord/gate_a.py) or
-            # wait for a separate operator confirmation is an open policy
-            # question (#2509) — deliberately not decided here. Leaving the
-            # event unhandled means it stays visible rather than this loop
-            # silently picking an answer.
-            continue
-        try:
-            _amend_from_verdict(config, event)
-        except Exception as exc:  # noqa: BLE001 — one bad event must not stop the page
-            errors.append(
-                f"verdict {event.event_id} ({event.submission_id}): {exc}"
-            )
-            logger.warning(
-                "portal sync: could not act on changes-requested verdict "
-                "for submission %s",
-                event.submission_id,
-                exc_info=True,
-            )
-            continue
-        portal_store.mark_event_handled(event.event_id, now=now)
-        consumed += 1
+
+    initial_at, initial_rowid = portal_store.get_verdict_watermark()
+    commit_at, commit_rowid = initial_at, initial_rowid
+    scan_at, scan_rowid = initial_at, initial_rowid
+    blocked = False
+
+    for _page_num in range(pages):
+        page = portal_store.events_after_verdict_watermark(
+            scan_at, scan_rowid, limit=limit
+        )
+        if not page:
+            break
+        for rowid, event in page:
+            scan_at, scan_rowid = event.received_at, rowid
+            if event.handled_at is not None:
+                # Already dispatched by an earlier pass — e.g. this tick's
+                # commit point is frozen behind a still-failing sibling from a
+                # PRIOR tick and this one was successfully handled back then,
+                # before that sibling ever failed. Nothing new to do; just
+                # let the scan move past it without re-dispatching.
+                if not blocked:
+                    commit_at, commit_rowid = scan_at, scan_rowid
+                continue
+            verdict = _signoff_verdict(event)
+            if verdict is None:
+                if not blocked:
+                    commit_at, commit_rowid = scan_at, scan_rowid
+                continue
+            if _normalize_verdict(verdict) != "changes_requested":
+                # Includes "approved". Whether an approved verdict should
+                # auto-record `coord gate-a --approved` (coord/gate_a.py) or
+                # wait for a separate operator confirmation is an open policy
+                # question (#2509) — deliberately not decided here. Leaving
+                # `handled_at` unset means a future consumer can still see it
+                # via `unhandled_events()`; advancing the watermark just means
+                # THIS consumer will not look at it again, which is separate.
+                if not blocked:
+                    commit_at, commit_rowid = scan_at, scan_rowid
+                continue
+            try:
+                _amend_from_verdict(config, event)
+            except Exception as exc:  # noqa: BLE001 — one bad event must not stop the page
+                errors.append(
+                    f"verdict {event.event_id} ({event.submission_id}): {exc}"
+                )
+                logger.warning(
+                    "portal sync: could not act on changes-requested verdict "
+                    "for submission %s",
+                    event.submission_id,
+                    exc_info=True,
+                )
+                blocked = True
+                continue
+            portal_store.mark_event_handled(event.event_id, now=now)
+            consumed += 1
+            if not blocked:
+                commit_at, commit_rowid = scan_at, scan_rowid
+        if blocked or len(page) < limit:
+            break
+
+    if (commit_at, commit_rowid) != (initial_at, initial_rowid):
+        portal_store.set_verdict_watermark(commit_at, commit_rowid)
     return consumed, errors
 
 
