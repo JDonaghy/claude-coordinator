@@ -153,6 +153,32 @@ jobs:
       # gated separately through the #2164 CI wrapper.
       - run: scripts/run_tests_without_gh.sh python -m pytest tests/ -q --ignore=tests/acceptance
 
+  # #2135 (child of epic #1902): "every `gh` argv construction lives inside
+  # coord/github_ops.py" is the load-bearing assumption under the #1902
+  # forge-portability cost estimate — it's the fact that makes the eventual
+  # port a refactor instead of a rewrite. Before this job it was protected
+  # by nothing but convention (a grep someone remembered to run by hand).
+  #
+  # scripts/check_gh_argv_containment.py scans coord/**/*.py for a bare
+  # `"gh"`/`'gh'` token outside coord/github_ops.py, with one explicit,
+  # commented allowlist entry for coord/prereqs.py's binary-version probe
+  # (it checks `gh` is installed; it doesn't drive the forge). See that
+  # script's module docstring for the full rationale and
+  # tests/test_check_gh_argv_containment.py for the negative-test proof
+  # that the guard can actually fail.
+  #
+  # Stdlib-only (re/pathlib/dataclasses), so no `pip install` needed here —
+  # this is meant to be as cheap as `no-gh-on-path` above, a grep-shaped
+  # check, not a build step.
+  gh-argv-containment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python scripts/check_gh_argv_containment.py .
+
   # #2170: run the full suite in the environment of a REAL FLEET MACHINE — a
   # populated `~/.coord/` (thin-client shaped), no `sqlite3` on PATH, and a
   # `$TMPDIR` under an ancestor pytest config.
