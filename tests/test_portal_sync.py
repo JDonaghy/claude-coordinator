@@ -772,3 +772,181 @@ def test_requeue_revives_a_retired_row_with_a_fresh_revision():
 
 def test_requeue_of_an_unknown_row_is_a_clean_none():
     assert portal_store.requeue("nope", 1) is None
+
+
+# ── consuming portal verdicts (#2509, PDR-4) ────────────────────────────────
+
+
+class FakeRepoCfg:
+    def __init__(self, github: str = "acme/portal-repo") -> None:
+        self.github = github
+
+
+class FakeConfig:
+    """Just enough of `coord.config.Config` for `_consume_verdicts`: a
+    `.repo(name)` lookup. Real dispatch is monkeypatched out in every test
+    below, so nothing else on Config is ever touched."""
+
+    def __init__(self, repos: dict | None = None) -> None:
+        self._repos = repos or {}
+
+    def repo(self, name):
+        return self._repos.get(name)
+
+
+def _changes_requested_page(comments: str | None = "make it blue") -> dict:
+    data = {"verdict": "changes_requested"}
+    if comments is not None:
+        data["comments"] = comments
+    return {
+        "events": [
+            {"id": "e1", "submission_id": SUB, "type": "signoff.changes_requested", "data": data}
+        ],
+        "cursor": "c1",
+        "has_more": False,
+    }
+
+
+def test_changes_requested_dispatches_amend_and_marks_the_event_consumed(monkeypatch):
+    portal_store.link_milestone(
+        repo_name="acme-portal", milestone_number=5, submission_id=SUB
+    )
+    monkeypatch.setattr(portal_sync, "_resolve_tracking_issue", lambda repo_cfg, ms: 42)
+    calls = []
+
+    def fake_dispatch(repo_name, tracking_issue_number, config, *, amend_briefing=None, **_):
+        calls.append((repo_name, tracking_issue_number, amend_briefing))
+        return ("assignment-1", "machine-1")
+
+    monkeypatch.setattr("coord.mock_author.dispatch_acceptance_mock", fake_dispatch)
+
+    config = FakeConfig({"acme-portal": FakeRepoCfg()})
+    client = FakeClient(pages=[_changes_requested_page()])
+    result = sync_tick(config=config, client=client)
+
+    assert result.verdicts_consumed == 1
+    assert calls == [("acme-portal", 42, "make it blue")]
+    assert portal_store.unhandled_events() == []
+
+
+def test_approved_verdict_is_left_unconsumed_not_auto_decided(monkeypatch):
+    """#2509's open policy question: an `approved` verdict must not silently
+    auto-record Gate A here — it stays unhandled instead of being acted on."""
+    dispatched = []
+    monkeypatch.setattr(
+        "coord.mock_author.dispatch_acceptance_mock",
+        lambda *a, **kw: dispatched.append((a, kw)),
+    )
+    config = FakeConfig({"acme-portal": FakeRepoCfg()})
+    client = FakeClient(
+        pages=[
+            {
+                "events": [
+                    {"id": "e1", "submission_id": SUB, "type": "signoff.approved"}
+                ],
+                "cursor": "c1",
+                "has_more": False,
+            }
+        ]
+    )
+    result = sync_tick(config=config, client=client)
+
+    assert result.verdicts_consumed == 0
+    assert dispatched == []
+    assert [e.event_id for e in portal_store.unhandled_events()] == ["e1"]
+
+
+def test_changes_requested_with_no_link_recorded_stays_unhandled_and_errors():
+    """No `coord portal link` for this submission yet — nothing to dispatch
+    to, and the client's feedback must not be dropped."""
+    config = FakeConfig({"acme-portal": FakeRepoCfg()})
+    client = FakeClient(pages=[_changes_requested_page()])
+    result = sync_tick(config=config, client=client)
+
+    assert result.verdicts_consumed == 0
+    assert any("no milestone is linked" in e for e in result.errors)
+    assert [e.event_id for e in portal_store.unhandled_events()] == ["e1"]
+
+
+def test_a_dispatch_failure_leaves_the_event_to_retry_next_tick(monkeypatch):
+    portal_store.link_milestone(
+        repo_name="acme-portal", milestone_number=5, submission_id=SUB
+    )
+    monkeypatch.setattr(portal_sync, "_resolve_tracking_issue", lambda repo_cfg, ms: 42)
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("Gate A already in flight")
+
+    monkeypatch.setattr("coord.mock_author.dispatch_acceptance_mock", boom)
+
+    config = FakeConfig({"acme-portal": FakeRepoCfg()})
+    client = FakeClient(pages=[_changes_requested_page()])
+    result = sync_tick(config=config, client=client)
+
+    assert result.verdicts_consumed == 0
+    assert any("Gate A already in flight" in e for e in result.errors)
+    assert [e.event_id for e in portal_store.unhandled_events()] == ["e1"]
+
+
+def test_a_missing_comment_falls_back_to_a_placeholder_amend_text(monkeypatch):
+    portal_store.link_milestone(
+        repo_name="acme-portal", milestone_number=5, submission_id=SUB
+    )
+    monkeypatch.setattr(portal_sync, "_resolve_tracking_issue", lambda repo_cfg, ms: 42)
+    calls = []
+    monkeypatch.setattr(
+        "coord.mock_author.dispatch_acceptance_mock",
+        lambda repo, issue, cfg, **kw: calls.append(kw.get("amend_briefing")),
+    )
+
+    config = FakeConfig({"acme-portal": FakeRepoCfg()})
+    client = FakeClient(pages=[_changes_requested_page(comments=None)])
+    sync_tick(config=config, client=client)
+
+    assert len(calls) == 1
+    assert SUB in calls[0]
+
+
+def test_with_no_config_the_verdict_phase_is_a_no_op_not_a_crash():
+    """`sync_tick(client=...)` with no config is the documented test/CLI
+    bypass — verdict consumption must not explode with nowhere to dispatch."""
+    client = FakeClient(pages=[_changes_requested_page()])
+    result = sync_tick(client=client)
+
+    assert result.verdicts_consumed == 0
+    assert [e.event_id for e in portal_store.unhandled_events()] == ["e1"]
+
+
+class TestSignoffVerdict:
+    def _event(self, kind: str, payload: dict | None = None):
+        return portal_store.PortalEvent(
+            event_id="e1",
+            submission_id=SUB,
+            kind=kind,
+            occurred_at="",
+            payload=payload or {},
+            received_at=0.0,
+        )
+
+    def test_verdict_suffix_on_type(self):
+        assert (
+            portal_sync._signoff_verdict(self._event("signoff.changes_requested"))
+            == "changes_requested"
+        )
+
+    def test_verdict_nested_in_data(self):
+        event = self._event("signoff", {"data": {"verdict": "approved"}})
+        assert portal_sync._signoff_verdict(event) == "approved"
+
+    def test_non_signoff_kind_is_not_a_verdict(self):
+        assert portal_sync._signoff_verdict(self._event("created")) is None
+
+    def test_comment_read_from_nested_data(self):
+        event = self._event(
+            "signoff.changes_requested", {"data": {"comments": "make it bigger"}}
+        )
+        assert portal_sync._signoff_comment(event) == "make it bigger"
+
+    def test_comment_defaults_to_empty_string(self):
+        event = self._event("signoff.changes_requested")
+        assert portal_sync._signoff_comment(event) == ""

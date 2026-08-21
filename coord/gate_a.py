@@ -224,6 +224,19 @@ def make_record(
     ``verdict`` must be one of :data:`VERDICTS`; anything else is a
     programming error, not an operator error (the CLI's mutually-exclusive
     ``--approved``/``--changes`` flags already reject bad input).
+
+    **Open policy question (#2509, flagged for the operator, not resolved by
+    this call or any caller yet):** should an "approved" verdict on the
+    customer portal auto-call this with ``verdict=VERDICT_APPROVED`` — i.e.
+    does a client's portal sign-off record itself — or does an operator
+    still confirm separately via the existing CLI/TUI path? Today nothing
+    does the former: ``coord.portal_sync._consume_verdicts`` only acts on
+    `changes-requested` (auto-amending the contract) and deliberately leaves
+    `approved` events unconsumed rather than silently picking an answer here.
+    Whichever way this is eventually decided, an auto-recorded call MUST
+    pass ``actor="client via portal"`` (or similarly explicit) — never leave
+    ``actor`` to default such that a client's decision reads as if some
+    coord process made it.
     """
     if verdict not in VERDICTS:
         raise ValueError(f"unknown Gate A verdict {verdict!r}")
