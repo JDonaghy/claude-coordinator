@@ -159,6 +159,36 @@ class TestLinkMilestone:
         )
 
 
+class TestGetLinkBySubmission:
+    """The reverse lookup #2509's verdict consumer needs: an inbound event
+    carries only `submission_id` and must resolve back to `(repo,
+    milestone)`."""
+
+    def test_finds_the_link_by_submission_id(self, coord_db) -> None:
+        from coord.portal_store import get_link_by_submission, link_milestone
+
+        link_milestone(
+            repo_name="acme-portal", milestone_number=5, submission_id="sub_xyz"
+        )
+        found = get_link_by_submission("sub_xyz")
+        assert found is not None
+        assert found.repo_name == "acme-portal"
+        assert found.milestone_number == 5
+
+    def test_unknown_submission_id_is_a_clean_none(self, coord_db) -> None:
+        from coord.portal_store import get_link_by_submission
+
+        assert get_link_by_submission("nope") is None
+
+    def test_does_not_confuse_two_different_submissions(self, coord_db) -> None:
+        from coord.portal_store import get_link_by_submission, link_milestone
+
+        link_milestone(repo_name="repo-a", milestone_number=1, submission_id="sub_a")
+        link_milestone(repo_name="repo-b", milestone_number=2, submission_id="sub_b")
+        assert get_link_by_submission("sub_a").repo_name == "repo-a"
+        assert get_link_by_submission("sub_b").repo_name == "repo-b"
+
+
 class TestStatePersistenceDirect:
     """The board_meta seam itself — `coord.state`'s half, exercised the same
     way `TestPersistence` in `tests/test_gate_a.py` exercises the sibling

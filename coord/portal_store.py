@@ -894,3 +894,21 @@ def list_milestone_links() -> list[PortalLink]:
 
     links = [PortalLink.from_dict(raw) for raw in state.list_portal_links()]
     return [link for link in links if link is not None]
+
+
+def get_link_by_submission(submission_id: str) -> PortalLink | None:
+    """Reverse lookup: the milestone link for a portal ``submission_id``, if any.
+
+    :func:`link_milestone` / :func:`get_milestone_link` only index the
+    forward direction (milestone → submission_id), which is all PDR-3's
+    auto-push needs. PDR-4's verdict consumer needs the other direction —
+    an inbound event carries only ``submission_id`` and must resolve back to
+    the ``(repo_name, milestone_number)`` coord dispatches against. Links are
+    few enough (one per submission a customer has ever been sent to) that a
+    linear scan of :func:`list_milestone_links` is simply the read path — no
+    new index, no new table.
+    """
+    for link in list_milestone_links():
+        if link.submission_id == submission_id:
+            return link
+    return None

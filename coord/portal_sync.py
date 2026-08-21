@@ -10,9 +10,21 @@ One pass, in this order:
 1. **Pull** — customer-authored events since the stored cursor (new
    submissions · sign-off verdicts · answers to open questions) into the
    local inbox, then advance the cursor.
-2. **Push** — coord-authored facts from the outbox (design rounds · status ·
+2. **Consume verdicts** (#2509, PDR-4) — drain events pulled but not yet
+   acted on (:func:`coord.portal_store.unhandled_events`) and, for each
+   ``changes-requested`` sign-off, resolve the linked ``(repo, milestone)``
+   (#2507, PDR-1) and dispatch a targeted Gate-A contract amendment
+   (:func:`coord.mock_author.dispatch_acceptance_mock` with
+   ``amend_briefing`` set to the client's own comment) — the same
+   ``coord acceptance mock --amend`` path an operator would type by hand,
+   now triggered by the portal event instead. An event is marked consumed
+   only once the dispatch itself has succeeded, so a crash mid-drain
+   re-processes it next tick rather than dropping the client's feedback.
+   An ``approved`` verdict is deliberately left alone here — see
+   :func:`_consume_verdicts`.
+3. **Push** — coord-authored facts from the outbox (design rounds · status ·
    open questions), one row at a time, in per-submission FIFO order.
-3. **Heartbeat** — say the daemon is alive.
+4. **Heartbeat** — say the daemon is alive.
 
 Each phase is independently guarded: a portal outage, a rejected field, or a
 malformed event can never crash the tick or silence the other two phases (the
@@ -130,6 +142,13 @@ MAX_PUSH_PER_TICK = 25
 #: former freezes a customer's queue forever behind a request that will never
 #: succeed.
 MAX_PUSH_ATTEMPTS = 8
+#: Unhandled events walked per pass by the verdict consumer (#2509). Bounded
+#: for the same reason as the push/pull budgets above — a large backlog must
+#: not make one tick unbounded. Events this pass does not act on (anything
+#: that isn't a `changes-requested` sign-off) are left unhandled and simply
+#: seen again next tick, so a full backlog drains over several passes rather
+#: than being skipped.
+MAX_VERDICTS_PER_TICK = 100
 
 
 @dataclass(frozen=True)
@@ -138,6 +157,7 @@ class SyncResult:
 
     enabled: bool = True
     pulled: int = 0
+    verdicts_consumed: int = 0
     applied: int = 0
     rejected: int = 0
     held: int = 0
@@ -147,7 +167,9 @@ class SyncResult:
     @property
     def moved(self) -> bool:
         """True when this pass actually moved a row in either direction."""
-        return bool(self.pulled or self.applied or self.rejected)
+        return bool(
+            self.pulled or self.verdicts_consumed or self.applied or self.rejected
+        )
 
     def summary(self) -> str:
         if not self.enabled:
@@ -159,6 +181,7 @@ class SyncResult:
             return "portal sync: disabled"
         parts = [
             f"pulled={self.pulled}",
+            f"verdicts_consumed={self.verdicts_consumed}",
             f"applied={self.applied}",
             f"rejected={self.rejected}",
             f"held={self.held}",
@@ -326,11 +349,12 @@ def sync_tick(
     ``SyncResult(enabled=False)`` having sent nothing. Pass *client*
     explicitly to bypass config (tests, ``coord portal sync``).
 
-    The three phases are independently isolated, deliberately in this order:
+    The four phases are independently isolated, deliberately in this order:
     pull first (a sign-off verdict pulled now can be acted on this same
-    tick), push second, heartbeat last but unconditionally — a pass that
-    failed everything else still proves the daemon is alive, and that is
-    precisely the pass the portal most needs to hear about.
+    tick), then verdict consumption (#2509), then push, heartbeat last but
+    unconditionally — a pass that failed everything else still proves the
+    daemon is alive, and that is precisely the pass the portal most needs to
+    hear about.
     """
     if client is None:
         try:
@@ -352,6 +376,19 @@ def sync_tick(
     except Exception as exc:  # noqa: BLE001 — a third party must never crash the tick
         errors.append(f"pull: {exc}")
         logger.warning("portal sync: pull failed", exc_info=True)
+
+    # #2509 (PDR-4): act on whatever the pull above (or an earlier tick) left
+    # in the inbox. Isolated exactly like the other phases — a dispatch
+    # failure (no idle machine, GitHub down, the milestone's Gate A already
+    # claimed) must not silence push or heartbeat, and must not be mistaken
+    # for a portal-side problem.
+    verdicts_consumed = 0
+    try:
+        verdicts_consumed, verdict_errors = _consume_verdicts(config, now=now)
+        errors.extend(verdict_errors)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"verdicts: {exc}")
+        logger.warning("portal sync: verdict consumption failed", exc_info=True)
 
     applied = rejected = held = 0
     try:
@@ -391,6 +428,7 @@ def sync_tick(
     return SyncResult(
         enabled=True,
         pulled=pulled,
+        verdicts_consumed=verdicts_consumed,
         applied=applied,
         rejected=rejected,
         held=held,
@@ -503,6 +541,184 @@ def _mirror_event(event: dict[str, Any], *, now: float | None) -> None:
         revision = None  # bool is an int in Python; a flag is not a revision
     if isinstance(revision, int) and revision > 0:
         portal_store.seed_revision(submission_id, revision, now=now)
+
+
+# ── consuming portal verdicts (#2509, PDR-4) ────────────────────────────────
+#
+# The counterpart to `enqueue_*` above: those put coord-owned facts on the
+# outbound queue, this acts on customer-owned ones the portal already sent.
+# `portal_store.unhandled_events()` / `mark_event_handled()` have existed as
+# pull-side plumbing since #1982 with zero callers — this is the first.
+#
+# Scope, deliberately narrow: only a `changes-requested` sign-off is acted on
+# here. Every other event kind (a new submission, an `approved` sign-off, an
+# answer to an open question) is left unhandled — not lost, just not this
+# ticket's job — so a future consumer can still read it, and nothing here
+# silently decides a question it wasn't asked. See the "approved" branch
+# below for the specific open question this deliberately does not resolve.
+
+
+def _signoff_verdict(event: "portal_store.PortalEvent") -> str | None:
+    """The sign-off verdict *event* carries, or ``None`` if it isn't one.
+
+    The portal's own event contract for a sign-off is not fully pinned down
+    yet, so this reads either shape that has been observed: the verdict as a
+    suffix on ``type`` (``"signoff.changes_requested"``) or nested in the
+    event's ``data``/``fields`` payload (``{"type": "signoff", "data":
+    {"verdict": "changes_requested"}}``). Never raises on a malformed event —
+    it just returns ``None``, and the event is left unhandled for a human to
+    look at rather than mis-filed as "not a sign-off".
+    """
+    kind = (event.kind or "").strip()
+    if not (kind == "signoff" or kind.startswith("signoff.")):
+        return None
+    if "." in kind:
+        suffix = kind.split(".", 1)[1].strip()
+        if suffix:
+            return suffix
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    nested = payload.get("data")
+    if not isinstance(nested, dict):
+        nested = payload.get("fields")
+    verdict = nested.get("verdict") if isinstance(nested, dict) else None
+    if not isinstance(verdict, str) or not verdict.strip():
+        verdict = payload.get("verdict")
+    return verdict.strip() if isinstance(verdict, str) and verdict.strip() else None
+
+
+def _signoff_comment(event: "portal_store.PortalEvent") -> str:
+    """The client's own comment text on *event*, or ``""`` if it left none."""
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    nested = payload.get("data")
+    if not isinstance(nested, dict):
+        nested = payload.get("fields")
+    for source in (nested, payload):
+        if not isinstance(source, dict):
+            continue
+        for key in ("comments", "comment", "message", "note"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _resolve_tracking_issue(repo_cfg: Any, milestone_number: int) -> int | None:
+    """The milestone's tracking (epic) issue number, or ``None`` if unresolved.
+
+    Every command that dispatches milestone work
+    (:func:`coord.mock_author.dispatch_acceptance_mock` included) is keyed by
+    tracking-issue number, resolving the milestone FROM it — but a
+    :class:`coord.portal_store.PortalLink` only carries the milestone number
+    the other direction, inbound events never see a tracking-issue number at
+    all. This is the reverse lookup, same approach
+    :func:`coord.plans.aggregate_repo_plans` already uses: open issues + the
+    closed-epics list, filtered to the one carrying the epic label under this
+    milestone (:func:`coord.plans.find_tracking_issue`).
+    """
+    from coord import github_ops  # noqa: PLC0415
+    from coord.plans import find_tracking_issue  # noqa: PLC0415
+
+    candidates = github_ops.get_open_issues(repo_cfg.github) + github_ops.get_closed_epics(
+        repo_cfg.github
+    )
+    tracking = find_tracking_issue(milestone_number, candidates)
+    return tracking["number"] if tracking is not None else None
+
+
+def _amend_from_verdict(config: Any, event: "portal_store.PortalEvent") -> None:
+    """Dispatch the targeted Gate-A amendment for one `changes-requested` event.
+
+    Raises on anything that stops the dispatch (no link recorded, unknown
+    repo, no resolvable tracking issue, Gate A already claimed, no idle
+    machine, ...) — the caller marks the event consumed only if this returns
+    normally, so any of these leaves the event to retry next tick rather than
+    dropping the client's feedback.
+    """
+    link = portal_store.get_link_by_submission(event.submission_id)
+    if link is None:
+        raise RuntimeError(
+            f"no milestone is linked to portal submission "
+            f"{event.submission_id!r} (coord portal link) — cannot resolve "
+            "where to dispatch the amendment"
+        )
+    repo_cfg = config.repo(link.repo_name)
+    if repo_cfg is None:
+        raise RuntimeError(
+            f"linked repo {link.repo_name!r} is not in coordinator.yml"
+        )
+
+    tracking_issue_number = _resolve_tracking_issue(repo_cfg, link.milestone_number)
+    if tracking_issue_number is None:
+        raise RuntimeError(
+            f"could not resolve a tracking (epic) issue for milestone "
+            f"{link.milestone_number} in {link.repo_name!r}"
+        )
+
+    comment = _signoff_comment(event)
+    amend_text = comment or (
+        "The client requested changes via the portal sign-off but left no "
+        f"comment text — check portal submission {event.submission_id!r} "
+        "directly for context."
+    )
+
+    from coord.mock_author import dispatch_acceptance_mock  # noqa: PLC0415
+
+    dispatch_acceptance_mock(
+        link.repo_name,
+        tracking_issue_number,
+        config,
+        amend_briefing=amend_text,
+    )
+
+
+def _consume_verdicts(
+    config: Any, *, limit: int = MAX_VERDICTS_PER_TICK, now: float | None = None
+) -> tuple[int, list[str]]:
+    """Drain unhandled events and act on every `changes-requested` sign-off.
+
+    Requires *config* (a real :class:`coord.config.Config`) to resolve the
+    linked repo and dispatch through — a bare *client* (the test/CLI bypass
+    :func:`sync_tick` also accepts) is not enough to dispatch anything, so
+    with no config this is a deliberate no-op rather than a crash.
+
+    Returns ``(consumed, errors)``. Never raises: every event is handled
+    inside its own try/except so one bad event (an unresolved link, a
+    machine-picking failure) cannot stop the rest of the page — mirroring
+    `_push`'s per-row isolation.
+    """
+    if config is None:
+        return 0, []
+    consumed = 0
+    errors: list[str] = []
+    for event in portal_store.unhandled_events(limit=limit):
+        verdict = _signoff_verdict(event)
+        if verdict is None:
+            continue
+        normalized = verdict.strip().lower().replace("-", "_")
+        if normalized != "changes_requested":
+            # Includes "approved". Whether an approved verdict should
+            # auto-record `coord gate-a --approved` (coord/gate_a.py) or
+            # wait for a separate operator confirmation is an open policy
+            # question (#2509) — deliberately not decided here. Leaving the
+            # event unhandled means it stays visible rather than this loop
+            # silently picking an answer.
+            continue
+        try:
+            _amend_from_verdict(config, event)
+        except Exception as exc:  # noqa: BLE001 — one bad event must not stop the page
+            errors.append(
+                f"verdict {event.event_id} ({event.submission_id}): {exc}"
+            )
+            logger.warning(
+                "portal sync: could not act on changes-requested verdict "
+                "for submission %s",
+                event.submission_id,
+                exc_info=True,
+            )
+            continue
+        portal_store.mark_event_handled(event.event_id, now=now)
+        consumed += 1
+    return consumed, errors
 
 
 def _push(

@@ -777,6 +777,15 @@ def _portal_sync_tick(config: Config):  # noqa: ANN201 — coord.portal_sync.Syn
     internet and an outage there must never touch dispatch, merge, or any
     verdict.  The caller's try/except is the belt to that braces.
 
+    As of #2509 (PDR-4), one of `sync_tick`'s phases *is* a verdict: it
+    drains events pulled but not yet consumed
+    (``coord.portal_store.unhandled_events``) and, for each
+    `changes-requested` sign-off, dispatches a targeted Gate-A contract
+    amendment (``coord.mock_author.dispatch_acceptance_mock``) against the
+    milestone PDR-1's link (``coord portal link``) resolves — the same
+    ``coord acceptance mock --amend`` an operator would type by hand, now
+    triggered by the client's own portal comment instead.
+
     Extracted as a module-level function so tests can call it directly without
     wiring up the async ``_tick_loop`` infrastructure (mirrors
     ``_passive_tick`` / ``_sync_issues_tick``).
