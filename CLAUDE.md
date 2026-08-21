@@ -10,6 +10,20 @@ CLI tool + per-machine agent server that coordinates Claude Code workers across 
 > [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#design-decisions--the-settled-rationale).
 > Keep it that way: if a new rule does not change what a worker does, it belongs in `docs/`.
 
+> **Operator sessions: dispatch, don't do.** If you're the interactive coordinator session —
+> not a dispatched `type=work`/`review` leg — and the user asks for a change in any repo listed
+> in `coordinator.yml`, don't edit that repo's tree yourself: file a GitHub issue and `coord
+> drive-queue add` it. That gets the change tested, independently reviewed, merged, and
+> deployed; hand-editing it here skips all four. (Doc-only edits to *this* repo are the
+> documented exception for *who* does the work — see
+> [`docs/COST_DISCIPLINE.md`](docs/COST_DISCIPLINE.md) — **not** for *how* it lands: every commit
+> on `main`, doc-only ones included, is squash-merged from a branch's PR, never pushed to `main`
+> directly. Use `EnterWorktree`, branch, commit, push, open the PR, let it merge, then
+> `ExitWorktree`.) Caught 2026-08-21: this exact rule used to live inline here, got moved to
+> that linked doc by #2195, and was then skipped — an operator session hand-implemented a
+> natal-chart feature directly instead of dispatching it. If you're a worker or reviewer leg,
+> this paragraph isn't for you.
+
 ## Current Goal — read first
 
 **[`GOAL.md`](GOAL.md) holds the current north-star objective** — the living, cross-repo / cross-machine goal that should bias all planning, triage, and dispatch. It is meta-level (above any single issue, repo, or session) and changes as priorities evolve: read it first, plan against it, and keep it current. `coordinator.yml` is the source of truth for *topology*; `GOAL.md` is the source of truth for *intent*.
