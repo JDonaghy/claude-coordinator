@@ -2,9 +2,15 @@
 #
 # A systemd *user* unit (mirrors coord-agent/coord-serve/coord-web), paired
 # with coord-notify.timer. Runs `coord notify` on a schedule: polls each
-# agent for completion, posts the GH completion/failure comments, and
-# triggers the auto-loop (review-on-completion, fix-on-request-changes,
-# re-review-on-fix-completion). Install ONLY on the box that owns
+# agent for completion, posts the GH completion/failure comments, triggers
+# the auto-loop (review-on-completion, fix-on-request-changes,
+# re-review-on-fix-completion), and — #2536 — auto-heals any `running` board
+# row whose recorded machine confirms is dead and aged well past its own
+# needs-attention threshold (the same non-destructive recovery `coord
+# diagnose --reset` performs by hand; see
+# docs/AGENT_OPERATIONS.md → "Periodic coord notify" for the guardrails, and
+# `pipeline.auto_heal_phantom_rows` in coordinator.yml to opt out). Install
+# ONLY on the box that owns
 # ~/.coord/coord.db (dellserver in production — the same host that runs
 # coord-serve/coord-web) — it must NOT run on a thin-client machine, since
 # `coord notify` there would just re-route itself back over HTTP to the
