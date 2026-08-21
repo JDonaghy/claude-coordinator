@@ -624,6 +624,165 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// #2464: a couple of tests below assert on the *exit status* of a real
+    /// `coord --version`. `do_spawn` launches `Command::new("coord")`, which
+    /// resolves purely through the inherited `PATH` — true for a `cargo test`
+    /// started from an interactive shell, and false for one spawned by the
+    /// notify drain, a systemd unit or a desktop launcher, none of which
+    /// source a login shell and so never see `~/.local/bin`. With the CLI
+    /// unreachable the spawn fails before it ever runs, `do_spawn` reports
+    /// `exit -1` with an empty stderr, and those cases read as a regression
+    /// in the branch under test when the only thing missing is an installed
+    /// dependency. Guard them on this probe and skip *loudly* instead: a test
+    /// that cannot run must never be reported as a failure, and the
+    /// `eprintln!` keeps the skip visible in `cargo test` output (which shows
+    /// captured stdio for passing tests only under `--nocapture`, so the
+    /// message also names the reason in one line for log greps).
+    ///
+    /// Deliberately mirrors the OS lookup and nothing more: `do_spawn`
+    /// consults no fallback install dirs, so a more generous probe here would
+    /// let a test claim the CLI is available when the code under test still
+    /// cannot find it.
+    fn coord_cli_on_path() -> bool {
+        coord_cli_in(std::env::var_os("PATH"))
+    }
+
+    /// Pure form of [`coord_cli_on_path`], split out so the probe itself can
+    /// be tested against synthetic directories without mutating the process
+    /// environment (which every other test in this binary shares).
+    fn coord_cli_in(path_var: Option<std::ffi::OsString>) -> bool {
+        let Some(path_var) = path_var else {
+            return false;
+        };
+        // On Windows the OS appends the PATHEXT suffixes; `.exe` is the only
+        // one a Rust/Python console script produces, so check it first and
+        // fall back to the extension-less name for WSL-style layouts.
+        let names: &[&str] = if cfg!(windows) {
+            &["coord.exe", "coord"]
+        } else {
+            &["coord"]
+        };
+        std::env::split_paths(&path_var)
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .any(|dir| names.iter().any(|name| is_executable_file(&dir.join(name))))
+    }
+
+    /// `true` when `path` is a regular file carrying an execute bit. On
+    /// non-unix targets the permission model differs enough that "a regular
+    /// file exists here" is the best available proxy.
+    fn is_executable_file(path: &std::path::Path) -> bool {
+        let Ok(meta) = std::fs::metadata(path) else {
+            return false;
+        };
+        if !meta.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            meta.permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
+
+    /// Emit the standard skip notice for a test that needs the real CLI.
+    fn skip_no_coord_cli(test_name: &str) {
+        eprintln!(
+            "SKIP {test_name}: no executable `coord` on PATH, so \
+             `Command::new(\"coord\")` cannot launch — this test asserts on a \
+             real `coord --version` exit status and would report a missing \
+             dependency as a branch regression (#2464)."
+        );
+    }
+
+    /// Create a temp dir containing a `coord` entry, and return the dir.
+    /// `executable` controls whether the mode bits allow execution;
+    /// `directory` makes it a directory instead of a file, so the probe's
+    /// "regular file" requirement is exercised too.
+    fn make_fake_bin_dir(tag: &str, executable: bool, directory: bool) -> PathBuf {
+        let unique = format!(
+            "coord-cli-probe-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = dir.join("coord");
+        if directory {
+            std::fs::create_dir_all(&entry).unwrap();
+        } else {
+            std::fs::write(&entry, "#!/bin/sh\nexit 0\n").unwrap();
+            // Off-unix there are no mode bits to set, so the flag is inert —
+            // bind it so the cross-platform build (#39) stays warning-free.
+            #[cfg(not(unix))]
+            let _ = executable;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = if executable { 0o755 } else { 0o644 };
+                std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+        }
+        dir
+    }
+
+    #[test]
+    fn coord_cli_probe_false_when_path_unset_or_empty() {
+        assert!(!coord_cli_in(None), "an unset PATH cannot resolve anything");
+        assert!(
+            !coord_cli_in(Some(std::ffi::OsString::from(""))),
+            "an empty PATH cannot resolve anything"
+        );
+    }
+
+    #[test]
+    fn coord_cli_probe_finds_an_executable_coord() {
+        let dir = make_fake_bin_dir("hit", true, false);
+        assert!(coord_cli_in(Some(dir.clone().into_os_string())));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn coord_cli_probe_ignores_a_non_executable_file() {
+        // A `coord` that exists but isn't +x can't be spawned either, so the
+        // probe must not report it as available.
+        let dir = make_fake_bin_dir("noexec", false, false);
+        let available = coord_cli_in(Some(dir.clone().into_os_string()));
+        std::fs::remove_dir_all(&dir).ok();
+        #[cfg(unix)]
+        assert!(!available, "a non-executable `coord` is not launchable");
+        #[cfg(not(unix))]
+        let _ = available; // no mode bits to strip off-unix
+    }
+
+    #[test]
+    fn coord_cli_probe_ignores_a_directory_named_coord() {
+        let dir = make_fake_bin_dir("isdir", true, true);
+        let available = coord_cli_in(Some(dir.clone().into_os_string()));
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(!available, "a directory named `coord` is not an executable");
+    }
+
+    #[test]
+    fn coord_cli_probe_scans_every_path_entry() {
+        // The hit is in the *second* entry, behind an empty segment and a
+        // directory that has no `coord` — all three must be walked.
+        let miss = make_fake_bin_dir("miss-a", true, false);
+        std::fs::remove_file(miss.join("coord")).unwrap();
+        let hit = make_fake_bin_dir("hit-b", true, false);
+        let joined = std::env::join_paths([PathBuf::from(""), miss.clone(), hit.clone()]).unwrap();
+        let available = coord_cli_in(Some(joined));
+        std::fs::remove_dir_all(&miss).ok();
+        std::fs::remove_dir_all(&hit).ok();
+        assert!(available, "the probe must scan past earlier misses");
+    }
+
     #[test]
     fn spawn_returns_false_when_busy() {
         let _guard = lock_subprocess_test();
@@ -661,6 +820,10 @@ mod tests {
 
     #[test]
     fn poll_captures_result() {
+        if !coord_cli_on_path() {
+            skip_no_coord_cli("poll_captures_result");
+            return;
+        }
         let _guard = lock_subprocess_test();
         let mut runner = CommandRunner::new();
         runner.spawn(&["--version"]);
@@ -702,6 +865,10 @@ mod tests {
 
     #[test]
     fn spawn_no_inject_for_flag_args() {
+        if !coord_cli_on_path() {
+            skip_no_coord_cli("spawn_no_inject_for_flag_args");
+            return;
+        }
         let _guard = lock_subprocess_test();
         // When args[0] starts with '-' (e.g. --version), no --config injection
         // should happen. We verify by spawning --version and checking it succeeds.
