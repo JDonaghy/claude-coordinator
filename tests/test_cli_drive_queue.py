@@ -2166,6 +2166,149 @@ def test_a_parked_merge_only_race_falls_back_to_an_ordinary_relaunch(
     assert len(merge_only_runs.merge) == 1, merge_only_runs.merge
 
 
+# ── #2535: auto-fire a CI re-run for a merge-queue entry blocked SOLELY on
+# stale-but-green checks with an already-approved review — no drive-queue row
+# needed at all, since this scans the merge queue directly. Fixtures below are
+# deliberately self-contained (not `live_ci_backend`, which fixes the base
+# timestamp to always read FRESH — the opposite of what a staleness scenario
+# needs, and whose fake CI stand-in has no `rerun_for_pr` to assert calls on).
+
+
+def _seed_pending_merge_row(
+    coord_db, issue: int, *, pr_number: int, ci_stale_reruns: int = 0
+) -> None:
+    """A bare `merge_queue` row — no drive-queue counterpart — PENDING, with
+    a PR number (required for `ci_revalidation_candidates` to consider it at
+    all) and an optional pre-spent `ci_stale_reruns` budget."""
+    coord_db.execute(
+        "INSERT INTO merge_queue "
+        "(assignment_id, repo_name, repo_github, branch, target_branch, "
+        " issue_number, issue_title, state, pr_number, enqueued_at, "
+        " ci_stale_reruns) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+        (
+            f"w{issue}", REPO, "john/claude-coordinator", f"work-{issue}", "main",
+            issue, f"issue {issue}", pr_number, time.time(), ci_stale_reruns,
+        ),
+    )
+    coord_db.commit()
+
+
+class _FakeStaleCi:
+    """Stands in for the live backend, like `live_ci_backend`'s `_FakeLiveCi`
+    — but with a `rerun_for_pr` that records its calls (#2182's fake has
+    none, since nothing before #2535 ever needed the tick to trigger one)."""
+
+    is_available = True
+
+    def __init__(self, rerun_calls: list) -> None:
+        self._rerun_calls = rerun_calls
+
+    def list_checks_for_pr(self, repo: str, number: int) -> list:
+        from coord.ci_store import CheckRun
+
+        return [CheckRun(
+            name="build", status="completed", conclusion="success",
+            url="", run_id="1", started_at=100.0, completed_at=160.0,
+        )]
+
+    def expects_checks(self, repo: str, number: int) -> bool:
+        return True
+
+    def rerun_for_pr(self, repo: str, number: int) -> bool:
+        self._rerun_calls.append((repo, number))
+        return True
+
+
+@pytest.fixture
+def stale_ci_backend(monkeypatch):
+    """Fakes the #1851 staleness shape directly: a green check that
+    `started_at` well BEFORE the base's own commit timestamp — the base
+    moved out from under an already-green PR. Returns the list of
+    `(repo, pr_number)` pairs `rerun_for_pr` was called with.
+    """
+    import coord.ci_store as ci_store_module
+    import coord.github_ops as github_ops
+
+    rerun_calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        ci_store_module, "build_ci_store", lambda t, **_kw: _FakeStaleCi(rerun_calls)
+    )
+    # The check above started at 100.0; the base's own commit landed at
+    # 1000.0 — well AFTER, so `_ci_checks_are_stale` reads True.
+    monkeypatch.setattr(
+        github_ops, "get_branch_commit_timestamp", lambda repo, branch: 1000.0
+    )
+    monkeypatch.setattr(github_ops, "get_pr_commit_messages", lambda repo, n: [])
+    monkeypatch.setattr(github_ops, "check_pr_mergeable", lambda repo, n: None)
+    return rerun_calls
+
+
+def test_auto_revalidate_fires_a_ci_rerun_for_an_entry_blocked_solely_on_stale_checks(
+    cli_no_gates, coord_db, stale_ci_backend,
+):
+    """The #2530/#2534 shape, unattended: a PENDING entry with a PR, review
+    already satisfied (`cli_no_gates` disables the review requirement —
+    the same minimal "sole blocker is CI" shape
+    `TestCiRevalidationCandidates` uses in tests/test_merge_queue.py), and
+    CI checks that are green but predate the current base. The tick fires
+    the re-run itself — no drive-queue row, no operator running
+    `coord merge --revalidate` by hand.
+    """
+    _seed_pending_merge_row(coord_db, 2534, pr_number=42)
+
+    result = cli_no_gates("tick")
+    assert result.exit_code == 0, result.output
+
+    assert stale_ci_backend == [("john/claude-coordinator", 42)]
+    row = coord_db.execute(
+        "SELECT ci_stale_reruns, error FROM merge_queue WHERE issue_number = ?",
+        (2534,),
+    ).fetchone()
+    assert row["ci_stale_reruns"] == 1
+    assert row["error"].startswith("CI running:")
+    assert "#2535" in row["error"]
+
+    from coord.audit import query_audit_log
+
+    entries = query_audit_log(event_type="merge_checks_stale_auto_revalidate")["entries"]
+    assert len(entries) == 1
+    assert entries[0]["issue"] == 2534
+    assert entries[0]["repo"] == REPO
+
+
+def test_auto_revalidate_never_exceeds_the_shared_budget(
+    cli_no_gates, coord_db, stale_ci_backend,
+):
+    """Budget already spent (whether by a prior tick or a prior live
+    `coord merge` attempt makes no difference — it's the same counter): no
+    NEW rerun fires, but the exhaustion is still recorded so a human
+    watching the audit trail sees it."""
+    from coord.merge_queue import MAX_CI_STALE_RERUNS
+
+    _seed_pending_merge_row(
+        coord_db, 2534, pr_number=42, ci_stale_reruns=MAX_CI_STALE_RERUNS
+    )
+
+    result = cli_no_gates("tick")
+    assert result.exit_code == 0, result.output
+
+    assert stale_ci_backend == []  # no new rerun triggered
+    row = coord_db.execute(
+        "SELECT ci_stale_reruns FROM merge_queue WHERE issue_number = ?",
+        (2534,),
+    ).fetchone()
+    assert row["ci_stale_reruns"] == MAX_CI_STALE_RERUNS  # unchanged
+
+    from coord.audit import query_audit_log
+
+    entries = query_audit_log(
+        event_type="merge_checks_stale_auto_revalidate_exhausted"
+    )["entries"]
+    assert len(entries) == 1
+    assert entries[0]["issue"] == 2534
+
+
 def test_a_repeatedly_dead_drive_still_reaches_blocked_and_escalates(
     cli, seed, launches, coord_db
 ):

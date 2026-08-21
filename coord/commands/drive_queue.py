@@ -2350,6 +2350,162 @@ def _run_merge_only_candidates(plan: TickPlan, config_path: Path | None) -> None
         click.echo(f"merge-only: {reason}")
 
 
+def _run_auto_revalidate_checks_stale(config_path: Path | None) -> None:
+    """#2535: best-effort auto-fire of the CI-staleness rerun for merge-queue
+    entries blocked SOLELY on stale CI checks against an already-approved
+    review — closing the gap where nothing periodic ever calls a live
+    ``coord merge`` or ``coord merge --revalidate`` on such an entry's
+    behalf, so it just sits until an operator notices ``--dry-run``'s
+    ``checks_stale`` line and reruns by hand (the trigger: #2530's Gate-A
+    PR #2534 sat blocked 2026-08-21 on nothing but 210 unrelated merges
+    having landed since its CI last ran).
+
+    Deliberately narrow — this is NOT ``merge.auto_drain`` reopened (that
+    flag stays ``False`` by design; see ``docs/DRIVE_QUEUE.md`` and the
+    2026-06-07 incident it guards against). This step never merges anything
+    and never touches an entry blocked on review, a real CI failure, or a
+    conflict — it only triggers a ``gh run rerun`` for the exact shape
+    :func:`coord.merge_queue.ci_revalidation_candidates` already scopes
+    ``--revalidate``'s CI arm to (#1851/#1925): ``PENDING``, review
+    approved, smoke fresh, CI checks green but predating the current base.
+
+    BOUNDED, shared with the live path. Draws from the SAME
+    ``ci_stale_reruns``/``MAX_CI_STALE_RERUNS`` budget
+    :func:`coord.merge_queue.process`'s own #2197 auto-rerun already spends
+    from — a live ``coord merge`` attempt and this tick share one ceiling,
+    never two independent ones that could double the effective retry count.
+    An entry that has already exhausted the budget (on a prior live attempt
+    or a prior tick) is left for a human exactly as #2197 already leaves it;
+    this function never fires a further rerun past the cap, though it does
+    keep recording the escalation (below) for as long as the entry stays
+    stuck, so a human watching the audit trail sees it, not just the first
+    tick that hit the ceiling.
+
+    Cost-visible (#1632's posture): every triggered rerun is a real CI run
+    on GitHub's own runners, recorded via :func:`coord.audit.record_audit`
+    (operational tier) so an operator can see the auto-fired count — same
+    spirit as the notifier being advisory rather than silent, never a
+    silent background spend.
+
+    Deliberately NOT behind a new config flag — this reuses exactly the
+    bound and the counter #2197 already established for "an automatic CI
+    rerun triggered by staleness"; the only thing new here is a periodic
+    caller for the case nothing was already about to call ``process()``
+    live. If that judgment turns out to be wrong in practice, the fix is a
+    ``merge.auto_revalidate_stale_ci`` off-switch, not removing the
+    dedicated budget this already shares.
+
+    Best-effort like every other optional step in this tick (conflict
+    reconciliation in ``_auto_drain_tick``, the merge-only fast path above):
+    a failure here must never abort the rest of the tick. Skipped entirely
+    on a thin client — this daemon-host tick is the only place it ever
+    runs, same guard :func:`_fetch_live_ci_gate`/
+    :func:`_run_merge_only_candidates` use.
+    """
+    from coord.board_service import resolve as resolve_board_service  # noqa: PLC0415
+
+    if resolve_board_service() is not None:
+        return
+
+    try:
+        from coord import github_ops as _gh_ops  # noqa: PLC0415
+        from coord import merge_queue as _mq  # noqa: PLC0415
+        from coord.audit import record_audit  # noqa: PLC0415
+        from coord.ci_store import build_ci_store  # noqa: PLC0415
+        from coord.commands._common import _load_config  # noqa: PLC0415
+        from coord.state import load_board as _load_board  # noqa: PLC0415
+
+        cfg = _load_config(config_path)
+        board = _load_board()
+        ci_store = build_ci_store(
+            cfg.ci_store.type, host=cfg.ci_store.host, token_env=cfg.ci_store.token_env,
+        )
+        if ci_store is None or not ci_store.is_available:
+            return
+        items = _mq.load_queue()
+        candidates = _mq.ci_revalidation_candidates(items, board, cfg, ci_store, _gh_ops)
+    except Exception:  # noqa: BLE001 — best-effort, see docstring
+        return
+
+    if not candidates:
+        return
+
+    touched: list = []
+    for entry in candidates:
+        label = f"{entry.repo_name} #{entry.issue_number} ({entry.branch})"
+        if entry.ci_stale_reruns >= _mq.MAX_CI_STALE_RERUNS:
+            # Budget already spent (on a previous tick, or a previous live
+            # `coord merge` attempt) — #2197's own terminal wording is
+            # already on the entry from whichever call last evaluated it.
+            # Nothing new to trigger; still worth one audit row per tick so
+            # an operator watching the trail sees this has been sitting
+            # exhausted, not silently forgotten.
+            record_audit(
+                tier="operational", category="merge",
+                event_type="merge_checks_stale_auto_revalidate_exhausted",
+                actor="drive-queue-tick",
+                summary=(
+                    f"auto-revalidate: {label} still checks_stale after "
+                    f"{entry.ci_stale_reruns}/{_mq.MAX_CI_STALE_RERUNS} "
+                    "auto-reruns — needs a human (`coord merge --revalidate` "
+                    "or `coord merge --only`)"
+                ),
+                repo=entry.repo_name, issue=entry.issue_number,
+                assignment_id=entry.assignment_id,
+                details={
+                    "pr_number": entry.pr_number,
+                    "ci_stale_reruns": entry.ci_stale_reruns,
+                },
+            )
+            continue
+        try:
+            reran = ci_store.rerun_for_pr(entry.repo_github, entry.pr_number)
+        except Exception as exc:  # noqa: BLE001 — one entry's failure must not sink the rest
+            click.echo(
+                f"auto-revalidate: could not re-run CI for {label}: {exc}", err=True
+            )
+            continue
+        entry.ci_stale_reruns += 1
+        entry.error = (
+            f"{_mq.CI_PENDING_PREFIX} re-run triggered for CI checks that "
+            "predate the current base (#2535 auto-revalidate "
+            f"{entry.ci_stale_reruns}/{_mq.MAX_CI_STALE_RERUNS} "
+            f"{'triggered' if reran else 'failed to trigger'})"
+        )
+        touched.append(entry)
+        click.echo(
+            f"auto-revalidate: {'triggered' if reran else 'FAILED to trigger'} "
+            f"a CI re-run for {label} (checks_stale, review already approved) "
+            f"— {entry.ci_stale_reruns}/{_mq.MAX_CI_STALE_RERUNS}"
+        )
+        record_audit(
+            tier="operational", category="merge",
+            event_type="merge_checks_stale_auto_revalidate",
+            actor="drive-queue-tick",
+            summary=(
+                f"auto-revalidate: {'triggered' if reran else 'FAILED to trigger'} "
+                f"a CI re-run for {label} — {entry.ci_stale_reruns}/"
+                f"{_mq.MAX_CI_STALE_RERUNS}"
+            ),
+            repo=entry.repo_name, issue=entry.issue_number,
+            assignment_id=entry.assignment_id,
+            details={"pr_number": entry.pr_number, "reran": reran},
+        )
+
+    if not touched:
+        return
+
+    try:
+        from coord import merge_queue as _mq  # noqa: PLC0415
+
+        fresh = _mq.load_queue()
+        by_id = {e.assignment_id: e for e in touched}
+        merged = [by_id.get(item.assignment_id, item) for item in fresh]
+        _mq.save_queue(merged)
+    except Exception:  # noqa: BLE001 — best-effort persistence; next tick recomputes
+        pass
+
+
 def _run_resume_probe(entry: QueueEntry) -> ProbeResult:
     """Run one entry's ``--resume-when`` probe with a hard timeout.
 
@@ -2729,6 +2885,15 @@ def drive_queue_tick(
         # take, same posture as the launch subprocess further down.
         if not reconcile_only:
             _run_merge_only_candidates(plan, config_path)
+
+        # #2535: independent of the drive-queue plan above (this scans the
+        # MERGE queue directly, not drive-queue rows) — a bounded, best-effort
+        # CI re-run for any entry blocked solely on stale-but-green checks
+        # with an already-approved review. Same `not reconcile_only` posture
+        # as the merge-only fast path just above: a `gh run rerun` is a real
+        # external action that mode promises not to take.
+        if not reconcile_only:
+            _run_auto_revalidate_checks_stale(config_path)
 
         # #2235 Phase 0: record every entry this tick moved INTO or OUT OF
         # `blocked`/`parked`, with the reason the queue stated and — for a
