@@ -2039,23 +2039,40 @@ def _record_smoke_verdict(
             # out-of-band, exiting nonzero. Skipping this branch would leave
             # the common case unguarded, since `build_smoke_briefing` tells
             # every smoke worker to self-record exactly this way.
+            # #2464-review: this must record on EVERY outcome, not just a
+            # downgrade. `_confirmed_pass_verdict` also distinguishes
+            # confirmed-by-a-real-run from merely inconclusive, and that
+            # distinction is the audit trail the module docstring promises
+            # ("the row must say WHY"). Falling through to the generic
+            # "already authoritative — leaving it untouched" log below when
+            # `state == "passed"` would silently discard it: `test_reason`
+            # would keep whatever text was there before this confirmation
+            # ran, so a (potentially 20-minute) run that agreed with the
+            # claim would leave no trace it ever happened — including on the
+            # next reap of the same already-passed parent.
             state, reason = _confirmed_pass_verdict(
                 transition, entry,
                 claim_reason="worker self-recorded via `coord test` (#2217)",
             )
+            record_test_verdict(
+                assignment_id=parent_id,
+                test_state=state,
+                test_reason=reason,
+            )
             if state != "passed":
-                record_test_verdict(
-                    assignment_id=parent_id,
-                    test_state=state,
-                    test_reason=reason,
-                )
                 log.warning(
                     "smoke %s: overturned parent %s's self-recorded "
                     "test_state='passed' to %r on independent evidence "
                     "(#2464).",
                     transition.assignment_id, parent_id, state,
                 )
-                return
+            else:
+                log.info(
+                    "smoke %s: parent %s's self-recorded test_state='passed' "
+                    "— %s",
+                    transition.assignment_id, parent_id, reason,
+                )
+            return
         log.info(
             "smoke %s: parent %s already carries an authoritative test_state="
             "%r (the worker recorded it via `coord test`, #2217) — leaving it "

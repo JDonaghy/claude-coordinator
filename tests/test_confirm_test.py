@@ -369,6 +369,90 @@ class TestConfirmBranch:
         assert result.worktree.exists()
 
 
+# ── locking: two overlapping notify passes must not race on one worktree ──────
+#
+# #2464-review: `/notify`'s own lock (`coord/serve_app.py`'s `post_notify`)
+# gives up after 120s and runs the whole drain UNLOCKED, and a confirmation can
+# now legitimately run far longer than that. So two confirmations for the same
+# (repo, branch) really can overlap, and `git worktree add --force --detach`
+# does not protect against a second process reusing the identical path.
+# `confirm_branch` must serialize on a per-(repo, branch) lock instead.
+
+
+class TestConfirmBranchLocking:
+    def test_lock_path_is_distinct_from_the_worktree_path(self) -> None:
+        # Taking `flock` on a path `git worktree add` is about to create (and
+        # a failed run may leave behind) is not a stable thing to lock
+        # against.
+        assert ct.confirm_lock_path("api", BRANCH) != ct.confirm_worktree_path(
+            "api", BRANCH,
+        )
+
+    def test_a_held_lock_makes_a_second_confirmation_inconclusive_not_a_race(
+        self, checkout: Path,
+    ) -> None:
+        """Simulate a second notify pass finding the confirm-worktree lock
+        already held by an in-flight confirmation for the same branch. It
+        must step aside — INCONCLUSIVE, never a refutation — and it must
+        never touch the worktree lifecycle at all (no fetch, no checkout, no
+        build/test command), which is what proves there is no race."""
+        lock = ct.FileLock(ct.confirm_lock_path("api", BRANCH))
+        lock.acquire(timeout=None)
+        try:
+            runner = _ScriptedRunner(default=_FakeProc(0))
+            # timeout=0: nothing left in the shared deadline to wait for the
+            # lock, so this must fail fast rather than block the test.
+            result = ct.confirm_branch(
+                "api", BRANCH, _StubConfig(repo_path=str(checkout)),
+                runner=runner, timeout=0,
+            )
+        finally:
+            lock.release()
+
+        assert result.kind == KIND_SETUP
+        assert result.inconclusive is True
+        assert result.refuted is False
+        assert "already in progress" in result.reason
+        assert runner.calls == [], (
+            "a confirmation that could not take the lock must never run the "
+            "build/test command — that would be the exact race this lock "
+            "exists to prevent"
+        )
+
+    def test_a_lock_held_for_a_different_branch_does_not_block_this_one(
+        self, checkout: Path,
+    ) -> None:
+        other_lock = ct.FileLock(ct.confirm_lock_path("api", "some-other-branch"))
+        other_lock.acquire(timeout=None)
+        try:
+            runner = _ScriptedRunner(default=_FakeProc(0))
+            result = ct.confirm_branch(
+                "api", BRANCH, _StubConfig(repo_path=str(checkout)), runner=runner,
+            )
+        finally:
+            other_lock.release()
+
+        assert result.confirmed
+
+    def test_the_lock_is_released_after_a_run_so_a_later_confirmation_can_proceed(
+        self, checkout: Path,
+    ) -> None:
+        """Guards against a leaked lock: every return path inside
+        `confirm_branch` (success, refutation, inconclusive) must release the
+        lock, or the very next confirmation of the same branch would hang."""
+        config = _StubConfig(repo_path=str(checkout))
+
+        first = ct.confirm_branch(
+            "api", BRANCH, config, runner=_ScriptedRunner(default=_FakeProc(1)),
+        )
+        assert first.refuted
+
+        second = ct.confirm_branch(
+            "api", BRANCH, config, runner=_ScriptedRunner(default=_FakeProc(0)),
+        )
+        assert second.confirmed
+
+
 # ── the switch ───────────────────────────────────────────────────────────────
 
 
@@ -550,6 +634,66 @@ class TestSmokeVerdictIsConfirmed:
             "a worker's self-recorded pass is authoritative against everything "
             "EXCEPT a contradicting run; got "
             f"{row['test_state']!r}"
+        )
+
+    def test_self_recorded_pass_confirmed_by_a_real_run_is_annotated(
+        self, coord_db, tmp_path: Path
+    ) -> None:
+        """#2464-review: a self-recorded pass genuinely confirmed by a real
+        run must have that outcome PERSISTED, not silently discarded because
+        `test_state` didn't change. Before the fix this fell through to the
+        generic "already authoritative — leaving it untouched" branch and
+        `record_test_verdict` was never even called, so the confirmation's own
+        reason never reached the row — indistinguishable from a confirmation
+        that never ran at all.
+        """
+        from coord.state import record_test_verdict
+
+        self._record_work()
+        self._record_smoke()
+        record_test_verdict(assignment_id="work-1", test_state="passed")
+
+        transition, record, entry = self._transition(tmp_path, None)
+        confirm = self._reap(
+            transition, record, entry,
+            ct.ConfirmationResult(kind=KIND_OK, reason="re-ran the suite and it passed"),
+        )
+
+        confirm.assert_called_once()
+        row = self._row()
+        assert row["test_state"] == "passed"
+        assert "confirmed" in (row["test_reason"] or "").lower(), (
+            "a confirmed self-recorded pass must say so in test_reason rather "
+            f"than leaving whatever text (or nothing) was there before: "
+            f"{row['test_reason']!r}"
+        )
+
+    def test_self_recorded_pass_inconclusive_confirmation_is_annotated(
+        self, coord_db, tmp_path: Path
+    ) -> None:
+        """Same gap as above, on the INCONCLUSIVE arm: the row must say
+        UNCONFIRMED, not silently keep stale (or no) reason text."""
+        from coord.state import record_test_verdict
+
+        self._record_work()
+        self._record_smoke()
+        record_test_verdict(assignment_id="work-1", test_state="passed")
+
+        transition, record, entry = self._transition(tmp_path, None)
+        confirm = self._reap(
+            transition, record, entry,
+            ct.ConfirmationResult(
+                kind=KIND_SETUP, reason="no local checkout for 'api' on this machine",
+            ),
+        )
+
+        confirm.assert_called_once()
+        row = self._row()
+        assert row["test_state"] == "passed"
+        assert "UNCONFIRMED" in (row["test_reason"] or ""), (
+            "an inconclusive confirmation of a self-recorded pass must still "
+            f"say nobody checked, not silently discard the attempt: "
+            f"{row['test_reason']!r}"
         )
 
     def test_confirmed_pass_is_recorded_passed(

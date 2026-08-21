@@ -122,6 +122,12 @@ from coord.revalidate import (
     local_repo_dir,
 )
 
+# #2464-review: guards the confirm-worktree lifecycle against two overlapping
+# notify passes (see `confirm_lock_path` below for the full hazard this
+# closes). Not a deferred/cyclic import — `coord.filelock` only reaches into
+# the stdlib, and `coord.drive` already imports it the same way.
+from coord.filelock import FileLock, LockBusy
+
 #: Ceiling on one confirmation run — **the build and the suite share it**, it is
 #: not per-command. Deliberately tighter than
 #: :data:`coord.revalidate.DEFAULT_TIMEOUT_SECONDS` (30 min): that one bounds an
@@ -354,6 +360,44 @@ def confirm_worktree_path(repo_name: str, branch: str) -> Path:
     return COORD_DIR / "confirm-worktrees" / safe
 
 
+def confirm_lock_path(repo_name: str, branch: str) -> Path:
+    """Per-``(repo, branch)`` lock guarding one confirm-worktree's lifecycle.
+
+    #2464-review: ``/notify``'s own lock (``coord/serve_app.py``'s
+    ``post_notify``) waits up to 120s for ``notify.lock`` and then, on
+    ``LockBusy``, **runs the whole drain unlocked anyway** — a reasonable
+    fallback when a drain finished in seconds, but a confirmation can now
+    legitimately run up to :data:`CONFIRM_DEFAULT_TIMEOUT_SECONDS`. Two notify
+    passes really can overlap on two threads (see ``_pass_state`` above), and
+    if both happen to confirm the *same* branch — a human's manual ``coord
+    notify`` landing mid-drain, ``coord drive``'s stall nudge, another
+    machine's daemon-routed call — they would otherwise race on the identical
+    :func:`confirm_worktree_path`. ``git worktree add --force --detach`` does
+    **not** protect against this: ``--force`` is specifically what lets it
+    proceed onto a path another process already has checked out, so one
+    process's ``_remove_worktree``/checkout can execute while the other is
+    mid build/test — a filesystem race that can fail an in-progress command
+    for reasons that have nothing to do with the branch, exactly the
+    ``REFUTED``-on-a-working-PR failure the module docstring's "FAIL
+    DIRECTION" section forbids.
+
+    So ``confirm_branch`` takes this lock for the whole worktree lifecycle
+    (remove → add → build → test → remove) before touching anything on disk.
+    A second confirmation for the same ``(repo, branch)`` waits its turn
+    instead of racing; a confirmation of a *different* branch (or a different
+    repo) is unaffected — this is a per-key lock, not a repo-wide one.
+
+    Deliberately a **separate** lock file from :func:`confirm_worktree_path`
+    itself: taking ``flock`` on a path that ``git worktree add`` is about to
+    create (and a failed run may leave behind) is not a stable thing to lock
+    against, and would tie the lock's lifetime to the worktree's.
+    """
+    from coord.state import COORD_DIR  # noqa: PLC0415
+
+    safe = f"{repo_name}-{branch}".replace("/", "-")
+    return COORD_DIR / "confirm-worktrees" / f"{safe}.lock"
+
+
 def branch_touched_files(repo_dir: Path, branch: str, base_branch: str) -> list[str]:
     """Paths the branch changes vs its merge-base with *base_branch*.
 
@@ -558,135 +602,176 @@ def confirm_branch(
         )
 
     wt_path = confirm_worktree_path(repo_name, branch)
-    _remove_worktree(repo_dir, wt_path)
-    wt_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # #2464-review: the whole worktree lifecycle below (remove -> add ->
+    # build -> test -> remove) must never run twice concurrently for the same
+    # (repo, branch) — see `confirm_lock_path` for the full hazard. `/notify`'s
+    # own lock gives up after 120s and runs unlocked, so this is the actual
+    # guarantee. Bounded by whatever is left of the shared deadline: lock
+    # contention that cannot clear before the deadline is exactly as
+    # informative as a run that cannot finish before it, so it gets the same
+    # answer — inconclusive, never a refutation (the module's "FAIL
+    # DIRECTION" invariant).
+    lock = FileLock(confirm_lock_path(repo_name, branch))
+    try:
+        lock.acquire(timeout=max(0.0, deadline - clock()))
+    except LockBusy:
+        return ConfirmationResult(
+            kind=KIND_SETUP,
+            reason=(
+                f"another confirmation for {repo_name}/{branch} is already "
+                "in progress on this machine — the confirm-worktree lifecycle "
+                "is not safe to run twice concurrently, so this one steps "
+                "aside rather than racing it; falling back to the worker's "
+                "own claim (#2464-review)"
+            ),
+        )
+    except OSError as exc:
+        return ConfirmationResult(
+            kind=KIND_SETUP,
+            reason=(
+                f"could not take the confirmation lock for {repo_name}/"
+                f"{branch}: {exc}"
+            ),
+        )
 
     try:
-        fetched = _run(["git", "fetch", "origin", "--prune"], cwd=repo_dir)
-    except (subprocess.SubprocessError, OSError) as exc:
-        return ConfirmationResult(
-            kind=KIND_SETUP, reason=f"git fetch failed: {exc}",
-        )
-    if fetched.returncode != 0:
-        return ConfirmationResult(
-            kind=KIND_SETUP,
-            reason=f"git fetch failed: {(fetched.stderr or '').strip()}",
-        )
+        _remove_worktree(repo_dir, wt_path)
+        wt_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # #2464-review: is THIS machine allowed to judge THIS diff? Checked after
-    # the fetch (the diff needs fresh `origin/*` refs) and before the checkout
-    # (a wrong-hardware confirmation should not even pay for a worktree).
-    missing_caps = unmet_confirmation_capabilities(
-        config, repo_name, branch, repo_dir,
-    )
-    if missing_caps:
-        return ConfirmationResult(
-            kind=KIND_SETUP,
-            reason=(
-                f"this machine does not advertise {', '.join(missing_caps)}, "
-                f"which `smoke_tests.capability_rules` require for the files "
-                f"origin/{branch} touches — confirming here would judge the "
-                "branch on hardware the Test stage would never have routed it "
-                "to, so nothing is concluded (#2464)"
-            ),
-        )
-
-    added = _run(
-        ["git", "worktree", "add", "--force", "--detach",
-         str(wt_path), f"origin/{branch}"],
-        cwd=repo_dir,
-    )
-    if added.returncode != 0:
-        # Most often: the worker never pushed, so `origin/<branch>` does not
-        # exist. Inconclusive rather than a refutation — "we could not find the
-        # branch" is not "the branch is red". The pushed-nothing case has its
-        # own detector (`push_failure_reason`, #1797).
-        return ConfirmationResult(
-            kind=KIND_SETUP,
-            reason=(
-                f"could not check out origin/{branch} for confirmation: "
-                f"{(added.stderr or '').strip()}"
-            ),
-        )
-
-    run_cmd = runner or _shell_runner
-
-    def _left() -> int:
-        """Whole seconds left on the shared build+suite deadline (min 1)."""
-        return max(1, int(deadline - clock()))
-
-    build_command = getattr(repo_cfg, "build_command", None)
-    if build_command:
-        echo(f"    confirming build: {build_command}")
         try:
-            built = run_cmd(build_command, wt_path, _left())
+            fetched = _run(["git", "fetch", "origin", "--prune"], cwd=repo_dir)
+        except (subprocess.SubprocessError, OSError) as exc:
+            return ConfirmationResult(
+                kind=KIND_SETUP, reason=f"git fetch failed: {exc}",
+            )
+        if fetched.returncode != 0:
+            return ConfirmationResult(
+                kind=KIND_SETUP,
+                reason=f"git fetch failed: {(fetched.stderr or '').strip()}",
+            )
+
+        # #2464-review: is THIS machine allowed to judge THIS diff? Checked
+        # after the fetch (the diff needs fresh `origin/*` refs) and before
+        # the checkout (a wrong-hardware confirmation should not even pay for
+        # a worktree).
+        missing_caps = unmet_confirmation_capabilities(
+            config, repo_name, branch, repo_dir,
+        )
+        if missing_caps:
+            return ConfirmationResult(
+                kind=KIND_SETUP,
+                reason=(
+                    f"this machine does not advertise {', '.join(missing_caps)}, "
+                    f"which `smoke_tests.capability_rules` require for the files "
+                    f"origin/{branch} touches — confirming here would judge the "
+                    "branch on hardware the Test stage would never have routed "
+                    "it to, so nothing is concluded (#2464)"
+                ),
+            )
+
+        added = _run(
+            ["git", "worktree", "add", "--force", "--detach",
+             str(wt_path), f"origin/{branch}"],
+            cwd=repo_dir,
+        )
+        if added.returncode != 0:
+            # Most often: the worker never pushed, so `origin/<branch>` does
+            # not exist. Inconclusive rather than a refutation — "we could
+            # not find the branch" is not "the branch is red". The
+            # pushed-nothing case has its own detector (`push_failure_reason`,
+            # #1797).
+            return ConfirmationResult(
+                kind=KIND_SETUP,
+                reason=(
+                    f"could not check out origin/{branch} for confirmation: "
+                    f"{(added.stderr or '').strip()}"
+                ),
+            )
+
+        run_cmd = runner or _shell_runner
+
+        def _left() -> int:
+            """Whole seconds left on the shared build+suite deadline (min 1)."""
+            return max(1, int(deadline - clock()))
+
+        build_command = getattr(repo_cfg, "build_command", None)
+        if build_command:
+            echo(f"    confirming build: {build_command}")
+            try:
+                built = run_cmd(build_command, wt_path, _left())
+            except subprocess.TimeoutExpired:
+                return ConfirmationResult(
+                    kind=KIND_TIMEOUT,
+                    reason=(
+                        f"confirmation build timed out after {timeout}s — a "
+                        "suite that did not finish says nothing about the "
+                        "branch"
+                    ),
+                    command=build_command,
+                    worktree=wt_path,
+                )
+            if built.returncode != 0:
+                return _classify_failure(
+                    "build",
+                    built.returncode,
+                    (built.stdout or "") + "\n" + (built.stderr or ""),
+                    wt_path,
+                    build_command,
+                )
+
+        if deadline - clock() <= 0:
+            # The build consumed the whole shared window. Same answer as a
+            # suite timeout — inconclusive — but reported without spending
+            # another second of the drain's lock hold on a run that cannot
+            # finish.
+            return ConfirmationResult(
+                kind=KIND_TIMEOUT,
+                reason=(
+                    f"the confirmation build used the whole {timeout}s "
+                    "window, leaving no time to run the suite — nothing was "
+                    "learned about the branch"
+                ),
+                command=test_command,
+                worktree=wt_path,
+            )
+
+        echo(f"    confirming tests: {test_command}")
+        try:
+            tested = run_cmd(test_command, wt_path, _left())
         except subprocess.TimeoutExpired:
             return ConfirmationResult(
                 kind=KIND_TIMEOUT,
                 reason=(
-                    f"confirmation build timed out after {timeout}s — a suite "
-                    "that did not finish says nothing about the branch"
+                    f"confirmation suite timed out after {timeout}s — a "
+                    "suite that did not finish says nothing about the branch"
                 ),
-                command=build_command,
+                command=test_command,
                 worktree=wt_path,
             )
-        if built.returncode != 0:
+        if tested.returncode != 0:
             return _classify_failure(
-                "build",
-                built.returncode,
-                (built.stdout or "") + "\n" + (built.stderr or ""),
+                "suite",
+                tested.returncode,
+                (tested.stdout or "") + "\n" + (tested.stderr or ""),
                 wt_path,
-                build_command,
+                test_command,
             )
 
-    if deadline - clock() <= 0:
-        # The build consumed the whole shared window. Same answer as a suite
-        # timeout — inconclusive — but reported without spending another
-        # second of the drain's lock hold on a run that cannot finish.
+        # Green, and observed rather than reported. Clean up: nothing to
+        # inspect.
+        _remove_worktree(repo_dir, wt_path)
         return ConfirmationResult(
-            kind=KIND_TIMEOUT,
+            kind=KIND_OK,
             reason=(
-                f"the confirmation build used the whole {timeout}s window, "
-                "leaving no time to run the suite — nothing was learned about "
-                "the branch"
+                f"independently re-ran `{test_command}` at origin/{branch} "
+                "and it passed"
             ),
             command=test_command,
-            worktree=wt_path,
+            returncode=0,
         )
-
-    echo(f"    confirming tests: {test_command}")
-    try:
-        tested = run_cmd(test_command, wt_path, _left())
-    except subprocess.TimeoutExpired:
-        return ConfirmationResult(
-            kind=KIND_TIMEOUT,
-            reason=(
-                f"confirmation suite timed out after {timeout}s — a suite that "
-                "did not finish says nothing about the branch"
-            ),
-            command=test_command,
-            worktree=wt_path,
-        )
-    if tested.returncode != 0:
-        return _classify_failure(
-            "suite",
-            tested.returncode,
-            (tested.stdout or "") + "\n" + (tested.stderr or ""),
-            wt_path,
-            test_command,
-        )
-
-    # Green, and observed rather than reported. Clean up: nothing to inspect.
-    _remove_worktree(repo_dir, wt_path)
-    return ConfirmationResult(
-        kind=KIND_OK,
-        reason=(
-            f"independently re-ran `{test_command}` at origin/{branch} and it "
-            "passed"
-        ),
-        command=test_command,
-        returncode=0,
-    )
+    finally:
+        lock.release()
 
 
 __all__ = [
@@ -701,6 +786,7 @@ __all__ = [
     "begin_confirmation_pass",
     "branch_touched_files",
     "confirm_branch",
+    "confirm_lock_path",
     "confirm_worktree_path",
     "confirmation_enabled",
     "confirmation_timeout",
