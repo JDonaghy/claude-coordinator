@@ -1354,6 +1354,7 @@ def _apply_cordons(  # noqa: PLR0912 — one linear apply-the-plan pass
     outcome.cooling_seconds = plan.cooling_seconds
     outcome.collateral_spared = list(plan.collateral_spared)
     outcome.blocked_behind = plan.blocked_behind
+    outcome.stuck_in_cooldown = list(plan.stuck_in_cooldown)
     if plan.released is not None:
         outcome.released = plan.released.to_dict()
         # stderr as well as stdout: on the timer host this line IS the
@@ -2148,8 +2149,18 @@ def release_cordon(
             )
         )
         return
+    # #2490: hosts the newest propagate run flagged as behind, idle, and
+    # left uncordoned only because the #2240 cooldown is suppressing new
+    # cordons. These are exactly the machines an operator would otherwise
+    # have to notice by hand (`coord status` showing `online • idle` on a
+    # host that's actually stuck on an old version) — surface them even when
+    # `active` is empty, since a stuck host is by definition NOT cordoned.
+    stuck_hosts, stuck_target = _stuck_hosts_from_journal()
     if not active:
-        click.echo("no machines are cordoned — the fleet is free to take work")
+        if stuck_hosts:
+            _echo_stuck_hosts(stuck_hosts, stuck_target)
+        else:
+            click.echo("no machines are cordoned — the fleet is free to take work")
         return
     for name, record in sorted(active.items()):
         remaining = max(0.0, record.expires_at - now) / 60.0
@@ -2180,6 +2191,8 @@ def release_cordon(
             f"`coord release propagate` releases it by itself after "
             f"{rc.DEFAULT_MAX_DEFERRALS}."
         )
+    if stuck_hosts:
+        _echo_stuck_hosts(stuck_hosts, stuck_target)
     click.echo(
         f"\nclear one with `coord release cordon --clear <machine>` "
         f"(default lifetime {rc.DEFAULT_TTL_SECONDS / 60:.0f}m — a cordon "
@@ -2195,6 +2208,59 @@ def _read_propagation_records() -> list[dict]:
         return rp.read_records(_state_dir())
     except Exception:  # noqa: BLE001 — see every caller: never load-bearing
         return []
+
+
+def _stuck_hosts_from_journal() -> tuple[list[str], str | None]:
+    """Hosts the NEWEST propagate run flagged as stuck-in-cooldown (#2490).
+
+    ``CordonPlan.stuck_in_cooldown`` (mirrored onto ``CordonOutcome`` and
+    journalled under a run's ``cordons`` key) names behind, idle hosts a run
+    left uncordoned only because the #2240 deadlock-release cooldown is
+    still active — the gap the issue is about: nothing gave such a host a
+    signal or a path back to rolling for up to the cooldown's full length.
+
+    Only the single newest record counts, deliberately: this is a
+    point-in-time reading ("as of the last tick"), and a host named in an
+    older record may since have gone busy, rolled, or had its cooldown
+    lift — reporting it from a stale record would be a false alarm, which is
+    exactly the kind of noise this fleet already has too much of. No
+    journal (a thin client, or a host that has never run propagate)
+    degrades to nothing rather than raising — mirrors every other reader of
+    this journal in this module.
+    """
+    try:
+        records = _read_propagation_records()
+    except Exception:  # noqa: BLE001 — never load-bearing
+        return [], None
+    if not records:
+        return [], None
+    newest = records[-1]
+    if not isinstance(newest, dict):
+        return [], None
+    cordons = newest.get("cordons")
+    if not isinstance(cordons, dict):
+        return [], None
+    stuck = cordons.get("stuck_in_cooldown") or []
+    if not isinstance(stuck, list):
+        return [], None
+    target = newest.get("target_version")
+    return [str(h) for h in stuck], (str(target) if target else None)
+
+
+def _echo_stuck_hosts(stuck_hosts: list[str], stuck_target: str | None) -> None:
+    """The #2490 notice both branches of ``release_cordon`` share.
+
+    One line per host, each naming its own override command — the format
+    the issue itself asks for: "precision: 18m behind v0.5.192, idle, cordon
+    suppressed by cooldown (#2240) — consider `coord agent update --machine
+    precision`."
+    """
+    version = f"v{stuck_target}" if stuck_target else "the release"
+    click.echo(f"\n! STUCK (#2490): behind {version}, idle, cordon suppressed "
+               "by the #2240 deadlock-release cooldown — no automatic path "
+               "back to rolling until it lifts on its own:")
+    for host in sorted(stuck_hosts):
+        click.echo(f"  ! {host}: consider `coord agent update --machine {host}`")
 
 
 @release_group.command(

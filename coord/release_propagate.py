@@ -1294,6 +1294,14 @@ def render_record(record: PropagationRecord | Mapping[str, Any]) -> list[str]:
             "    cordons held off (post-release cooldown, #2240): "
             f"{float(cordons['cooling_seconds']) / 60.0:.0f}m left"
         )
+    # #2490: name the hosts that were behind and idle but left uncordoned
+    # purely because of the cooldown above — the gap that let `precision`
+    # sit stuck for 30 minutes with no automatic path back to rolling.
+    if cordons.get("stuck_in_cooldown"):
+        lines.append(
+            "    ! STUCK (idle, behind, cooldown-suppressed, #2490): "
+            + ", ".join(cordons["stuck_in_cooldown"])
+        )
     for esc in cordons.get("escalated") or []:
         lines.append(f"    ! {esc.get('message') or esc}")
     for err in cordons.get("errors") or []:

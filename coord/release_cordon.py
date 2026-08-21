@@ -658,6 +658,17 @@ class CordonPlan:
     #: exactly when `collateral_spared` is non-empty. The single fact that
     #: would have turned a 40-minute puzzle into one line of output.
     blocked_behind: str | None = None
+    #: #2490: hosts that are BEHIND *target_version*, have no busy signal of
+    #: their own this run (idle), and are not being cordoned only because an
+    #: unexpired deadlock-release cooldown is suppressing all new cordons —
+    #: set exactly when ``cooling_seconds > 0``. This is the gap the issue
+    #: names: a host in this state has no automatic path back to rolling for
+    #: up to the cooldown's full length, and nothing surfaced that it was
+    #: sitting there idle, behind, and unflagged. Reported separately from
+    #: ``collateral_spared`` (blocked behind a busy daemon host — a different
+    #: reason a behind host stays uncordoned) so each surface can name the
+    #: actual cause instead of collapsing both into "not cordoned".
+    stuck_in_cooldown: tuple[str, ...] = ()
 
     @property
     def empty(self) -> bool:
@@ -668,6 +679,7 @@ class CordonPlan:
             or self.expired
             or self.released
             or self.collateral_spared
+            or self.stuck_in_cooldown
         )
 
     def to_dict(self) -> dict:
@@ -681,6 +693,7 @@ class CordonPlan:
             "cooling_seconds": self.cooling_seconds,
             "collateral_spared": list(self.collateral_spared),
             "blocked_behind": self.blocked_behind,
+            "stuck_in_cooldown": list(self.stuck_in_cooldown),
         }
 
     def render(self) -> list[str]:
@@ -717,6 +730,13 @@ class CordonPlan:
                 f"{self.cooling_seconds / 60.0:.0f}m — a recent deadlock "
                 "release (#2240) is still letting the fleet work; nothing was "
                 "cordoned this run"
+            )
+        for host in self.stuck_in_cooldown:
+            lines.append(
+                f"  ! STUCK: {host} is behind and idle, but cordoning is "
+                "suppressed by the deadlock-release cooldown above (#2490) — "
+                f"it has no automatic path back to rolling until the cooldown "
+                f"lifts. Consider `coord agent update --machine {host}`."
             )
         for esc in self.escalations:
             lines.append(f"  ! {esc.message}")
@@ -880,6 +900,21 @@ def plan_cordons(
     pressure = pressure or DeferralPressure()
     cooling = pressure.cooling_for(now, release_cooldown)
     if cooling > 0:
+        # #2490: a behind host with no busy signal of its own has nothing
+        # left holding it back except this cooldown — it is idle, it is
+        # behind, and it will sit exactly like that until the cooldown
+        # lifts (up to `release_cooldown` seconds) with no cordon and,
+        # before this, no signal anywhere that it needs attention.
+        # `collateral` hosts are excluded: those are uncordoned for an
+        # unrelated reason (blocked behind a busy daemon host) that already
+        # has its own name (`collateral_spared`/`blocked_behind`).
+        stuck = tuple(
+            sorted(
+                host
+                for host in (drift.behind - collateral)
+                if not (busy_reasons or {}).get(host)
+            )
+        )
         return CordonPlan(
             uncordon=to_uncordon,
             expired=expired,
@@ -887,6 +922,7 @@ def plan_cordons(
             unknown=tuple(sorted(drift.undecided & set(live))),
             collateral_spared=tuple(sorted(collateral)),
             blocked_behind=blocked_behind,
+            stuck_in_cooldown=stuck,
         )
     if max_deferrals > 0 and pressure.consecutive >= max_deferrals:
         return CordonPlan(
@@ -984,6 +1020,12 @@ class CordonOutcome:
     #: #2176: the daemon host `collateral_spared` was spared on account of.
     #: Mirrors `CordonPlan.blocked_behind`.
     blocked_behind: str | None = None
+    #: #2490: mirrors `CordonPlan.stuck_in_cooldown` — behind, idle hosts this
+    #: run left uncordoned only because the #2240 deadlock cooldown is still
+    #: active. Journalled (not just printed) so a read-only surface like
+    #: `coord status` can flag them without recomputing `plan_cordons` itself
+    #: — see `coord.commands.status._stuck_in_cooldown_hosts`.
+    stuck_in_cooldown: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -999,4 +1041,5 @@ class CordonOutcome:
             "max_deferrals": self.max_deferrals,
             "collateral_spared": list(self.collateral_spared),
             "blocked_behind": self.blocked_behind,
+            "stuck_in_cooldown": list(self.stuck_in_cooldown),
         }
