@@ -154,6 +154,7 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         context_menu_layout: std::cell::RefCell::new(Vec::new()),
         fleet_health_overlay_open: false,
         pending_drive_queue_after: None,
+        pending_gate_a_changes_note: None,
         queue_sel: 0,
         queue_scroll: 0,
         queue_sort: None,

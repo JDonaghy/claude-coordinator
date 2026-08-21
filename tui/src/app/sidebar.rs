@@ -241,6 +241,10 @@ impl CoordApp {
             // while open (the drive-queue overlay itself was retired by
             // #1868 — the Queue panel is the one queue surface now).
             || self.pending_drive_queue_after.is_some()
+            // #2500: the "What needs to change?" Gate-A note prompt owns
+            // ALL input while open, same posture as the drive-queue one
+            // just above.
+            || self.pending_gate_a_changes_note.is_some()
     }
 
     /// an `action_id` of the form `"toolbar:<verb>"` resolved by
