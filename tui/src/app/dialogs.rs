@@ -84,6 +84,29 @@ impl CoordApp {
                 "send-to-pipeline",
                 "Send to Pipeline",
             ));
+            // #2494: "Add to drive queue" — `coord drive-queue add <repo>
+            // <issue>`, this repo's own recommended dispatch path
+            // (docs/DRIVE_QUEUE.md) and a genuinely different mechanism from
+            // "Send to Pipeline" above (`coord track`, the label-based `coord
+            // plan`/`approve` flow, with no drive-queue equivalent). Reuses
+            // the exact same menu-item/dispatch machinery the Pipeline row's
+            // `PipelineRowLifecycle::New` block already offers below —
+            // `pipeline_menu_repo_issue` (the shared dispatch-side resolver
+            // behind the `"drive-queue-add"`/`"drive-queue-row-remove"`/
+            // `"drive-queue-add-on:<machine>"` action ids) already treats
+            // `BoardRow` and `PipelineRow` targets identically, so no new
+            // action ids or dispatch plumbing are needed here — only this
+            // menu-content wiring. `offer_add: true` (queue-or-update, safe
+            // to invoke more than once) gated on the same Backlog-only
+            // lifecycle as "Send to Pipeline": queuing something already
+            // in-flight doesn't make sense. Swaps to "Remove from drive
+            // queue" for a row somehow already queued (e.g. added via `coord
+            // drive-queue add` directly before ever visiting the TUI).
+            items.extend(self.drive_queue_menu_items_for_pipeline_row(
+                issue_number,
+                repo_name,
+                true,
+            ));
             items.push(ContextMenuItem::separator());
         }
         // #661: the Board has NO direct dispatch. Choosing HOW to run an issue
@@ -1289,12 +1312,27 @@ impl CoordApp {
                 tracking_issue,
                 milestone_title,
                 milestone_number,
-            } => self.context_menu_items_for_milestone_header(
-                repo_name,
-                *tracking_issue,
-                milestone_title,
-                *milestone_number,
-            ),
+            } => {
+                // #2494: look up the epic tracking issue's own labels from
+                // the cached open-issues list so the menu can gate "Send to
+                // Pipeline" on whether it's already `coord`-labeled. No
+                // cache row (e.g. a stale/offline board) → empty labels,
+                // which offers the item — worst case a harmless re-`track`.
+                let labels: &[String] = self
+                    .data
+                    .open_issues
+                    .iter()
+                    .find(|oi| oi.repo_name == *repo_name && oi.number == *tracking_issue)
+                    .map(|oi| oi.labels.as_slice())
+                    .unwrap_or(&[]);
+                self.context_menu_items_for_milestone_header(
+                    repo_name,
+                    *tracking_issue,
+                    milestone_title,
+                    *milestone_number,
+                    labels,
+                )
+            }
             ContextMenuTarget::TerminalRow { .. } => self.context_menu_items_for_terminal_row(),
             ContextMenuTarget::PlansStub { repo_name, milestone } => {
                 self.context_menu_items_for_plans_stub(repo_name.as_deref(), milestone.as_ref())
@@ -6091,6 +6129,16 @@ impl CoordApp {
                 repo_name: Some(repo),
                 ..
             } => (repo.clone(), *num),
+            // #2494: the Plans-panel epic-row menu's "Send to Pipeline"
+            // reuses this same entry point (`coord track <repo>
+            // <tracking_issue>` is identical to the Board row's `track`
+            // call — the epic's own issue number just arrives via a
+            // different target shape).
+            ContextMenuTarget::MilestoneHeader {
+                repo_name,
+                tracking_issue,
+                ..
+            } => (repo_name.clone(), *tracking_issue),
             _ => {
                 self.push_toast(
                     &format!("{} unavailable", toast_title),
