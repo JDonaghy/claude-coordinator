@@ -321,6 +321,8 @@ mod tests {
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }
     }
 

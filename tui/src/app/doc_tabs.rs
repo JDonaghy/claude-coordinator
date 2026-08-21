@@ -2547,6 +2547,8 @@ mod tests {
                 state: "open".to_string(),
                 milestone_number: None,
                 milestone_title: None,
+                body_truncated: false,
+                body_len: None,
             }],
             ..BoardData::default()
         };
@@ -2574,6 +2576,8 @@ mod tests {
                     state: "open".to_string(),
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 })
                 .collect(),
             pipeline_repos: vec![(
@@ -2625,6 +2629,8 @@ mod tests {
                 state: "open".to_string(),
                 milestone_number: None,
                 milestone_title: None,
+                body_truncated: false,
+                body_len: None,
             }],
             pipeline_repos: vec![(
                 "claude-coordinator".to_string(),

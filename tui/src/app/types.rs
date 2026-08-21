@@ -2220,6 +2220,15 @@ pub(crate) struct PipelineIssue {
     pub(crate) all_labels: Vec<String>,
     /// True when the issue is closed on GitHub (`state == "closed"`).
     pub(crate) is_closed: bool,
+    /// #2497: true when `body` is a wire preview, not the full text — mirrors
+    /// `OpenIssue::body_truncated` (this struct is built from `OpenIssue` in
+    /// `pipeline_issues_from_cache`). Closed (non-epic) issues get their body
+    /// dropped to 0 chars by `board_wire.bound_issue_row`; the Issue tab uses
+    /// this to arm a `GET /issue/{repo}/{number}` hydration fetch.
+    pub(crate) body_truncated: bool,
+    /// #2497: original body length before truncation, present only when
+    /// `body_truncated` is true. Mirrors `OpenIssue::body_len`.
+    pub(crate) body_len: Option<i64>,
 }
 
 #[derive(Default)]
@@ -2342,6 +2351,19 @@ pub(crate) struct OpenIssue {
     /// #406: GitHub milestone title (e.g. "v0.5").  `None` when no milestone.
     #[serde(default)]
     pub(crate) milestone_title: Option<String>,
+    /// #2497: true when the `/board` wire bounded `body` — set for a closed
+    /// (non-epic) issue, whose body `board_wire.bound_issue_row` drops to 0
+    /// chars (#1791). `#[serde(default)]` so an older daemon (pre-#2497,
+    /// never stamps this) deserializes as `false` — the pre-existing
+    /// behavior of trusting `body` verbatim. Absent for open/epic issues,
+    /// whose bodies the wire never truncates to 0.
+    #[serde(default)]
+    pub(crate) body_truncated: bool,
+    /// #2497: the issue's full body length before truncation. `Some` only
+    /// when `body_truncated` is true; drives the Issue tab's hydration gate
+    /// (`CoordApp::issue_body_fetch_target`).
+    #[serde(default)]
+    pub(crate) body_len: Option<i64>,
 }
 
 /// #803: models config snapshot read from `board_meta['pipeline_models']`.
