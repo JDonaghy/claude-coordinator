@@ -176,6 +176,19 @@ COMMANDS_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
         # stale across a minutes-long CI-settle poll) only ever runs on the
         # daemon host / a standalone dev environment.
         ("_reload_board_after_wait", "load_board"),
+        # #2510-routed: `_dispatch_ci_fixes` is the CI-failure sibling of
+        # `_dispatch_conflict_fixes` above — it dispatches a bounded ci-fix
+        # worker (or escalates to HUMAN_REQUIRED) for a CONFIRMED
+        # `checks_failed` event. Like its conflict-fix twin it is only ever
+        # called from inside `merge()`'s two bodies (the whole-queue path and
+        # the `--only` surgical path), both of which sit below the same
+        # `daemon_reroute_target("COORD_MERGE_ON_DAEMON")` early-return — so a
+        # thin client's `coord merge` is forwarded to the daemon's /merge and
+        # never reaches this frame. The load_board/save_board pair is the same
+        # guarded pair `_dispatch_conflict_fixes` already had, not a new
+        # unguarded call site.
+        ("_dispatch_ci_fixes", "load_board"),
+        ("_dispatch_ci_fixes", "save_board"),
     },
     # #2182-guarded: `_fetch_live_ci_gate` re-derives a `parked` entry's merge
     # gate live on the drive-queue tick (instead of waiting out the 45-minute

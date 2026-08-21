@@ -325,6 +325,7 @@
       "assignment_id": "work-748a",
       "assignment_type": "work",
       "branch": "issue-748-fixture",
+      "ci_fix_dispatches": 0,
       "ci_flaky_pending": "",
       "ci_flaky_reruns": 0,
       "ci_infra_reruns": 0,
