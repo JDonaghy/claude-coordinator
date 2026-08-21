@@ -15,7 +15,9 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
 from pathlib import Path
+from typing import Callable, TypeVar
 
 from coord.platform_paths import default_coord_dir
 
@@ -86,6 +88,57 @@ def close() -> None:
     if _conn is not None:
         _conn.close()
         _conn = None
+
+
+_T = TypeVar("_T")
+
+# #2538: a handful of consecutive short retries — long enough to ride out a
+# concurrent writer (the daemon's own passive tick, another `coord merge`/
+# `coord notify` invocation) that only holds the DB for a moment, short
+# enough that a genuinely stuck lock still fails fast rather than hanging
+# `coord merge` for a long time.
+_LOCK_RETRY_ATTEMPTS = 5
+_LOCK_RETRY_BASE_DELAY_S = 0.1
+
+
+def retry_on_locked(
+    write: Callable[[], _T],
+    *,
+    attempts: int = _LOCK_RETRY_ATTEMPTS,
+    base_delay: float = _LOCK_RETRY_BASE_DELAY_S,
+) -> _T:
+    """Run *write* (a zero-arg callable performing one or more SQLite writes),
+    retrying with exponential backoff when SQLite raises ``database is
+    locked`` (#2538).
+
+    That error is transient contention — a concurrent writer holding the DB
+    at the exact moment this call tries to write, not a real failure — and a
+    short wait is very likely to let it clear.  ``PRAGMA busy_timeout``
+    (set on every connection in :func:`_open`) already makes SQLite itself
+    wait before raising, but under sustained contention (several writers in
+    a tight loop) that single wait can still be exhausted; this adds a few
+    more short, backed-off attempts on top rather than failing on the first
+    collision.
+
+    Any other ``OperationalError`` (schema drift, a malformed statement, …)
+    is re-raised immediately without retrying — those are not transient, and
+    retrying would only delay surfacing a real bug.  After *attempts*
+    consecutive ``database is locked`` collisions, re-raises the last
+    ``sqlite3.OperationalError`` so the caller can decide how to degrade
+    (see ``coord.state._record_dispatched_assignment_local``, whose caller —
+    ``coord.auto_loop._dispatch_fix`` — treats it as a declined dispatch
+    rather than letting it crash the whole run).
+    """
+    delay = base_delay
+    for attempt in range(1, attempts + 1):
+        try:
+            return write()
+        except sqlite3.OperationalError as exc:
+            if "database is locked" not in str(exc).lower() or attempt >= attempts:
+                raise
+            time.sleep(delay)
+            delay *= 2
+    raise AssertionError("unreachable")  # loop above always returns or raises
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────

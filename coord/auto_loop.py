@@ -34,6 +34,7 @@ Data model:
 from __future__ import annotations
 
 import logging
+import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
@@ -1221,10 +1222,37 @@ def _dispatch_fix(
     )
     board.active.append(fix_assignment)
 
-    record_dispatched_assignment(
-        assignment=fix_assignment,
-        repo_github=repo.github,
-    )
+    try:
+        record_dispatched_assignment(
+            assignment=fix_assignment,
+            repo_github=repo.github,
+        )
+    except sqlite3.OperationalError as exc:
+        if "database is locked" not in str(exc).lower():
+            # Not the transient contention this guard exists for (#2538) —
+            # a schema mismatch or malformed statement is a real bug and
+            # must not be swallowed as an ordinary declined dispatch.
+            raise
+        # `record_dispatched_assignment` already retries transient
+        # "database is locked" contention itself (coord.db.retry_on_locked,
+        # via coord._record_dispatched_assignment_local) — this is only
+        # reached once that bounded retry budget is exhausted. The fix
+        # worker has already been POSTed to the agent above and is really
+        # running; only the durable board-DB row failed to write. Treat it
+        # the same as any other declined dispatch (no machine, agent
+        # unreachable, …) rather than letting a transient lock crash the
+        # whole caller (`coord merge`'s CI-fix queue, the review auto-loop,
+        # …) — undo the in-memory append so a saved board never carries a
+        # row this call never durably recorded, and let the caller's
+        # existing "dispatch declined" handling take it from here.
+        board.active.remove(fix_assignment)
+        log.warning(
+            "auto_loop: fix dispatch for %s hit persistent DB contention "
+            "recording assignment %s (%s) — treating as not dispatched; "
+            "will retry next run",
+            work.assignment_id, fix_assignment.assignment_id, exc,
+        )
+        return None
     return fix_assignment
 
 

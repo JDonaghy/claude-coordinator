@@ -399,6 +399,92 @@ class TestDispatchedByAssignmentId:
         assert rows["sibling-load-001"]["dispatched_by_assignment_id"] == "origin-work-load"
 
 
+class TestRecordDispatchedAssignmentLockContention:
+    """#2538: `_record_dispatched_assignment_local`'s INSERT is the one
+    write in that function that's actually load-bearing (unlike the
+    best-effort `_record_audit` call alongside it) — a concurrent writer
+    (the daemon's own passive tick, another `coord merge`/`coord notify`
+    invocation) holding the DB for a moment must not be fatal. It now
+    retries transient `database is locked` collisions via
+    `coord.db.retry_on_locked` before giving up.
+    """
+
+    class _FlakyConn:
+        """Wraps a real (in-memory) connection, raising `database is
+        locked` on the first *fail_times* `execute()` calls before
+        delegating to the real one — simulates a concurrent writer holding
+        the DB for a few moments."""
+
+        def __init__(self, real_conn, fail_times: int) -> None:
+            self._real = real_conn
+            self._fail_times = fail_times
+            self.calls = 0
+
+        def execute(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls <= self._fail_times:
+                import sqlite3
+
+                raise sqlite3.OperationalError("database is locked")
+            return self._real.execute(*args, **kwargs)
+
+        def commit(self):
+            return self._real.commit()
+
+    def test_retries_through_transient_lock_then_persists(
+        self, coord_db, monkeypatch
+    ) -> None:
+        from coord.models import Assignment
+        from coord.state import record_dispatched_assignment
+
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+        flaky = self._FlakyConn(coord_db, fail_times=2)
+        monkeypatch.setattr("coord.state.get_connection", lambda: flaky)
+
+        record_dispatched_assignment(
+            assignment=Assignment(
+                assignment_id="ci-fix-2538", machine_name="laptop",
+                repo_name="api", issue_number=9, issue_title="[fix-1] thing",
+                type="work",
+            ),
+            repo_github="acme/api",
+        )
+
+        assert flaky.calls == 3  # two collisions, then the write that lands
+        row = coord_db.execute(
+            "SELECT status FROM assignments WHERE assignment_id=?",
+            ("ci-fix-2538",),
+        ).fetchone()
+        assert row is not None, "assignment must be durably recorded once the lock clears"
+        assert row["status"] == "running"
+
+    def test_raises_once_the_retry_budget_is_exhausted(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """A lock that never clears within the bounded retry budget must
+        still surface to the caller — `coord.auto_loop._dispatch_fix` is
+        the layer responsible for turning that into a graceful "declined"
+        rather than a crash, not this one silently swallowing it."""
+        import sqlite3
+
+        from coord.models import Assignment
+        from coord.state import record_dispatched_assignment
+
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+        flaky = self._FlakyConn(coord_db, fail_times=999)
+        monkeypatch.setattr("coord.state.get_connection", lambda: flaky)
+
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            record_dispatched_assignment(
+                assignment=Assignment(
+                    assignment_id="ci-fix-2538-b", machine_name="laptop",
+                    repo_name="api", issue_number=9, issue_title="[fix-1] thing",
+                    type="work",
+                ),
+                repo_github="acme/api",
+            )
+
+
 class TestRecordDispatchedAssignmentBranch:
     """#557: record_dispatched_assignment must persist the branch column so
     coord reattach can find it for the remote push-back finalize."""

@@ -9,7 +9,13 @@ from pathlib import Path
 import pytest
 
 from coord import db as db_mod
-from coord.db import _ensure_schema, override_connection, close, _migrate_gate_order
+from coord.db import (
+    _ensure_schema,
+    override_connection,
+    close,
+    _migrate_gate_order,
+    retry_on_locked,
+)
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -722,6 +728,78 @@ class TestMergeQueueCiFixDispatchesColumn:
         _ensure_schema(conn)
         assert "ci_fix_dispatches" in _merge_queue_columns(conn)
         conn.close()
+
+
+# ── retry_on_locked (#2538) ─────────────────────────────────────────────────
+
+
+class TestRetryOnLocked:
+    """#2538: `coord merge` crashed the whole run on a transient
+    `sqlite3.OperationalError: database is locked` raised while recording a
+    dispatched CI-fix assignment. `retry_on_locked` gives a momentary
+    collision (the daemon's own passive tick, another `coord merge`/`coord
+    notify` invocation holding the DB) a few short, backed-off attempts to
+    clear before it becomes the caller's problem.
+    """
+
+    def test_succeeds_immediately_when_no_contention(self) -> None:
+        calls = []
+
+        def _write() -> str:
+            calls.append(1)
+            return "ok"
+
+        assert retry_on_locked(_write) == "ok"
+        assert len(calls) == 1
+
+    def test_retries_through_transient_lock_then_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sleeps: list[float] = []
+        monkeypatch.setattr(db_mod.time, "sleep", lambda s: sleeps.append(s))
+
+        attempts = {"n": 0}
+
+        def _write() -> str:
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise sqlite3.OperationalError("database is locked")
+            return "ok"
+
+        result = retry_on_locked(_write)
+
+        assert result == "ok"
+        assert attempts["n"] == 3
+        # Two collisions before the third, successful attempt — backed off
+        # (each wait longer than the last), never a busy-loop.
+        assert len(sleeps) == 2
+        assert sleeps[1] > sleeps[0]
+
+    def test_raises_after_exhausting_the_retry_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(db_mod.time, "sleep", lambda s: None)
+
+        def _write() -> None:
+            raise sqlite3.OperationalError("database is locked")
+
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            retry_on_locked(_write, attempts=3, base_delay=0.0)
+
+    def test_unrelated_operational_error_is_not_retried(self) -> None:
+        """A schema/statement bug is a real failure, not transient
+        contention — it must surface on the very first attempt rather than
+        being retried (and delayed) as if it were lock contention."""
+        calls = []
+
+        def _write() -> None:
+            calls.append(1)
+            raise sqlite3.OperationalError("no such table: bogus")
+
+        with pytest.raises(sqlite3.OperationalError, match="no such table"):
+            retry_on_locked(_write)
+
+        assert len(calls) == 1
 
 
 # ── override_connection ────────────────────────────────────────────────────────

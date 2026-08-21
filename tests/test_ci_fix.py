@@ -333,3 +333,27 @@ class TestDispatchCiFixesWrapper:
             merge_cmd._dispatch_ci_fixes(events, two_machine_config, dry_run=False)
 
         assert entry.state == PENDING
+
+    def test_declined_dispatch_under_budget_is_echoed(
+        self, two_machine_config: Config, coord_db, capsys,
+    ) -> None:
+        """#2538: a declined dispatch (including `_dispatch_fix` hitting
+        persistent DB-lock contention, which surfaces exactly like any
+        other decline — see coord.auto_loop._dispatch_fix) must be visible
+        in `coord merge` output, not silently dropped — otherwise an
+        operator watching the run has no idea this entry didn't advance."""
+        from coord.commands import merge as merge_cmd
+        from coord.state import save_board
+
+        board = Board()
+        save_board(board)
+
+        entry = _entry()
+        events = [self._checks_failed_event(entry)]
+
+        with patch("coord.ci_fix.dispatch_ci_fix", return_value=None):
+            merge_cmd._dispatch_ci_fixes(events, two_machine_config, dry_run=False)
+
+        out = capsys.readouterr().out
+        assert "ci-fix not dispatched" in out
+        assert f"#{entry.issue_number}" in out

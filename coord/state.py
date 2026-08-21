@@ -37,7 +37,7 @@ from coord._board_mapping import (
 from coord.audit import record_audit as _record_audit
 from coord.board_service import resolve as _board_service_resolve
 from coord.board_service import route_write as _route_write
-from coord.db import get_connection
+from coord.db import get_connection, retry_on_locked
 from coord.models import (
     WORK_LIKE_TYPES,
     Assignment,
@@ -1018,8 +1018,17 @@ def _record_dispatched_assignment_local(
     )
 
     conn = get_connection()
-    conn.execute(
-        """INSERT INTO assignments (
+
+    # #2538: this INSERT/commit is the one write in this function that's
+    # actually load-bearing (unlike the best-effort `_record_audit` call
+    # below it) — a concurrent writer (the daemon's own passive tick,
+    # another `coord merge`/`coord notify` invocation) holding the DB for a
+    # moment must not crash the caller.  The statement is safe to retry
+    # as-is: `assignment_id` is the primary key and the `ON CONFLICT ...
+    # DO UPDATE` makes a re-attempted write idempotent.
+    def _write() -> None:
+        conn.execute(
+            """INSERT INTO assignments (
             assignment_id, machine_name, repo_name, repo_github,
             issue_number, issue_title, status, type, briefing,
             files_allowed, model, dispatched_at, review_of_assignment_id,
@@ -1101,8 +1110,10 @@ def _record_dispatched_assignment_local(
             assignment.driven_by,
             assignment.dispatched_by_assignment_id,
         ),
-    )
-    conn.commit()
+        )
+        conn.commit()
+
+    retry_on_locked(_write)
     _record_audit(
         tier="business",
         category="dispatch",
