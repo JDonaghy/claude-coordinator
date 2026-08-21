@@ -2304,11 +2304,23 @@ impl CoordApp {
             .iter()
             .find(|oi| oi.repo_name == repo && oi.number == g.issue_number)
         {
+            // #2497: the /board wire drops a closed (non-epic) issue's body
+            // to 0 chars (`body_truncated`); once the background detail
+            // fetch (run_periodic_work → GET /issue/{repo}/{number}) has
+            // hydrated the full body, render that instead of the wire's
+            // truncation notice.
+            let hydrated: Option<&str> = if oi.body_truncated {
+                self.issue_detail_cache
+                    .get(&key)
+                    .and_then(|e| e.full.as_deref())
+            } else {
+                None
+            };
             return issue_body_list(
                 Some((
                     oi.number,
                     oi.title.as_str(),
-                    oi.body.as_str(),
+                    hydrated.unwrap_or(oi.body.as_str()),
                     &oi.labels[..],
                 )),
                 self.board_pane_detail_scroll(),
@@ -2479,10 +2491,24 @@ impl CoordApp {
         let issue = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i));
         issue_body_list(
             issue.map(|i| {
+                // #2497: the /board wire drops a closed (non-epic) issue's
+                // body to 0 chars (`body_truncated`); once the background
+                // detail fetch (run_periodic_work → GET
+                // /issue/{repo}/{number}) has hydrated the full body,
+                // render that instead of the wire's truncation notice.
+                let hydrated: Option<&str> = if i.body_truncated {
+                    i.coord_repo.as_deref().and_then(|repo| {
+                        self.issue_detail_cache
+                            .get(&(repo.to_string(), i.number))
+                            .and_then(|e| e.full.as_deref())
+                    })
+                } else {
+                    None
+                };
                 (
                     i.number,
                     i.title.as_str(),
-                    i.body.as_str(),
+                    hydrated.unwrap_or(i.body.as_str()),
                     &i.all_labels[..],
                 )
             }),

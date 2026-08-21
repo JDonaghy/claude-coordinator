@@ -2315,6 +2315,8 @@ mod tests {
                     state: "open".to_string(),
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "myrepo".to_string(),
@@ -2325,6 +2327,8 @@ mod tests {
                     state: "open".to_string(),
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
             ],
             ..BoardData::default()

@@ -218,6 +218,8 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         artifact_fetch_rx: None,
         findings_detail_cache: std::collections::HashMap::new(),
         findings_fetch_rx: None,
+        issue_detail_cache: std::collections::HashMap::new(),
+        issue_fetch_rx: None,
         pending_artifact_pull: None,
         last_artifact_pulls: std::collections::HashMap::new(),
         artifact_pull_dialog: None,
@@ -910,6 +912,8 @@ pub fn make_app_with_one_completed_issue() -> CoordApp {
         labels: Vec::new(),
         milestone_number: None,
         milestone_title: None,
+        body_truncated: false,
+        body_len: None,
     });
     app.rebuild_board_sidebar();
     app

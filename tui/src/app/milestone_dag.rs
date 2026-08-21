@@ -1298,6 +1298,8 @@ mod pure_tests {
             state: state.to_string(),
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         }
     }
 

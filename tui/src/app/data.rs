@@ -274,6 +274,17 @@ pub(crate) struct FindingsDetailEntry {
     pub(crate) full: Option<String>,
 }
 
+/// #2497: one hydrated (or failed) full-issue-body detail fetch — see
+/// `CoordApp::issue_detail_cache`. Mirrors [`FindingsDetailEntry`] (#1337)
+/// for `issues.body` instead of `assignments.review_findings`.
+pub(crate) struct IssueDetailEntry {
+    pub(crate) fetched_at: Instant,
+    /// `Some(body)` = the full issue body from `GET /issue/{repo}/{number}`.
+    /// `None` = the fetch failed; re-armed after a 30 s back-off so a down
+    /// daemon isn't hammered every tick.
+    pub(crate) full: Option<String>,
+}
+
 /// #336: Sanitize a git branch name for use as a URL path component.
 ///
 /// Mirrors Python's `coord.agent._sanitize_branch`: replaces runs of
@@ -1573,6 +1584,8 @@ pub(crate) fn load_data() -> BoardData {
                             .unwrap_or_else(|_| "open".to_string()),
                         milestone_number: row.get::<_, Option<i64>>(6).unwrap_or(None),
                         milestone_title: row.get::<_, Option<String>>(7).unwrap_or(None),
+                        body_truncated: false,
+                        body_len: None,
                     })
                 })
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -2403,6 +2416,42 @@ pub(crate) fn spawn_findings_detail_fetch(
                         .and_then(|f| f.as_str())
                         .map(|s| s.to_string())
                 }),
+            Err(_) => None,
+        };
+        let _ = tx.send(out);
+    });
+    rx
+}
+
+/// #2497: fetch one issue's FULL `body` from the daemon's single-issue
+/// detail endpoint (`GET /issue/{repo_name}/{number}`). The `/board`
+/// collection wire drops a closed (non-epic) issue's body to 0 chars
+/// (`board_wire.bound_issue_row`, #1791); the Board/Pipeline Issue tab
+/// hydrates the full body through this. Mirrors
+/// [`spawn_findings_detail_fetch`] (#1337). Sends `None` on any HTTP/parse
+/// failure (the pane keeps showing the truncation notice).
+pub(crate) fn spawn_issue_detail_fetch(
+    base_url: String,
+    token: Option<String>,
+    repo_name: String,
+    number: u64,
+) -> std::sync::mpsc::Receiver<Option<String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(3))
+            .timeout(std::time::Duration::from_secs(5))
+            .build();
+        let mut req = agent.get(&format!("{base_url}/issue/{repo_name}/{number}"));
+        if let Some(t) = token {
+            req = req.set("Authorization", &format!("Bearer {t}"));
+        }
+        let out = match req.call() {
+            Ok(resp) => resp
+                .into_string()
+                .ok()
+                .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+                .and_then(|v| v.get("body").and_then(|f| f.as_str()).map(|s| s.to_string())),
             Err(_) => None,
         };
         let _ = tx.send(out);

@@ -2905,6 +2905,19 @@ pub struct CoordApp {
         (String, i64),
         std::sync::mpsc::Receiver<Option<String>>,
     )>,
+    /// #2497: Full issue bodies hydrated from the daemon's
+    /// `GET /issue/{repo}/{number}` detail endpoint, keyed by `(repo,
+    /// issue_number)` — the /board collection wire drops a closed
+    /// (non-epic) issue's body to 0 chars (`board_wire.bound_issue_row`,
+    /// #1791). A successful entry never expires (a closed issue's body is
+    /// immutable in practice). A failed entry (`full: None`) backs off for
+    /// 30 s before re-arming. Mirrors `findings_detail_cache` (#1337).
+    issue_detail_cache: std::collections::HashMap<(String, u64), IssueDetailEntry>,
+    /// #2497: In-flight issue-body detail fetch.  `None` when idle.
+    issue_fetch_rx: Option<(
+        (String, u64),
+        std::sync::mpsc::Receiver<Option<String>>,
+    )>,
     /// #336: Tracks a pending `coord pull-artifact` dispatch.
     /// Contains `(work_id, repo, sanitized_branch)` so we can show the
     /// destination path in a completion dialog.
@@ -3956,6 +3969,8 @@ impl CoordApp {
             artifact_fetch_rx: None,
             findings_detail_cache: std::collections::HashMap::new(),
             findings_fetch_rx: None,
+            issue_detail_cache: std::collections::HashMap::new(),
+            issue_fetch_rx: None,
             pending_artifact_pull: None,
             last_artifact_pulls: std::collections::HashMap::new(),
             artifact_pull_dialog: None,
@@ -5392,6 +5407,8 @@ impl CoordApp {
                     matched_labels: matched,
                     all_labels: oi.labels.clone(),
                     is_closed: oi.state == "closed",
+                    body_truncated: oi.body_truncated,
+                    body_len: oi.body_len,
                 })
             })
             .collect();
@@ -5459,6 +5476,8 @@ impl CoordApp {
                     matched_labels: matched,
                     all_labels: oi.labels.clone(),
                     is_closed: oi.state == "closed",
+                    body_truncated: oi.body_truncated,
+                    body_len: oi.body_len,
                 });
                 present.insert(key);
             }

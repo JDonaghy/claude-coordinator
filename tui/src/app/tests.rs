@@ -1707,6 +1707,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app
     }
@@ -1863,6 +1865,8 @@
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 43,
@@ -1873,6 +1877,8 @@
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
         ];
         // `selected_issue_repo_and_key()` reads the Board selection while on
@@ -2432,6 +2438,8 @@
                 matched_labels: vec!["coord".to_string(), "epic".to_string()],
                 all_labels: vec!["coord".to_string(), "epic".to_string(), "status:ready".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 42,
@@ -2442,6 +2450,8 @@
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string(), "status:ready".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
         ];
         app.rebuild_pipeline_sidebar(None);
@@ -2895,6 +2905,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.pipeline_repo_names = vec!["api".to_string()];
         app.pipeline_sel = Some(0);
@@ -3072,6 +3084,8 @@
                 labels: vec!["coord".to_string()],
                 milestone_number: Some(9),
                 milestone_title: Some("v1.0".to_string()),
+                body_truncated: false,
+                body_len: None,
             }],
             milestone_work_orders: vec![MilestoneWorkOrder {
                 repo_name: "api".to_string(),
@@ -3098,6 +3112,8 @@
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string(), "status:ready".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 99,
@@ -3108,6 +3124,8 @@
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string(), "status:ready".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
         ];
         app.rebuild_pipeline_sidebar(None);
@@ -3947,6 +3965,8 @@
                     labels: vec!["coord".to_string()],
                     milestone_number: Some(9),
                     milestone_title: Some("v1.0".to_string()),
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -3957,6 +3977,8 @@
                     labels: vec!["coord".to_string()],
                     milestone_number: Some(9),
                     milestone_title: Some("v1.0".to_string()),
+                    body_truncated: false,
+                    body_len: None,
                 },
             ],
             milestone_work_orders: vec![MilestoneWorkOrder {
@@ -3993,6 +4015,8 @@
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 43,
@@ -4003,6 +4027,8 @@
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
         ];
         app.rebuild_pipeline_sidebar(None);
@@ -5062,6 +5088,8 @@
                 labels: Vec::new(),
                 milestone_number: None,
                 milestone_title: None,
+                body_truncated: false,
+                body_len: None,
             });
         }
         app.rebuild_board_sidebar();
@@ -5178,6 +5206,8 @@
             labels: Vec::new(),
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         });
         // legacy status:refining → now Backlog (New), no Refining bucket
         app.data.open_issues.push(OpenIssue {
@@ -5189,6 +5219,8 @@
             labels: vec!["status:refining".to_string()],
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         });
         // status:ready → Refined (Pending)
         app.data.open_issues.push(OpenIssue {
@@ -5200,6 +5232,8 @@
             labels: vec!["status:ready".to_string()],
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         });
         app.rebuild_board_sidebar();
         let cache = app.board_issues_cache.clone();
@@ -5228,6 +5262,8 @@
             labels: Vec::new(),
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         });
         app.data.open_issues.push(OpenIssue {
             repo_name: "repo-a".to_string(),
@@ -5238,6 +5274,8 @@
             labels: vec!["status:refining".to_string()],
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         });
         app.data.open_issues.push(OpenIssue {
             repo_name: "repo-a".to_string(),
@@ -5248,6 +5286,8 @@
             labels: vec!["status:ready".to_string()],
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         });
         // Issue 4: in-flight (open issue with running assignment).
         app.data
@@ -5262,6 +5302,8 @@
             labels: Vec::new(),
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         });
         // Issue 5: completed (closed issue with done assignment).
         app.data
@@ -5276,6 +5318,8 @@
             labels: Vec::new(),
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         });
         app.rebuild_board_sidebar();
         let cache = app.board_issues_cache.clone();
@@ -5311,6 +5355,8 @@
             labels: Vec::new(),
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         });
         app.rebuild_board_sidebar();
         let cache = app.board_issues_cache.clone();
@@ -5391,6 +5437,8 @@
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string(), "status:ready".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 99,
@@ -5401,6 +5449,8 @@
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string(), "status:ready".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
         ];
         app.rebuild_pipeline_sidebar(None);
@@ -5521,6 +5571,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         });
         // Issue #44 with a legacy status:refining label → folds into New (#628).
         app.pipeline_issues.push(PipelineIssue {
@@ -5532,6 +5584,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string(), "status:refining".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         });
 
         let groups = app.pipeline_groups_for_repo("api");
@@ -5565,6 +5619,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string(), "status:ready".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         });
         app.data
             .assignments
@@ -5579,6 +5635,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string(), "status:ready".to_string()],
             is_closed: true,
+            body_truncated: false,
+            body_len: None,
         });
         app.data
             .assignments
@@ -5608,6 +5666,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         });
         // Legacy `status:refining` → folds into New (#628, Refining eliminated).
         app.pipeline_issues.push(PipelineIssue {
@@ -5619,6 +5679,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string(), "status:refining".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         });
         // In-progress: status:ready + active work assignment.
         app.pipeline_issues.push(PipelineIssue {
@@ -5630,6 +5692,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string(), "status:ready".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         });
         app.data
             .assignments
@@ -5644,6 +5708,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: true,
+            body_truncated: false,
+            body_len: None,
         });
         app.rebuild_pipeline_sidebar(None);
 
@@ -5948,6 +6014,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         };
         let mk_review = |verdict: Option<&str>| {
             let mut a = make_assignment_typed("done", 700, "api", Some("review"));
@@ -5996,6 +6064,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         };
         let mut a = make_assignment_typed("running", 700, "api", Some("review"));
         a.review_verdict = None;
@@ -6028,6 +6098,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         };
         let mut a = make_assignment_typed("finalizing", 700, "api", Some("review"));
         a.review_verdict = None;
@@ -6056,6 +6128,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }
     }
 
@@ -6673,6 +6747,8 @@
                 labels: vec!["coord".to_string()],
                 milestone_number: None,
                 milestone_title: None,
+                body_truncated: false,
+                body_len: None,
             }],
             ..BoardData::default()
         };
@@ -6720,6 +6796,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: true,
+            body_truncated: false,
+            body_len: None,
         });
 
         let groups = app.pipeline_groups_for_repo("api");
@@ -6785,6 +6863,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         new_issues.extend(app.pipeline_issues.clone());
         app.pipeline_issues = new_issues;
@@ -6825,6 +6905,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string(), "status:ready".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         new_issues.extend(app.pipeline_issues.clone());
         app.pipeline_issues = new_issues;
@@ -6899,6 +6981,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         });
         app.data
             .assignments
@@ -6955,6 +7039,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         });
         app.rebuild_pipeline_sidebar(None);
         assert_eq!(app.pipeline_state_section_names, vec!["new"]);
@@ -6973,6 +7059,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         });
         app.data
             .assignments
@@ -7009,6 +7097,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         new_issues.extend(app.pipeline_issues.clone());
         app.pipeline_issues = new_issues;
@@ -7315,6 +7405,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string(), "status:ready".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         });
         // No filter: both visible under "api".
         app.pipeline_search.clear();
@@ -7377,6 +7469,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string(), "status:ready".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         });
         app.active_view = SidebarView::Pipeline;
         // #857: "New" milestone groups default collapsed, so drill the
@@ -7553,6 +7647,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: true,
+            body_truncated: false,
+            body_len: None,
         });
         app.rebuild_pipeline_sidebar(None);
 
@@ -7844,6 +7940,8 @@
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string(), "epic".to_string(), "status:ready".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 42,
@@ -7854,6 +7952,8 @@
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string(), "status:ready".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 43,
@@ -7864,6 +7964,8 @@
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string(), "status:ready".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
         ];
         app.rebuild_pipeline_sidebar(None);
@@ -8851,6 +8953,8 @@
             matched_labels: vec![],
             all_labels: vec![],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         };
         let mut issue_other = issue_api.clone();
         issue_other.coord_repo = Some("other".to_string());
@@ -15344,6 +15448,8 @@
                 labels: vec!["coord".to_string()],
                 milestone_number: None,
                 milestone_title: None,
+                body_truncated: false,
+                body_len: None,
             }],
             ..BoardData::default()
         };
@@ -15388,6 +15494,8 @@
                 labels: vec!["coord".to_string()],
                 milestone_number: None,
                 milestone_title: None,
+                body_truncated: false,
+                body_len: None,
             }],
             ..BoardData::default()
         };
@@ -15436,6 +15544,8 @@
                 labels: vec!["coord".to_string()],
                 milestone_number: None,
                 milestone_title: None,
+                body_truncated: false,
+                body_len: None,
             }],
             ..BoardData::default()
         };
@@ -15500,6 +15610,8 @@
             labels: labels.iter().map(|s| s.to_string()).collect(),
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         };
         let app = make_test_app(BoardData {
             pipeline_tracked_labels: vec!["coord".to_string()],
@@ -15552,6 +15664,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string(), "status:ready".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         };
         assert_ne!(app.merge_stage_status_for(&cc276), StageStatus::Done);
         assert_eq!(
@@ -15730,6 +15844,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         });
         app.pipeline_sel = Some(0);
 
@@ -15779,6 +15895,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         });
         app.pipeline_sel = Some(0);
 
@@ -15865,6 +15983,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         });
         app.pipeline_sel = Some(0);
 
@@ -15926,6 +16046,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         });
         app.pipeline_sel = Some(0);
         app.data
@@ -15988,6 +16110,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         });
         app.pipeline_sel = Some(0);
         app.active_view = SidebarView::Pipeline;
@@ -16056,6 +16180,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         });
         app.pipeline_sel = Some(0);
         // Zombie: assignment is done, but a live tmux session is still discovered.
@@ -16104,6 +16230,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         });
         app.pipeline_sel = Some(0);
         // No assignments at all, but a live tmux session is discovered.
@@ -16149,6 +16277,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         });
         app.pipeline_sel = Some(0);
         app.active_view = SidebarView::Pipeline;
@@ -16210,6 +16340,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         });
         app.pipeline_sel = Some(0);
         app.active_view = SidebarView::Pipeline;
@@ -16622,6 +16754,8 @@
             labels: Vec::new(),
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         });
         assert_eq!(
             app.board_row_lifecycle("repo-a", 10),
@@ -16641,6 +16775,8 @@
             labels: vec!["status:refining".to_string()],
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         });
         assert_eq!(
             app.board_row_lifecycle("repo-a", 11),
@@ -16660,6 +16796,8 @@
             labels: vec!["status:ready".to_string()],
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         });
         assert_eq!(
             app.board_row_lifecycle("repo-a", 12),
@@ -17998,6 +18136,123 @@
         );
     }
 
+    // ── #2497: closed-issue body hydration (mirrors #1337's findings pattern) ──
+
+    #[test]
+    fn pipeline_issue_body_list_renders_preview_before_hydration() {
+        // #2497: the /board wire drops a closed (non-epic) issue's body to
+        // 0 chars, replacing it with the daemon's truncation notice
+        // (`body_truncated`). Until the background detail fetch lands, the
+        // Issue tab must render that notice as-is — degraded but never
+        // blank — exactly the #1337 pattern for review findings.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Issue;
+        app.pipeline_sel = Some(0);
+        app.pipeline_issues[0].is_closed = true;
+        app.pipeline_issues[0].body_truncated = true;
+        app.pipeline_issues[0].body_len = Some(9999);
+        app.pipeline_issues[0].body =
+            "\n… [truncated on the /board wire — full text: detail endpoint]".to_string();
+
+        let list = app.pipeline_issue_body_list();
+        let text: String = list
+            .items
+            .iter()
+            .flat_map(|i| i.text.spans.iter().map(|s| s.text.clone()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("truncated on the /board wire"),
+            "the daemon's truncation notice must render before hydration; got: {text:?}",
+        );
+        // And the periodic-work arming helper targets exactly this issue.
+        assert_eq!(
+            app.issue_body_fetch_target(),
+            Some(("api".to_string(), 42)),
+        );
+    }
+
+    #[test]
+    fn pipeline_issue_body_list_prefers_hydrated_full_body() {
+        // #2497: once the background detail fetch (GET
+        // /issue/{repo}/{number}) has hydrated the full body into
+        // issue_detail_cache, the Issue tab must render that instead of the
+        // wire's truncation notice.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Issue;
+        app.pipeline_sel = Some(0);
+        app.pipeline_issues[0].is_closed = true;
+        app.pipeline_issues[0].body_truncated = true;
+        app.pipeline_issues[0].body_len = Some(9999);
+        app.pipeline_issues[0].body =
+            "PREVIEW ONLY… [truncated on the /board wire — full text: detail endpoint]"
+                .to_string();
+        app.issue_detail_cache.insert(
+            ("api".to_string(), 42),
+            crate::app::data::IssueDetailEntry {
+                fetched_at: Instant::now(),
+                full: Some("FULL BODY with every closed-issue detail".to_string()),
+            },
+        );
+
+        let list = app.pipeline_issue_body_list();
+        let text: String = list
+            .items
+            .iter()
+            .flat_map(|i| i.text.spans.iter().map(|s| s.text.clone()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("FULL BODY with every closed-issue detail"),
+            "expected hydrated full body; got: {text:?}",
+        );
+        assert!(
+            !text.contains("PREVIEW ONLY"),
+            "preview must be replaced once hydrated; got: {text:?}",
+        );
+        // Hydrated → nothing left to fetch.
+        assert_eq!(app.issue_body_fetch_target(), None);
+    }
+
+    #[test]
+    fn issue_body_fetch_target_none_when_not_truncated_or_hydrated() {
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Issue;
+        app.pipeline_sel = Some(0);
+        // Body arrived whole → nothing to fetch.
+        assert_eq!(app.issue_body_fetch_target(), None);
+
+        // Truncated + already hydrated → nothing to fetch.
+        app.pipeline_issues[0].body_truncated = true;
+        app.pipeline_issues[0].body_len = Some(123);
+        app.issue_detail_cache.insert(
+            ("api".to_string(), 42),
+            crate::app::data::IssueDetailEntry {
+                fetched_at: Instant::now(),
+                full: Some("full body".to_string()),
+            },
+        );
+        assert_eq!(app.issue_body_fetch_target(), None);
+
+        // A recent FAILED attempt backs off (full: None, fresh timestamp).
+        app.issue_detail_cache.insert(
+            ("api".to_string(), 42),
+            crate::app::data::IssueDetailEntry {
+                fetched_at: Instant::now(),
+                full: None,
+            },
+        );
+        assert_eq!(app.issue_body_fetch_target(), None);
+
+        // Not on the Issue tab (still Pipeline view, but a different tab) →
+        // nothing armed even though the selected issue is truncated.
+        app.pipeline_detail_tab = PipelineDetailTab::Overview;
+        assert_eq!(app.issue_body_fetch_target(), None);
+    }
+
     // ── #289: auto-focus + Pipeline-tab stage content ──────────────────────
 
     /// Auto-focus defaults to the first pending (non-Done, non-Skipped)
@@ -18912,6 +19167,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string(), "status:ready".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.rebuild_pipeline_sidebar(None);
         app.pipeline_sel = Some(0);
@@ -19064,6 +19321,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string(), "status:ready".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.rebuild_pipeline_sidebar(None);
         app.pipeline_sel = Some(0);
@@ -19159,6 +19418,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.rebuild_pipeline_sidebar(None);
         app.pipeline_sel = Some(0);
@@ -19236,6 +19497,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.rebuild_pipeline_sidebar(None);
         app.pipeline_sel = Some(0);
@@ -19331,6 +19594,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.rebuild_pipeline_sidebar(None);
         app.pipeline_sel = Some(0);
@@ -19425,6 +19690,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.rebuild_pipeline_sidebar(None);
         app.pipeline_sel = Some(0);
@@ -19734,6 +20001,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string(), "status:ready".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.rebuild_pipeline_sidebar(None);
         app.pipeline_sel = Some(0);
@@ -19958,6 +20227,8 @@
             labels: vec!["status:ready".to_string()],
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         });
         app.rebuild_board_sidebar();
         let cache = app.board_issues_cache.clone();
@@ -19997,6 +20268,8 @@
             labels: vec!["status:ready".to_string()],
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         });
         // Issue 2: new-issue-chat only, no label → Backlog.
         app.data.open_issues.push(OpenIssue {
@@ -20008,6 +20281,8 @@
             labels: Vec::new(),
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         });
         app.rebuild_board_sidebar();
         let cache = app.board_issues_cache.clone();
@@ -20164,6 +20439,8 @@
             matched_labels: vec![],
             all_labels: vec![],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.pipeline_sel = Some(0);
         app
@@ -21656,6 +21933,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string(), "status:ready".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.pipeline_sel = Some(0);
         app.pipeline_detail_tab = PipelineDetailTab::Log;
@@ -21740,6 +22019,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string(), "status:ready".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.pipeline_sel = Some(0);
         app.pipeline_detail_tab = PipelineDetailTab::Log;
@@ -21836,6 +22117,8 @@
             labels: Vec::new(),
             milestone_number: Some(5),
             milestone_title: Some("v0.5".to_string()),
+            body_truncated: false,
+            body_len: None,
         });
         app.data.open_issues.push(OpenIssue {
             repo_name: "repo-a".to_string(),
@@ -21846,6 +22129,8 @@
             labels: Vec::new(),
             milestone_number: Some(6),
             milestone_title: Some("v0.6".to_string()),
+            body_truncated: false,
+            body_len: None,
         });
         app.data.open_issues.push(OpenIssue {
             repo_name: "repo-a".to_string(),
@@ -21856,6 +22141,8 @@
             labels: Vec::new(),
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         });
         app.rebuild_board_sidebar();
         let cache = app.board_issues_cache.clone();
@@ -21913,6 +22200,8 @@
             labels: Vec::new(),
             milestone_number: Some(7),
             milestone_title: Some("v0.7".to_string()),
+            body_truncated: false,
+            body_len: None,
         });
         app.rebuild_board_sidebar();
         app.select_issue("repo-a", 42);
@@ -21945,6 +22234,8 @@
             labels: Vec::new(),
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         });
         // Then a named milestone.
         app.data.open_issues.push(OpenIssue {
@@ -21956,6 +22247,8 @@
             labels: Vec::new(),
             milestone_number: Some(1),
             milestone_title: Some("v0.1".to_string()),
+            body_truncated: false,
+            body_len: None,
         });
         app.rebuild_board_sidebar();
         let cache = app.board_issues_cache.clone();
@@ -21982,6 +22275,8 @@
             labels: Vec::new(),
             milestone_number: Some(1),
             milestone_title: Some("v1.0".to_string()),
+            body_truncated: false,
+            body_len: None,
         });
         app.data.open_issues.push(OpenIssue {
             repo_name: "repo-a".to_string(),
@@ -21992,6 +22287,8 @@
             labels: Vec::new(),
             milestone_number: Some(2),
             milestone_title: Some("v2.0".to_string()),
+            body_truncated: false,
+            body_len: None,
         });
         app.data
             .assignments
@@ -22111,6 +22408,8 @@
                 state: "open".to_string(),
                 milestone_number: Some(1),
                 milestone_title: Some("v1.0".to_string()),
+                body_truncated: false,
+                body_len: None,
             },
             OpenIssue {
                 repo_name: "api".to_string(),
@@ -22121,6 +22420,8 @@
                 state: "open".to_string(),
                 milestone_number: Some(2),
                 milestone_title: Some("v2.0".to_string()),
+                body_truncated: false,
+                body_len: None,
             },
             OpenIssue {
                 repo_name: "api".to_string(),
@@ -22131,6 +22432,8 @@
                 state: "open".to_string(),
                 milestone_number: None,
                 milestone_title: None,
+                body_truncated: false,
+                body_len: None,
             },
         ];
         // Set pipeline_issues to match — all in "new" state (no work assignments).
@@ -22144,6 +22447,8 @@
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 20,
@@ -22154,6 +22459,8 @@
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 30,
@@ -22164,6 +22471,8 @@
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
         ];
         app.rebuild_pipeline_sidebar(None);
@@ -22209,6 +22518,8 @@
                 state: "open".to_string(),
                 milestone_number: None,
                 milestone_title: None,
+                body_truncated: false,
+                body_len: None,
             },
             OpenIssue {
                 repo_name: "api".to_string(),
@@ -22219,6 +22530,8 @@
                 state: "open".to_string(),
                 milestone_number: Some(3),
                 milestone_title: Some("v3.0".to_string()),
+                body_truncated: false,
+                body_len: None,
             },
         ];
         app.pipeline_issues = vec![
@@ -22231,6 +22544,8 @@
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 2,
@@ -22241,6 +22556,8 @@
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
         ];
         let idxs: Vec<usize> = vec![0, 1];
@@ -22342,6 +22659,8 @@
                 state: "open".to_string(),
                 milestone_number: Some(1),
                 milestone_title: Some("v1.0".to_string()),
+                body_truncated: false,
+                body_len: None,
             },
             OpenIssue {
                 repo_name: "api".to_string(),
@@ -22352,6 +22671,8 @@
                 state: "open".to_string(),
                 milestone_number: Some(2),
                 milestone_title: Some("v2.0".to_string()),
+                body_truncated: false,
+                body_len: None,
             },
             OpenIssue {
                 repo_name: "api".to_string(),
@@ -22362,6 +22683,8 @@
                 state: "open".to_string(),
                 milestone_number: None,
                 milestone_title: None,
+                body_truncated: false,
+                body_len: None,
             },
         ];
         app.pipeline_issues = vec![
@@ -22374,6 +22697,8 @@
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 20,
@@ -22384,6 +22709,8 @@
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 30,
@@ -22394,6 +22721,8 @@
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
         ];
         app.data.assignments = vec![
@@ -22630,6 +22959,8 @@
                     labels: vec!["coord".to_string(), "epic".to_string()],
                     milestone_number: Some(1),
                     milestone_title: Some("v1.0".to_string()),
+                    body_truncated: false,
+                    body_len: None,
                 },
                 // #102 carries NO tracked label of its own — only its parent
                 // epic #100 does. This is the exact shape of the reported
@@ -22644,6 +22975,8 @@
                     labels: vec![],
                     milestone_number: Some(1),
                     milestone_title: Some("v1.0".to_string()),
+                    body_truncated: false,
+                    body_len: None,
                 },
             ],
             epic_children: vec![EpicChildren {
@@ -22720,6 +23053,8 @@
                 labels: vec![],
                 milestone_number: None,
                 milestone_title: None,
+                body_truncated: false,
+                body_len: None,
             }],
             // tracking_issue 999 is NOT itself a tracked issue anywhere.
             epic_children: vec![EpicChildren {
@@ -22810,6 +23145,8 @@
                     labels: vec!["coord".to_string(), "epic".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
                 // Open + independently tracked child — Ready, so the
                 // nested row survives the #1281 In-progress filter.
@@ -22822,6 +23159,8 @@
                     labels: vec!["coord".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
             ],
             epic_children: vec![EpicChildren {
@@ -22889,6 +23228,8 @@
                     labels: vec!["coord".to_string(), "epic".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
                 // Untracked child — forced out of `pipeline_issues` below
                 // (the only production cause of `resolve_nested_child_index`
@@ -22902,6 +23243,8 @@
                     labels: vec![],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
                 // A totally unrelated tracked issue — its Pipeline doc tab
                 // is the one that must NOT outrank the child selection below.
@@ -22914,6 +23257,8 @@
                     labels: vec!["coord".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
             ],
             epic_children: vec![EpicChildren {
@@ -23008,6 +23353,8 @@
                 labels: vec!["coord".to_string(), "epic".to_string()],
                 milestone_number: None,
                 milestone_title: None,
+                body_truncated: false,
+                body_len: None,
             }],
             // #103 has no cached OpenIssue at all → `build_dag_nodes`
             // resolves it to `NodeState::Done` via the aged-out ⇒ terminal
@@ -23201,6 +23548,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         // Also add the open_issue entry for #5 (no milestone) so lookup works.
         app.data.open_issues.push(OpenIssue {
@@ -23212,6 +23561,8 @@
             state: "open".to_string(),
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         });
         new_issues.extend(app.pipeline_issues.clone());
         app.pipeline_issues = new_issues;
@@ -23698,6 +24049,8 @@
             matched_labels: vec![],
             all_labels: vec![],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.pipeline_sel = Some(0);
         assert!(app.detail_terminal_sessions.is_empty());
@@ -23724,6 +24077,8 @@
             matched_labels: vec![],
             all_labels: vec![],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.pipeline_sel = Some(0);
         assert_eq!(app.selected_issue_number(), Some(99));
@@ -23746,6 +24101,8 @@
             matched_labels: vec![],
             all_labels: vec![],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.pipeline_sel = Some(0);
         app.active_view = SidebarView::Pipeline;
@@ -23797,6 +24154,8 @@
             matched_labels: vec![],
             all_labels: vec![],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         // Apply the same logic that poll_pipeline_loader uses (open_issues is empty
         // in this app so live_keys is pipeline-only — the Board extension adds nothing,
@@ -23878,6 +24237,8 @@
             labels: vec![], // no status:* → NOT in pipeline
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         });
 
         // A completely-gone issue (#99) — no longer in pipeline OR open_issues.
@@ -23940,6 +24301,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
 
         // A stale session for an issue no longer on board or pipeline.
@@ -24000,6 +24363,8 @@
                 matched_labels: vec![],
                 all_labels: vec![],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 336,
@@ -24010,6 +24375,8 @@
                 matched_labels: vec![],
                 all_labels: vec![],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
         ];
         app.pipeline_sel = Some(0);
@@ -24440,6 +24807,8 @@
             matched_labels: vec![],
             all_labels: vec![],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.pipeline_sel = Some(0);
 
@@ -25504,6 +25873,8 @@
             matched_labels: vec![],
             all_labels: vec![],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.pipeline_sel = Some(0);
 
@@ -26384,6 +26755,8 @@
             matched_labels: vec![],
             all_labels: vec![],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.pipeline_sel = Some(0);
         assert_eq!(
@@ -26408,6 +26781,8 @@
             matched_labels: vec![],
             all_labels: vec![],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.pipeline_sel = Some(0);
         assert_eq!(
@@ -26440,6 +26815,8 @@
                 matched_labels: vec![],
                 all_labels: vec![],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 207,
@@ -26450,6 +26827,8 @@
                 matched_labels: vec![],
                 all_labels: vec![],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
         ];
         // Select the SECOND row (vimcode #207).
@@ -26630,6 +27009,8 @@
                 state: "open".to_string(),
                 milestone_number: None,
                 milestone_title: None,
+                body_truncated: false,
+                body_len: None,
             },
             OpenIssue {
                 repo_name: "repo-b".to_string(),
@@ -26640,6 +27021,8 @@
                 state: "open".to_string(),
                 milestone_number: None,
                 milestone_title: None,
+                body_truncated: false,
+                body_len: None,
             },
         ];
         let matches = app.finder_matches("telescope");
@@ -26678,6 +27061,8 @@
             state: "open".to_string(),
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         }];
         app.rebuild_board_sidebar();
         app.issue_finder = Some(IssueFinder {
@@ -26708,6 +27093,8 @@
             state: "open".to_string(),
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         }];
         app.pipeline_issues = vec![PipelineIssue {
             number: 42,
@@ -26719,6 +27106,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string(), "status:ready".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.rebuild_pipeline_sidebar(None);
         app.issue_finder = Some(IssueFinder {
@@ -27129,6 +27518,8 @@
             labels: Vec::new(),
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         });
 
         // Pre-select the issue in the sidebar (milestone 0, issue 0 within that
@@ -27145,6 +27536,69 @@
         assert!(
             driver.screen_contains(BODY),
             "Issue body must render on the Board > Issue tab:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #2497: a closed issue's body is dropped to 0 chars on the `/board`
+    /// wire (`board_wire.bound_issue_row`, #1791) and replaced with the
+    /// daemon's truncation notice. Once the background detail fetch (`GET
+    /// /issue/{repo}/{number}`) has landed in `issue_detail_cache`, the
+    /// Board Issue tab must render the full body instead — the full
+    /// `ShellAdapter → handle → render_frame` path, not just the pure
+    /// `board_issue_body_list` helper, so this exercises the same render
+    /// path `tuidriver_board_issue_body_renders` covers above, plus the
+    /// hydration lookup.
+    #[test]
+    fn tuidriver_board_closed_issue_body_hydrates_after_truncation() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        const NOTICE: &str =
+            "\n… [truncated on the /board wire — full text: detail endpoint]";
+        const FULL_BODY: &str =
+            "This is the full closed-issue body with every detail the wire preview dropped";
+
+        // App with one closed issue whose synced open_issues row carries only
+        // the wire's bounded (0-char) preview.
+        let assignments = vec![make_assignment_typed("done", 10, "repo-a", Some("work"))];
+        let mut app = make_app_with_assignments(assignments);
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 10,
+            title: "Fix dashboard rendering".to_string(),
+            body: NOTICE.to_string(),
+            state: "closed".to_string(),
+            labels: Vec::new(),
+            milestone_number: None,
+            milestone_title: None,
+            body_truncated: true,
+            body_len: Some(9999),
+        });
+        // The background detail fetch already landed.
+        app.issue_detail_cache.insert(
+            ("repo-a".to_string(), 10),
+            crate::app::data::IssueDetailEntry {
+                fetched_at: Instant::now(),
+                full: Some(FULL_BODY.to_string()),
+            },
+        );
+
+        // Pre-select the issue in the sidebar (same path as
+        // `tuidriver_board_issue_body_renders` above) and switch to Issue.
+        app.board_sidebar.set_selected_path(1, Some(vec![0, 0]));
+        app.board_detail_tab = BoardDetailTab::Issue;
+
+        // Wrap in the full ShellAdapter → TestBackend driver.
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+
+        assert!(
+            driver.screen_contains(FULL_BODY),
+            "hydrated full body must render on the Board > Issue tab:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains("truncated on the /board wire"),
+            "the wire's truncation notice must not still be showing once hydrated:\n{}",
             driver.screen()
         );
     }
@@ -27245,6 +27699,8 @@
             labels: Vec::new(),
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         });
         // Pre-select the issue row so the Issue tab has content to switch to.
         app.board_sidebar.set_selected_path(1, Some(vec![0, 0]));
@@ -27769,6 +28225,8 @@
             matched_labels: vec![],
             all_labels: vec![],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.pipeline_sel = Some(0);
 
@@ -27806,6 +28264,8 @@
             matched_labels: vec![],
             all_labels: vec![],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.pipeline_sel = Some(0);
 
@@ -27842,6 +28302,8 @@
             matched_labels: vec![],
             all_labels: vec![],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.pipeline_sel = Some(0);
 
@@ -27869,6 +28331,8 @@
             matched_labels: vec![],
             all_labels: vec![],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.pipeline_sel = Some(0);
 
@@ -27901,6 +28365,8 @@
             labels: vec![],
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         });
 
         // Add a pipeline issue so pipeline_lifecycle_section has data to check.
@@ -27913,6 +28379,8 @@
             matched_labels: vec![],
             all_labels: vec![],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         };
         let section = app.pipeline_lifecycle_section(&issue);
         assert_eq!(
@@ -28109,6 +28577,8 @@
             matched_labels: vec![],
             all_labels: vec![],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }
     }
 
@@ -29485,6 +29955,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: true,
+            body_truncated: false,
+            body_len: None,
         }
     }
 
@@ -30104,6 +30576,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.rebuild_pipeline_sidebar(None);
         app.pipeline_sel = Some(0);
@@ -30184,6 +30658,8 @@
                 state: "open".to_string(),
                 milestone_number: None,
                 milestone_title: None,
+                body_truncated: false,
+                body_len: None,
             }],
             pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
             ..BoardData::default()
@@ -30198,6 +30674,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -30258,6 +30736,8 @@
                 state: "open".to_string(),
                 milestone_number: None,
                 milestone_title: None,
+                body_truncated: false,
+                body_len: None,
             }],
             pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
             pipeline_tracked_labels: vec!["coord".to_string()],
@@ -30273,6 +30753,8 @@
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 99,
@@ -30283,6 +30765,8 @@
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
         ];
         app.active_view = SidebarView::Pipeline;
@@ -30339,6 +30823,8 @@
                 state: "open".to_string(),
                 milestone_number: Some(3),
                 milestone_title: Some("Sprint 1".to_string()),
+                body_truncated: false,
+                body_len: None,
             }],
             pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
             ..BoardData::default()
@@ -30352,6 +30838,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -30408,6 +30896,8 @@
                 state: "open".to_string(),
                 milestone_number: Some(3),
                 milestone_title: Some("Sprint 1".to_string()),
+                body_truncated: false,
+                body_len: None,
             }],
             pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
             ..BoardData::default()
@@ -30421,6 +30911,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -30476,6 +30968,8 @@
                 state: "open".to_string(),
                 milestone_number: None,
                 milestone_title: None,
+                body_truncated: false,
+                body_len: None,
             }],
             pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
             ..BoardData::default()
@@ -30531,6 +31025,8 @@
                     state: "open".to_string(),
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 }],
                 pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
                 ..BoardData::default()
@@ -30546,6 +31042,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -30855,6 +31353,8 @@
                 state: "open".to_string(),
                 milestone_number: None,
                 milestone_title: None,
+                body_truncated: false,
+                body_len: None,
             }],
             pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
             ..BoardData::default()
@@ -30868,6 +31368,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -30915,6 +31417,8 @@
                 state: "open".to_string(),
                 milestone_number: None,
                 milestone_title: None,
+                body_truncated: false,
+                body_len: None,
             }],
             pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
             ..BoardData::default()
@@ -30929,6 +31433,8 @@
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             // Decoy: stays visible under the "Decoy" filter below, and
             // carries a label ("decoy-marker") that only ever renders in
@@ -30945,6 +31451,8 @@
                 matched_labels: vec!["coord".to_string(), "decoy-marker".to_string()],
                 all_labels: vec!["coord".to_string(), "decoy-marker".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
         ];
         app.rebuild_board_sidebar();
@@ -31013,6 +31521,8 @@
                 state: "open".to_string(),
                 milestone_number: None,
                 milestone_title: None,
+                body_truncated: false,
+                body_len: None,
             }],
             ..BoardData::default()
         });
@@ -31101,6 +31611,8 @@
                 state: "open".to_string(),
                 milestone_number: None,
                 milestone_title: None,
+                body_truncated: false,
+                body_len: None,
             }],
             merge_queue: vec![MergeQueueEntry {
                 assignment_id: "stale-merge".to_string(),
@@ -31215,6 +31727,8 @@
                 state: "open".to_string(),
                 milestone_number: None,
                 milestone_title: None,
+                body_truncated: false,
+                body_len: None,
             }],
             pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
             issue_stage_projection: vec![IssueStageProjection {
@@ -31238,6 +31752,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -31305,6 +31821,8 @@
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         let items = app.context_menu_items_for_board_row(
             Some(42),
@@ -31753,6 +32271,8 @@
             state: state.to_string(),
             milestone_number,
             milestone_title: milestone_title.map(|s| s.to_string()),
+            body_truncated: false,
+            body_len: None,
         }
     }
 
@@ -32927,6 +33447,8 @@ Milestone tracking issue.
                 labels: vec!["coord".to_string()],
                 milestone_number: None,
                 milestone_title: None,
+                body_truncated: false,
+                body_len: None,
             }],
             assignments: vec![make_assignment_typed("running", 42, "api", Some("work"))],
             ..BoardData::default()
@@ -33113,6 +33635,8 @@ Milestone tracking issue.
                 labels: vec!["coord".to_string()],
                 milestone_number: None,
                 milestone_title: None,
+                body_truncated: false,
+                body_len: None,
             }],
             assignments: vec![make_assignment_typed("running", 42, "api", Some("work"))],
             ..BoardData::default()
@@ -33168,6 +33692,8 @@ Milestone tracking issue.
             matched_labels: vec![],
             all_labels: vec![],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.pipeline_sel = Some(0);
         app
@@ -33663,6 +34189,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: Some(1),
                     milestone_title: Some("v1.0".to_string()),
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -33673,6 +34201,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: Some(1),
                     milestone_title: Some("v1.0".to_string()),
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -33683,6 +34213,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: Some(1),
                     milestone_title: Some("v1.0".to_string()),
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -33693,6 +34225,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: Some(1),
                     milestone_title: Some("v1.0".to_string()),
+                    body_truncated: false,
+                    body_len: None,
                 },
             ],
             pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
@@ -33881,6 +34415,8 @@ Milestone tracking issue.
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 102,
@@ -33891,6 +34427,8 @@ Milestone tracking issue.
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 103,
@@ -33901,6 +34439,8 @@ Milestone tracking issue.
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 104,
@@ -33911,6 +34451,8 @@ Milestone tracking issue.
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
         ];
 
@@ -34123,6 +34665,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string(), "epic".to_string()],
                     milestone_number: Some(1),
                     milestone_title: Some("v1.0".to_string()),
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -34133,6 +34677,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: Some(1),
                     milestone_title: Some("v1.0".to_string()),
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -34143,6 +34689,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: Some(1),
                     milestone_title: Some("v1.0".to_string()),
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -34153,6 +34701,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: Some(1),
                     milestone_title: Some("v1.0".to_string()),
+                    body_truncated: false,
+                    body_len: None,
                 },
             ],
             assignments: vec![
@@ -34398,6 +34948,8 @@ Milestone tracking issue.
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string(), "Epic".to_string(), "status:ready".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 201,
@@ -34408,6 +34960,8 @@ Milestone tracking issue.
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string(), "status:ready".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
         ];
         app.active_view = SidebarView::Pipeline;
@@ -34468,6 +35022,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string(), "epic".to_string()],
                     milestone_number: Some(1),
                     milestone_title: Some("v1.0".to_string()),
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -34478,6 +35034,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: Some(1),
                     milestone_title: Some("v1.0".to_string()),
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -34488,6 +35046,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: Some(1),
                     milestone_title: Some("v1.0".to_string()),
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -34498,6 +35058,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: Some(1),
                     milestone_title: Some("v1.0".to_string()),
+                    body_truncated: false,
+                    body_len: None,
                 },
             ],
             pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
@@ -34523,6 +35085,8 @@ Milestone tracking issue.
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string(), "epic".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             // #1197 dedup case: #101 is ALSO independently tracked here (as
             // it would be if it carried a tracked label of its own) — this
@@ -34537,6 +35101,8 @@ Milestone tracking issue.
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 105,
@@ -34547,6 +35113,8 @@ Milestone tracking issue.
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
         ];
 
@@ -35209,6 +35777,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string(), "epic".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -35219,6 +35789,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -35229,6 +35801,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
             ],
             pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
@@ -35254,6 +35828,8 @@ Milestone tracking issue.
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string(), "epic".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 101,
@@ -35264,6 +35840,8 @@ Milestone tracking issue.
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 102,
@@ -35274,6 +35852,8 @@ Milestone tracking issue.
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: true,
+                body_truncated: false,
+                body_len: None,
             },
         ];
         app.pipeline_epic_expanded.insert(("api".to_string(), 100), true);
@@ -35396,6 +35976,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string(), "epic".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -35406,6 +35988,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
             ],
             pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
@@ -35427,6 +36011,8 @@ Milestone tracking issue.
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string(), "epic".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.pipeline_epic_expanded.insert(("api".to_string(), 100), true);
         app.active_view = SidebarView::Pipeline;
@@ -35506,6 +36092,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string(), "epic".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -35516,6 +36104,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -35526,6 +36116,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
             ],
             pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
@@ -35549,6 +36141,8 @@ Milestone tracking issue.
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string(), "epic".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.pipeline_epic_expanded.insert(("api".to_string(), 100), true);
         app.active_view = SidebarView::Pipeline;
@@ -35620,6 +36214,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string(), "epic".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -35630,6 +36226,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -35640,6 +36238,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
                 // Merged-but-not-closed: the GitHub issue itself stays
                 // `open` in the sync cache, but `merge_stage_status_for`
@@ -35656,6 +36256,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
             ],
             pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
@@ -35686,6 +36288,8 @@ Milestone tracking issue.
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string(), "epic".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 101,
@@ -35696,6 +36300,8 @@ Milestone tracking issue.
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 102,
@@ -35706,6 +36312,8 @@ Milestone tracking issue.
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: true,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 103,
@@ -35716,6 +36324,8 @@ Milestone tracking issue.
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
         ];
         // Merged merge_queue row for #103 → `merge_stage_status_for`
@@ -35805,6 +36415,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string(), "epic".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -35815,6 +36427,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -35825,6 +36439,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
             ],
             pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
@@ -35849,6 +36465,8 @@ Milestone tracking issue.
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string(), "epic".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 101,
@@ -35859,6 +36477,8 @@ Milestone tracking issue.
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: true,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 102,
@@ -35869,6 +36489,8 @@ Milestone tracking issue.
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: true,
+                body_truncated: false,
+                body_len: None,
             },
         ];
         // Force-expand so a stored default doesn't skip past the child
@@ -36034,6 +36656,8 @@ Milestone tracking issue.
             labels,
             milestone_number: Some(5),
             milestone_title: Some("v9.0".to_string()),
+            body_truncated: false,
+            body_len: None,
         };
         let coord = || vec!["coord".to_string()];
         let coord_epic = || vec!["coord".to_string(), "epic".to_string()];
@@ -36075,6 +36699,8 @@ Milestone tracking issue.
             matched_labels: vec!["coord".to_string()],
             all_labels: labels,
             is_closed: closed,
+            body_truncated: false,
+            body_len: None,
         };
         app.pipeline_issues = vec![
             issue(200, "Epic", false, coord_epic()),
@@ -36287,6 +36913,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string(), "epic".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -36297,6 +36925,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -36307,6 +36937,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -36317,6 +36949,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
             ],
             pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
@@ -36344,6 +36978,8 @@ Milestone tracking issue.
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string(), "epic".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 305,
@@ -36354,6 +36990,8 @@ Milestone tracking issue.
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
         ];
         app.pipeline_epic_expanded.insert(("api".to_string(), 300), true);
@@ -36398,6 +37036,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string(), "epic".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -36408,6 +37048,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
             ],
             pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
@@ -36435,6 +37077,8 @@ Milestone tracking issue.
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string(), "epic".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.active_view = SidebarView::Pipeline;
         app.rebuild_pipeline_sidebar(None);
@@ -40279,6 +40923,8 @@ Milestone tracking issue.
             matched_labels: vec!["coord".to_string()],
             all_labels: labels,
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         };
         let data = BoardData {
             pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
@@ -40447,6 +41093,8 @@ Milestone tracking issue.
             labels,
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         };
         let coord = || vec!["coord".to_string()];
         let data = BoardData {
@@ -40476,6 +41124,8 @@ Milestone tracking issue.
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string(), "epic".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.active_view = SidebarView::Pipeline;
         app.rebuild_pipeline_sidebar(None);
@@ -40579,6 +41229,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string(), "epic".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -40589,6 +41241,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -40599,6 +41253,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
             ],
             epic_children: vec![EpicChildren {
@@ -40621,6 +41277,8 @@ Milestone tracking issue.
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string(), "epic".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.pipeline_sel = Some(0);
         app.active_view = SidebarView::Pipeline;
@@ -40662,6 +41320,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
                 OpenIssue {
                     repo_name: "api".to_string(),
@@ -40672,6 +41332,8 @@ Milestone tracking issue.
                     labels: vec!["coord".to_string()],
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 },
             ],
             epic_children: vec![EpicChildren {
@@ -40696,6 +41358,8 @@ Milestone tracking issue.
             // `epic_lifecycle_section`'s own-label branch.
             all_labels: vec!["coord".to_string(), "epic".to_string(), "status:queued".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.pipeline_epic_expanded.insert(("api".to_string(), 600), true);
         app.active_view = SidebarView::Pipeline;
@@ -40769,6 +41433,8 @@ Milestone tracking issue.
             matched_labels: vec!["coord".to_string()],
             all_labels: labels,
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         };
         app.pipeline_issues = vec![
             // Staged issue declared FIRST — the sort must still move the
@@ -40918,6 +41584,8 @@ Milestone tracking issue.
             labels: Vec::new(),
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         });
         let target = ContextMenuTarget::BoardRow {
             issue_number: Some(42),
@@ -40959,6 +41627,8 @@ Milestone tracking issue.
             labels: Vec::new(),
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         });
         app.data.pipeline_repos = vec![("repo-a".to_string(), "org/repo-a".to_string())];
         app.rebuild_board_sidebar();
@@ -41057,6 +41727,8 @@ Milestone tracking issue.
             labels: Vec::new(),
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         });
         app.data.pipeline_repos = vec![("repo-a".to_string(), "org/repo-a".to_string())];
 
@@ -42707,6 +43379,8 @@ Milestone tracking issue.
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string(), "status:ready".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
             PipelineIssue {
                 number: 1124,
@@ -42717,6 +43391,8 @@ Milestone tracking issue.
                 matched_labels: vec!["coord".to_string()],
                 all_labels: vec!["coord".to_string(), "status:ready".to_string()],
                 is_closed: false,
+                body_truncated: false,
+                body_len: None,
             },
         ];
         app.rebuild_pipeline_sidebar(None);
@@ -46968,6 +47644,8 @@ Milestone tracking issue.
                     state: "open".to_string(),
                     milestone_number: Some(3),
                     milestone_title: Some("Sprint 1".to_string()),
+                    body_truncated: false,
+                    body_len: None,
                 }],
                 pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
                 ..BoardData::default()
@@ -46983,6 +47661,8 @@ Milestone tracking issue.
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -47088,6 +47768,8 @@ Milestone tracking issue.
                         state: "open".to_string(),
                         milestone_number: None,
                         milestone_title: None,
+                        body_truncated: false,
+                        body_len: None,
                     },
                     OpenIssue {
                         repo_name: "myrepo".to_string(),
@@ -47098,6 +47780,8 @@ Milestone tracking issue.
                         state: "open".to_string(),
                         milestone_number: None,
                         milestone_title: None,
+                        body_truncated: false,
+                        body_len: None,
                     },
                 ],
                 pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
@@ -47162,6 +47846,8 @@ Milestone tracking issue.
                     state: "open".to_string(),
                     milestone_number: None,
                     milestone_title: None,
+                    body_truncated: false,
+                    body_len: None,
                 }],
                 pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
                 ..BoardData::default()
@@ -47177,6 +47863,8 @@ Milestone tracking issue.
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
             is_closed: false,
+            body_truncated: false,
+            body_len: None,
         }];
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -47370,6 +48058,8 @@ Milestone tracking issue.
             labels: Vec::new(),
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         }
     }
 

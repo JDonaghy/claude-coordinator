@@ -959,6 +959,44 @@ impl CoordApp {
             }
         }
 
+        // #2497: Poll the in-flight full-issue-body detail fetch into the
+        // cache (the /board wire drops a closed issue's body to 0 chars;
+        // the Board/Pipeline Issue tab hydrates the full body from
+        // GET /issue/{repo}/{number}).
+        if let Some((key, rx)) = &self.issue_fetch_rx {
+            match rx.try_recv() {
+                Ok(full) => {
+                    let got_body = full.is_some();
+                    let entry = IssueDetailEntry {
+                        fetched_at: Instant::now(),
+                        full,
+                    };
+                    let key_clone = key.clone();
+                    self.issue_detail_cache.insert(key_clone, entry);
+                    self.issue_fetch_rx = None;
+                    if got_body {
+                        needs_redraw = true;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.issue_fetch_rx = None;
+                }
+            }
+        }
+        // #2497: Arm a fetch when the Board or Pipeline Issue tab shows an
+        // issue whose body was wire-truncated and not yet hydrated (the
+        // target helper handles tab/view gating + cache hits + failure
+        // back-off).
+        if self.issue_fetch_rx.is_none() {
+            if let Some(key) = self.issue_body_fetch_target() {
+                if let Some((url, token)) = resolve_board_service() {
+                    let rx = spawn_issue_detail_fetch(url, token, key.0.clone(), key.1);
+                    self.issue_fetch_rx = Some((key, rx));
+                }
+            }
+        }
+
         // #207: Machine metrics polling — only when the Machines panel is
         // visible so we don't burn background threads when the user is on
         // another view.

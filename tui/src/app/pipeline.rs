@@ -7270,6 +7270,61 @@ impl CoordApp {
         }
     }
 
+    /// #2497: the `(repo, issue_number)` cache key of the issue currently
+    /// shown on the Board or Pipeline **Issue tab** when its body was
+    /// bounded on the `/board` wire (`body_truncated`) and no usable cache
+    /// entry exists yet — i.e. the Issue tab wants a full-body detail fetch
+    /// armed. Mirrors [`Self::findings_fetch_target`] (#1337) for
+    /// `issues.body` instead of `assignments.review_findings`, keyed on
+    /// `(repo, issue_number)` alone (unlike findings, an issue body has no
+    /// per-fetch `len` to fold into the key — see `issue_detail_cache`'s
+    /// doc comment).
+    ///
+    /// `None` when neither Issue tab is the active view/tab, nothing is
+    /// selected, the body arrived whole, hydration already succeeded, or a
+    /// recent failed attempt is still backing off.
+    pub(crate) fn issue_body_fetch_target(&self) -> Option<(String, u64)> {
+        let (repo, number, truncated, len) = match self.active_view {
+            SidebarView::Board if self.board_detail_tab == BoardDetailTab::Issue => {
+                let repo = self.board_detail_repo()?;
+                let group = self.board_detail_issue_group()?;
+                let oi = self
+                    .data
+                    .open_issues
+                    .iter()
+                    .find(|oi| oi.repo_name == repo && oi.number == group.issue_number)?;
+                (
+                    oi.repo_name.clone(),
+                    oi.number,
+                    oi.body_truncated,
+                    oi.body_len,
+                )
+            }
+            SidebarView::Pipeline if self.pipeline_detail_tab == PipelineDetailTab::Issue => {
+                let issue = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))?;
+                let repo = issue.coord_repo.clone()?;
+                (repo, issue.number, issue.body_truncated, issue.body_len)
+            }
+            _ => return None,
+        };
+        if !truncated {
+            return None;
+        }
+        // Defensive: only arm once the wire has stamped a length alongside
+        // the truncation flag (mirrors `findings_fetch_target`'s `?` on
+        // `review_findings_len`) — an old daemon that somehow set the flag
+        // without the length isn't a fetchable state.
+        len?;
+        let key = (repo, number);
+        match self.issue_detail_cache.get(&key) {
+            // Hydrated — nothing to fetch.
+            Some(e) if e.full.is_some() => None,
+            // Failed recently — back off before re-arming.
+            Some(e) if e.fetched_at.elapsed() < Duration::from_secs(30) => None,
+            _ => Some(key),
+        }
+    }
+
     /// #336: True when the selected pipeline issue has a non-empty artifact
     /// manifest in the 30-second TTL cache — i.e. the artifact badge is
     /// currently rendered and the `a` keybind should be live.
