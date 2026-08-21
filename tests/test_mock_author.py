@@ -120,6 +120,38 @@ def test_briefing_threads_the_html_mock_glob_for_a_web_playwright_driver():
     assert "tests/acceptance/ms-9/mocks/" in out
 
 
+# ── #2512: deterministic mocks/index.html post-render step ─────────────────
+
+
+def test_briefing_instructs_index_script_for_html_driver():
+    out = mock_author.build_mock_author_briefing(
+        repo_slug="acme/webapp",
+        milestone_title="M",
+        milestone_number=2,
+        tracking_issue_number=100,
+        tracking_issue_body="",
+        issues=[],
+        driver_kind="web-playwright",
+        driver_mock_glob="*.html",
+    )
+    assert "scripts/gen_mock_index.py tests/acceptance/ms-2/mocks" in out
+    assert "index.html" in out
+
+
+def test_briefing_omits_index_script_for_non_html_driver():
+    out = mock_author.build_mock_author_briefing(
+        repo_slug="acme/tui",
+        milestone_title="M",
+        milestone_number=2,
+        tracking_issue_number=100,
+        tracking_issue_body="",
+        issues=[],
+        driver_kind="tui-tuidriver",
+        driver_mock_glob="*.screen",
+    )
+    assert "gen_mock_index.py" not in out
+
+
 def test_mock_author_system_prompt_pins_the_locked_html_mock_shape():
     """docs/ORACLE_LOOP.md's locked (2026-07-28) decision: a `.html` mock
     must be self-contained, open in a browser, and LOOK like the screen —
@@ -330,6 +362,7 @@ def test_amend_briefing_includes_correction_text_verbatim():
         milestone_number=9,
         tracking_issue_number=100,
         amend_text="the CLI flag is --for-path, not --path",
+        driver_mock_glob="*.screen",
     )
     assert "the CLI flag is --for-path, not --path" in out
     assert "acme/api" in out
@@ -343,10 +376,35 @@ def test_amend_briefing_names_already_merged_contract_and_scopes_edits():
         milestone_number=9,
         tracking_issue_number=100,
         amend_text="fix a typo",
+        driver_mock_glob="*.screen",
     )
     assert "tests/acceptance/ms-9/contract.md" in out
     assert "ALREADY-MERGED" in out
     assert "from-scratch" in out
+
+
+def test_amend_briefing_instructs_index_script_for_html_driver():
+    out = mock_author.build_mock_author_amend_briefing(
+        repo_slug="acme/webapp",
+        milestone_title="M",
+        milestone_number=2,
+        tracking_issue_number=100,
+        amend_text="fix a typo",
+        driver_mock_glob="*.html",
+    )
+    assert "scripts/gen_mock_index.py tests/acceptance/ms-2/mocks" in out
+
+
+def test_amend_briefing_omits_index_script_for_non_html_driver():
+    out = mock_author.build_mock_author_amend_briefing(
+        repo_slug="acme/api",
+        milestone_title="M",
+        milestone_number=9,
+        tracking_issue_number=100,
+        amend_text="fix a typo",
+        driver_mock_glob="*.screen",
+    )
+    assert "gen_mock_index.py" not in out
 
 
 def test_dispatch_amend_skips_open_issues_fetch_and_uses_amend_briefing(tmp_path):
