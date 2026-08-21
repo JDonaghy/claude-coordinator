@@ -306,6 +306,111 @@ class TestSeededReads:
         )
 
 
+class TestReportEndpoints:
+    """GET /api/report + GET /api/report/{report_id} in fixture mode (#2492 RPT-1).
+
+    Unlike every other seeded read in this file, ``FixtureServer.report_catalogue()``
+    falls back to the REAL ``coord.reports.catalogue()`` when a fixture doesn't
+    override it — it is pure in-process metadata (no DB read), so that fallback
+    stays deterministic and needs no seeding. ``report_result()`` has no such
+    fallback: a report id absent from the fixture's ``report_results`` 404s,
+    proving the route never reaches for the live DB the ``_no_io`` autouse
+    fixture above has already wired to explode.
+    """
+
+    def _fixture_with_reports(self):
+        return parse_fixture({
+            "board": {"assignments": [], "round_number": 0},
+            "report_results": {
+                "drive-queue-status": {
+                    "report_id": "drive-queue-status",
+                    "generated_at": 1750000000.0,
+                    "window": [1749999000.0, 1750000000.0],
+                    "columns": ["repo", "issue", "state"],
+                    "rows": [
+                        {"repo": "claude-coordinator", "issue": 4201, "state": "running"},
+                    ],
+                    "notes": ["#2492 fixture note"],
+                    "column_meta": [
+                        {"id": "repo", "label": "Repo", "kind": "text", "align": "left", "weight": 1.0},
+                        {"id": "issue", "label": "Issue", "kind": "int", "align": "right", "weight": 1.0},
+                        {"id": "state", "label": "State", "kind": "enum", "align": "left", "weight": 1.0},
+                    ],
+                    "totals": None,
+                    "chart": None,
+                },
+            },
+        })
+
+    def test_catalogue_falls_back_to_the_real_registry_when_not_seeded(self) -> None:
+        """No `report_catalogue` key in the fixture -> the real static
+        registry, still with no DB/network touched (`_no_io` would explode)."""
+        client = _client(self._fixture_with_reports())
+        r = client.get("/api/report")
+        assert r.status_code == 200
+        ids = [rep["id"] for rep in r.json()["reports"]]
+        assert "drive-queue-status" in ids
+        assert "issue-activity" in ids
+
+    def test_catalogue_override_wins_when_seeded(self) -> None:
+        fx = parse_fixture({
+            "board": {"assignments": [], "round_number": 0},
+            "report_catalogue": {
+                "reports": [
+                    {
+                        "id": "only-one",
+                        "title": "Only One",
+                        "description": "a fixture-only report",
+                        "params": [],
+                        "row_identity": None,
+                    },
+                ],
+            },
+        })
+        client = _client(fx)
+        r = client.get("/api/report")
+        assert r.status_code == 200
+        assert [rep["id"] for rep in r.json()["reports"]] == ["only-one"]
+
+    def test_run_returns_the_seeded_result(self) -> None:
+        client = _client(self._fixture_with_reports())
+        r = client.get("/api/report/drive-queue-status")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["report_id"] == "drive-queue-status"
+        assert body["rows"] == [
+            {"repo": "claude-coordinator", "issue": 4201, "state": "running"},
+        ]
+        assert body["notes"] == ["#2492 fixture note"]
+
+    def test_run_format_csv_over_a_seeded_result(self) -> None:
+        client = _client(self._fixture_with_reports())
+        r = client.get(
+            "/api/report/drive-queue-status", params={"format": "csv"}
+        )
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/csv")
+        assert "attachment; filename=" in r.headers["content-disposition"]
+        assert "claude-coordinator" in r.text
+        assert "# report: drive-queue-status" in r.text
+
+    def test_run_404s_on_a_report_id_absent_from_seeded_results(self) -> None:
+        """No live DB fallback in fixture mode — an unseeded report id is a
+        404, not a silent hit against the (patched-to-explode) real engine."""
+        client = _client(self._fixture_with_reports())
+        r = client.get("/api/report/issue-activity")
+        assert r.status_code == 404
+        assert "drive-queue-status" in r.json()["error"]
+
+    def test_run_unknown_format_is_still_a_400(self) -> None:
+        client = _client(self._fixture_with_reports())
+        r = client.get(
+            "/api/report/drive-queue-status", params={"format": "xlsx"}
+        )
+        assert r.status_code == 400
+        assert "csv" in r.json()["error"]
+
+
 class TestDeterminism:
     def test_two_runs_produce_byte_identical_pipeline_output(self) -> None:
         """Two independently-built apps, same fixture, identical bytes."""

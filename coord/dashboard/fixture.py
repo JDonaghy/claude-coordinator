@@ -36,6 +36,8 @@ Fixture schema (every key optional except ``board``)::
       "machines":        [ {...GET /api/machines entry...} ],
       "sessions":        [ {...GET /api/sessions entry...} ],
       "drive_queue":     [ {...coord.state._decode_drive_queue_row shape...} ],
+      "report_catalogue": {"reports": [ {...coord.reports.ReportDef.to_dict()...} ]},
+      "report_results":  {"issue-activity": {...coord.reports.ReportResult.to_dict()...}},
       "review_findings": {"rev-1": {"verdict": "approve", "body": "..."}},
       "diffs":           {"work-1": "diff --git ..."},
       "chat_reply":      "canned /api/chat response text",
@@ -60,6 +62,7 @@ from __future__ import annotations
 
 import copy
 import json
+from collections.abc import Mapping
 from dataclasses import MISSING, asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -156,6 +159,12 @@ class FixtureServer:
     machines_raw: list = field(default_factory=list)
     sessions_raw: list = field(default_factory=list)
     drive_queue_raw: list = field(default_factory=list)
+    #: #2492 RPT-1: `GET /api/report`'s catalogue. `None` (the default) falls
+    #: back to the real `coord.reports.catalogue()` — see `report_catalogue()`.
+    report_catalogue_raw: dict | None = None
+    #: #2492 RPT-1: seeded `GET /api/report/{id}` results, keyed by report id
+    #: — see `report_result()`.
+    report_results_raw: dict = field(default_factory=dict)
     review_findings_raw: dict = field(default_factory=dict)
     diffs: dict = field(default_factory=dict)
     chat_reply: str = "fixture mode: the coordinator assistant is not wired up."
@@ -209,6 +218,51 @@ class FixtureServer:
         if repo_name:
             rows = [r for r in rows if r.get("repo_name") == repo_name]
         return rows
+
+    def report_catalogue(self) -> dict[str, Any]:
+        """The seeded ``GET /api/report`` catalogue (#2492 RPT-1).
+
+        Unlike the board/drive-queue, ``coord.reports.catalogue()`` is pure
+        in-process metadata (report ids/titles/param definitions) — never a
+        DB read — so it is already deterministic without seeding. A fixture
+        overrides it only when a test wants a different catalogue than
+        production's (e.g. a smaller one for a focused scenario); absent an
+        override, this falls back to the real registry so `report_result()`
+        below (which validates against seeded results, not the catalogue)
+        stays the only place a report fixture is actually required.
+        """
+        if self.report_catalogue_raw is not None:
+            return copy.deepcopy(self.report_catalogue_raw)
+        from coord import reports as _reports  # noqa: PLC0415
+
+        return _reports.catalogue()
+
+    def report_result(
+        self, report_id: str, params: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """The seeded ``ReportResult``-shaped dict for *report_id* (#2492 RPT-1).
+
+        Keyed by report id only — one canned result per id, mirroring how
+        ``diffs`` is one canned string per assignment id rather than
+        branching on request details. ``params`` is accepted only for
+        signature symmetry with ``coord.reports.run_report(report_id,
+        params)``; a fixture that needs a param-sensitive variant seeds a
+        distinct fixture file per scenario, same as every other accessor
+        here.
+
+        Raises the real :class:`coord.reports.UnknownReportError` for a
+        report id with no seeded result, so ``GET /api/report/{id}`` returns
+        the byte-identical 404 shape in fixture and live mode.
+        """
+        from coord import reports as _reports  # noqa: PLC0415
+
+        entry = self.report_results_raw.get(report_id)
+        if entry is None:
+            raise _reports.UnknownReportError(
+                f"unknown report {report_id!r} — known reports: "
+                f"{', '.join(sorted(self.report_results_raw))}"
+            )
+        return copy.deepcopy(entry)
 
     def review_findings(self, assignment_id: str) -> tuple[str, str] | None:
         """Stand-in for ``coord.state.load_assignment_review_findings``.
@@ -353,6 +407,17 @@ def parse_fixture(raw: Any, *, path: Path | None = None) -> FixtureServer:
     if not all(isinstance(v, str) for v in diffs.values()):
         raise FixtureError("fixture 'diffs' values must be strings")
 
+    report_catalogue_raw = raw.get("report_catalogue")
+    if report_catalogue_raw is not None and not isinstance(report_catalogue_raw, dict):
+        raise FixtureError(
+            "fixture 'report_catalogue' must be a mapping (the GET /api/report response shape)"
+        )
+    report_results_raw = _as_dict(raw.get("report_results"), "report_results")
+    if not all(isinstance(v, dict) for v in report_results_raw.values()):
+        raise FixtureError(
+            "fixture 'report_results' values must be mappings (ReportResult wire shape)"
+        )
+
     server = FixtureServer(
         board_payload=board_payload,
         merge_queue_raw=_as_list(raw.get("merge_queue"), "merge_queue"),
@@ -360,6 +425,8 @@ def parse_fixture(raw: Any, *, path: Path | None = None) -> FixtureServer:
         machines_raw=_as_list(raw.get("machines"), "machines"),
         sessions_raw=_as_list(raw.get("sessions"), "sessions"),
         drive_queue_raw=_as_list(raw.get("drive_queue"), "drive_queue"),
+        report_catalogue_raw=report_catalogue_raw,
+        report_results_raw=report_results_raw,
         review_findings_raw=_as_dict(raw.get("review_findings"), "review_findings"),
         diffs=diffs,
         events=_parse_events(raw.get("events")),
