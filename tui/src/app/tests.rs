@@ -2590,10 +2590,13 @@
     }
 
     #[test]
-    fn request_gate_a_changes_action_spawns_changes_command() {
-        // #2063: "changes" is a recorded REJECTION, not merely the absence
-        // of an approval — the refusal downstream reads it to say what to
-        // fix instead of "nobody has looked yet".
+    fn request_gate_a_changes_action_opens_note_dialog_without_dispatching() {
+        // #2500: the click must no longer fire `coord gate-a --changes`
+        // straight away — it opens the "What needs to change?" prompt
+        // (`pending_gate_a_changes_note`) first, so a Cancel can abort the
+        // whole dispatch. Before this fix the click always fired
+        // unconditionally; see `submit_gate_a_changes_note_input_*` below
+        // for the actual dispatch, which now only happens on Submit.
         let mut app = make_pipeline_app_for_audit_menu_test(0);
         let target = ContextMenuTarget::PipelineRow {
             issue_number: Some(751),
@@ -2603,6 +2606,56 @@
         let handled =
             app.dispatch_context_menu_action("request-gate-a-changes", &target);
         assert!(handled, "request-gate-a-changes must be a recognised action");
+        assert!(
+            app.command_runner.spawned_calls.is_empty(),
+            "opening the note prompt must not dispatch anything yet: {:?}",
+            app.command_runner.spawned_calls,
+        );
+        let pending = app
+            .pending_gate_a_changes_note
+            .as_ref()
+            .expect("request-gate-a-changes must open pending_gate_a_changes_note");
+        assert_eq!(pending.repo_name, "api");
+        assert_eq!(pending.issue_number, 751);
+        assert_eq!(pending.buf, "");
+    }
+
+    #[test]
+    fn submit_gate_a_changes_note_input_dispatches_changes_command_with_note() {
+        // #2500: the typed note must ride through as `--note` on the
+        // `--changes` dispatch — this is the whole point of the fix, the
+        // round-trip a real rejection needs so the correction isn't left to
+        // the operator's memory + a separate `--amend` later.
+        let mut app = make_pipeline_app_for_audit_menu_test(0);
+        app.submit_gate_a_changes_note_input(PendingGateAChangesNote {
+            repo_name: "api".to_string(),
+            issue_number: 751,
+            buf: "status vocabulary is wrong".to_string(),
+        });
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "gate-a".to_string(),
+                "--changes".to_string(),
+                "api".to_string(),
+                "751".to_string(),
+                "--note".to_string(),
+                "status vocabulary is wrong".to_string(),
+            ]],
+        );
+    }
+
+    #[test]
+    fn submit_gate_a_changes_note_input_blank_buf_omits_note_flag() {
+        // #2500: an empty submit is fine — falls back to the pre-#2500
+        // behavior (`--changes` with no `--note`), rather than forcing the
+        // operator to type something.
+        let mut app = make_pipeline_app_for_audit_menu_test(0);
+        app.submit_gate_a_changes_note_input(PendingGateAChangesNote {
+            repo_name: "api".to_string(),
+            issue_number: 751,
+            buf: "   ".to_string(),
+        });
         assert_eq!(
             app.command_runner.spawned_calls,
             vec![vec![
@@ -2611,6 +2664,120 @@
                 "api".to_string(),
                 "751".to_string(),
             ]],
+            "a blank (whitespace-only) note must not append --note at all",
+        );
+    }
+
+    #[test]
+    fn gate_a_changes_note_cancel_drops_pending_without_dispatching() {
+        // #2500: Cancel (any dialog-button id other than "submit", per
+        // `fire_dialog_button`) must abort the whole verdict — unlike the
+        // pre-#2500 behavior where the context-menu click always fired.
+        let mut app = make_pipeline_app_for_audit_menu_test(0);
+        assert!(app.open_gate_a_changes_note_input());
+        if let Some(ref mut input) = app.pending_gate_a_changes_note {
+            input.buf = "typed but abandoned".to_string();
+        }
+        let mut backend = quadraui::tui::TuiBackend::new();
+        app.fire_dialog_button("cancel", &mut backend);
+        assert!(
+            app.pending_gate_a_changes_note.is_none(),
+            "Cancel must drop the pending note prompt",
+        );
+        assert!(
+            app.command_runner.spawned_calls.is_empty(),
+            "Cancel must NOT dispatch `coord gate-a` at all: {:?}",
+            app.command_runner.spawned_calls,
+        );
+    }
+
+    /// Black-box (#2500): the FULL event → handle → render path for the
+    /// "What needs to change?" prompt — arms it the same way
+    /// `new_terminal_name_prompt_submit_button_fires_create` arms its own
+    /// name prompt directly (menu-item navigation through the pipeline
+    /// row's many Gate-A/epic context-menu entries is covered separately by
+    /// `gate_a_verdict_menu_items_present_only_on_epic_row`'s screen-text
+    /// check), then drives the interesting bit through `TuiDriver`: typing
+    /// a note and pressing Enter to submit — the same "submit" dispatch a
+    /// click on the on-screen Submit button fires (`fire_dialog_button`,
+    /// `events.rs`'s Enter arm for `pending_gate_a_changes_note`), and the
+    /// route this dialog's own doc comment calls out as the primary one
+    /// (Enter submits, Esc cancels).
+    #[test]
+    fn tuidriver_gate_a_changes_note_submit_dispatches_with_note() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_pipeline_app_for_audit_menu_test(0);
+        assert!(
+            app.open_gate_a_changes_note_input(),
+            "precondition: the note prompt must open for the epic row",
+        );
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        assert!(
+            driver.screen_contains("Request Gate A changes"),
+            "the note prompt must render:\n{}",
+            driver.screen(),
+        );
+        assert!(
+            driver.screen_contains("What needs to change"),
+            "the note prompt must ask what needs to change:\n{}",
+            driver.screen(),
+        );
+
+        for ch in "status vocabulary is wrong".chars() {
+            driver.press(Key::Char(ch));
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let screen = driver.screen();
+        // The toast wraps/truncates at panel width (the full "--note ..."
+        // tail doesn't fit), same as `tuidriver_quiet_hours_submit_closes_
+        // dialog_and_toasts` — match the stable, untruncated prefix here;
+        // the exact argv (including the full `--note` text) is asserted
+        // separately at the direct-app level by
+        // `submit_gate_a_changes_note_input_dispatches_changes_command_with_note`.
+        assert!(
+            screen.contains("Gate A changes requested")
+                && screen.contains("coord gate-a --changes api 751"),
+            "Enter must submit and dispatch, toasting confirmation:\n{screen}",
+        );
+        assert!(
+            !screen.contains("What needs to change"),
+            "the dialog must close after a successful submit:\n{screen}",
+        );
+    }
+
+    /// Black-box (#2500): Esc must close the dialog and dispatch nothing —
+    /// the toast confirmation text must never appear. Same functional
+    /// route as clicking the on-screen Cancel button (`fire_dialog_button`
+    /// treats any non-"submit" id, and `events.rs`'s Escape arm, alike:
+    /// drop `pending_gate_a_changes_note` with no dispatch). Same
+    /// direct-arm shortcut as the Submit test above.
+    #[test]
+    fn tuidriver_gate_a_changes_note_cancel_does_not_dispatch() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_pipeline_app_for_audit_menu_test(0);
+        assert!(
+            app.open_gate_a_changes_note_input(),
+            "precondition: the note prompt must open for the epic row",
+        );
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        for ch in "abandoned note".chars() {
+            driver.press(Key::Char(ch));
+        }
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("What needs to change"),
+            "Esc must close the dialog:\n{screen}",
+        );
+        assert!(
+            !screen.contains("Gate A changes requested"),
+            "#2500: Esc (Cancel) must NOT dispatch `coord gate-a` at all:\n{screen}",
         );
     }
 
@@ -42006,6 +42173,8 @@ Milestone tracking issue.
             labels: Vec::new(),
             milestone_number: None,
             milestone_title: None,
+            body_truncated: false,
+            body_len: None,
         });
         app.data.pipeline_repos = vec![("repo-a".to_string(), "org/repo-a".to_string())];
         app.rebuild_board_sidebar();

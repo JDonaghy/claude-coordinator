@@ -2531,6 +2531,13 @@ pub struct CoordApp {
     /// (submit) or Esc (cancel), same posture as
     /// `pending_milestone_row_input`.
     pending_drive_queue_after: Option<PendingDriveQueueAfter>,
+    /// #2500: the "What needs to change?" prompt raised before `coord
+    /// gate-a --changes` fires — `Some` while the operator is typing the
+    /// note that becomes `--note`; owns ALL keys until Enter (submit, empty
+    /// buffer OK) or Esc (cancel — the whole dispatch is dropped, unlike
+    /// the pre-#2500 behavior where the context-menu click fired
+    /// unconditionally). Same posture as `pending_drive_queue_after`.
+    pending_gate_a_changes_note: Option<PendingGateAChangesNote>,
     /// #1866 (Q-1): selected row index into `queue_rows()` — the Queue
     /// panel's own *filtered, possibly re-sorted* row set.
     queue_sel: usize,
@@ -3901,6 +3908,7 @@ impl CoordApp {
             context_menu_layout: std::cell::RefCell::new(Vec::new()),
             fleet_health_overlay_open: false,
             pending_drive_queue_after: None,
+            pending_gate_a_changes_note: None,
             queue_sel: 0,
             queue_scroll: 0,
             queue_sort: None,

@@ -620,6 +620,18 @@ pub(crate) fn parse_stage_status(s: &str) -> StageStatus {
     }
 }
 
+/// #2500: pending "What needs to change?" text input, raised before
+/// `coord gate-a --changes` fires for the selected epic row. Same
+/// single-buffer shape as `PendingDriveQueueAfter` (Enter submits, Esc
+/// cancels) — the whole payload is one free-text `--note`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingGateAChangesNote {
+    /// Coord-local repo of the row the verdict is recorded against.
+    pub(crate) repo_name: String,
+    pub(crate) issue_number: u64,
+    pub(crate) buf: String,
+}
+
 // ─── Pipeline impl CoordApp ─────────────────────────────────────────────────
 
 impl CoordApp {
@@ -4131,13 +4143,19 @@ impl CoordApp {
     /// a PR satisfied silently, and nothing downstream ever checked — the
     /// mocks for two consecutive coord-portal milestones merged unseen.
     ///
-    /// `approved == false` records `--changes`, which leaves dispatch
-    /// refused; the note is deliberately not prompted for here (the TUI has
-    /// no text-input primitive on this path) — the toast points at the
-    /// `--amend` that carries the actual correction.
+    /// `approved == false` records `--changes`. #2500: the note the toast
+    /// used to point operators at typing separately (`coord acceptance mock
+    /// <repo> <issue> --amend "..."`) is now collected up front via
+    /// `pending_gate_a_changes_note` (`open_gate_a_changes_note_input` /
+    /// `submit_gate_a_changes_note_input`, same single-field
+    /// `DialogInput::TextInput` shape as "Add to drive queue after…") and
+    /// passed straight through as `--note`. This function itself stays the
+    /// low-level dispatcher — `approved == true` calls it directly with an
+    /// empty note (approval has no note to carry).
     pub(crate) fn dispatch_gate_a_verdict_for_selected_pipeline_row(
         &mut self,
         approved: bool,
+        note: &str,
     ) -> bool {
         let title = if approved {
             "Approve Gate A"
@@ -4158,14 +4176,35 @@ impl CoordApp {
             );
             return false;
         };
+        self.dispatch_gate_a_verdict(&repo, issue.number, approved, note)
+    }
+
+    /// #2500: the shared low-level `coord gate-a` dispatcher — both the
+    /// direct "Approve Gate A" path (`note` always `""`) and
+    /// `submit_gate_a_changes_note_input` (after the operator types a note
+    /// or submits blank) land here with an already-resolved `(repo, issue)`.
+    /// `--note` is only ever appended for `--changes`; `--approved` has no
+    /// use for one.
+    pub(crate) fn dispatch_gate_a_verdict(
+        &mut self,
+        repo: &str,
+        issue: u64,
+        approved: bool,
+        note: &str,
+    ) -> bool {
         let flag = if approved { "--approved" } else { "--changes" };
-        let issue_str = issue.number.to_string();
-        let cmd_strs: Vec<String> = vec![
+        let issue_str = issue.to_string();
+        let mut cmd_strs: Vec<String> = vec![
             "gate-a".to_string(),
             flag.to_string(),
-            repo.clone(),
+            repo.to_string(),
             issue_str,
         ];
+        let note = note.trim();
+        if !approved && !note.is_empty() {
+            cmd_strs.push("--note".to_string());
+            cmd_strs.push(note.to_string());
+        }
         let cmd_refs: Vec<&str> = cmd_strs.iter().map(|s| s.as_str()).collect();
         use crate::commands::SpawnQueuedOutcome;
         match self.command_runner.spawn_queued(&cmd_refs) {
@@ -4191,6 +4230,45 @@ impl CoordApp {
             }
             SpawnQueuedOutcome::Deduped => false,
         }
+    }
+
+    /// #2500: open the "What needs to change?" prompt for the selected
+    /// epic row ahead of `--changes`. Resolves `(repo, issue)` from
+    /// `pipeline_sel` up front — same posture as
+    /// `dispatch_gate_a_verdict_for_selected_pipeline_row` itself — so
+    /// `submit_gate_a_changes_note_input` doesn't need to re-derive the
+    /// selection after the operator has been typing (which could in theory
+    /// have moved, though the dialog owns all input while open).
+    pub(crate) fn open_gate_a_changes_note_input(&mut self) -> bool {
+        let Some(idx) = self.pipeline_sel else {
+            return false;
+        };
+        let Some(issue) = self.pipeline_issues.get(idx).cloned() else {
+            return false;
+        };
+        let Some(repo) = issue.coord_repo.clone() else {
+            self.push_toast(
+                "Request Gate A changes",
+                "No local repo mapping for this issue — cannot record a verdict.",
+                ToastSeverity::Warning,
+            );
+            return false;
+        };
+        self.pending_gate_a_changes_note = Some(PendingGateAChangesNote {
+            repo_name: repo,
+            issue_number: issue.number,
+            buf: String::new(),
+        });
+        true
+    }
+
+    /// #2500: submit the "What needs to change?" prompt — an empty buffer
+    /// is fine (falls back to the pre-#2500 behavior of `--changes` with no
+    /// `--note`); Cancel (`events.rs` / `dialogs.rs` fire_dialog_button)
+    /// never reaches here at all, so unlike before this gesture the click
+    /// always fired.
+    pub(crate) fn submit_gate_a_changes_note_input(&mut self, input: PendingGateAChangesNote) {
+        self.dispatch_gate_a_verdict(&input.repo_name, input.issue_number, false, &input.buf);
     }
 
     /// #1060 (docs/ORACLE_LOOP.md, #931): resolve the milestone

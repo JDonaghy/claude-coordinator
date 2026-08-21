@@ -1130,6 +1130,38 @@ impl CoordApp {
             }
         }
 
+        // ── #2500: "What needs to change?" Gate-A note single-field input.
+        // Same Enter-submits / Esc-cancels shape as
+        // `pending_drive_queue_after` just above — Esc drops the whole
+        // dispatch (no `coord gate-a` call at all), Enter submits with
+        // whatever's typed (blank is fine, falls back to no `--note`).
+        if self.pending_gate_a_changes_note.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Named(NamedKey::Enter) => {
+                        if let Some(input) = self.pending_gate_a_changes_note.take() {
+                            self.submit_gate_a_changes_note_input(input);
+                        }
+                    }
+                    Key::Named(NamedKey::Escape) => {
+                        self.pending_gate_a_changes_note = None;
+                    }
+                    Key::Named(NamedKey::Backspace) => {
+                        if let Some(ref mut input) = self.pending_gate_a_changes_note {
+                            input.buf.pop();
+                        }
+                    }
+                    Key::Char(ch) => {
+                        if let Some(ref mut input) = self.pending_gate_a_changes_note {
+                            input.buf.push(*ch);
+                        }
+                    }
+                    _ => {}
+                }
+                return Reaction::Redraw;
+            }
+        }
+
         // ── #316 Phase B: file-issue modal owns ALL input while open ───
         // Esc cancels; Ctrl+Y submits via `gh issue create`.
         if self.file_issue_modal.is_some() {

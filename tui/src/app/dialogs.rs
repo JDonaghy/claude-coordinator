@@ -2257,6 +2257,47 @@ impl CoordApp {
             });
         }
 
+        // ── #2500 "What needs to change?" — Gate-A changes-requested note ──
+        // Same single-field shape as "Add to drive queue after…" just
+        // above; Enter submits (blank OK, falls back to no `--note`), Esc
+        // cancels the whole `coord gate-a --changes` dispatch (`events.rs`).
+        if let Some(ref input) = self.pending_gate_a_changes_note {
+            return Some(Dialog {
+                table: None,
+                id: WidgetId::new("dialog:gate-a-changes-note"),
+                title: StyledText::plain("Request Gate A changes"),
+                body: vec![StyledText::plain(format!(
+                    "What needs to change in {} #{}'s Gate-A contract? Recorded as \
+                     the verdict's --note (optional — leave blank to record the \
+                     rejection with no note):",
+                    input.repo_name, input.issue_number
+                ))],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("submit"),
+                        label: "Submit".into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Cancel".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: None,
+                vertical_buttons: false,
+                input: Some(DialogInput::TextInput(DialogTextInput {
+                    value: input.buf.clone(),
+                    placeholder: "e.g. status vocabulary is wrong…".into(),
+                    cursor: Some(input.buf.len()),
+                })),
+            });
+        }
+
         // ── #1003 Close / archive plan confirm ──────────────────────────────
         if let Some(ref plan) = self.pending_close_plan {
             return Some(Dialog {
@@ -3797,6 +3838,25 @@ impl CoordApp {
                 }
                 _ => {
                     self.pending_drive_queue_after = None;
+                }
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── #2500 "What needs to change?" Gate-A note ───────────────────────
+        // "submit" dispatches `coord gate-a --changes ... --note <buf>`
+        // (blank buf OK); anything else (Cancel, or the dialog's own Esc
+        // route via `events.rs`) drops the pending input with no dispatch.
+        if self.pending_gate_a_changes_note.is_some() {
+            match id {
+                "submit" => {
+                    if let Some(input) = self.pending_gate_a_changes_note.take() {
+                        self.submit_gate_a_changes_note_input(input);
+                    }
+                }
+                _ => {
+                    self.pending_gate_a_changes_note = None;
                 }
             }
             *self.dialog_layout.borrow_mut() = None;
@@ -6905,11 +6965,16 @@ impl CoordApp {
             // rejection so the refusal downstream can say what to fix
             // instead of "nobody has looked yet".
             "approve-gate-a" => {
-                self.dispatch_gate_a_verdict_for_selected_pipeline_row(true);
+                self.dispatch_gate_a_verdict_for_selected_pipeline_row(true, "");
                 true
             }
+            // #2500: no longer dispatches directly — opens the "What needs
+            // to change?" prompt (`pending_gate_a_changes_note`) first, so
+            // the rejection carries a note instead of firing silently.
+            // `submit_gate_a_changes_note_input` does the actual dispatch
+            // on Submit; Cancel/Esc drops it with no `coord gate-a` call.
             "request-gate-a-changes" => {
-                self.dispatch_gate_a_verdict_for_selected_pipeline_row(false);
+                self.open_gate_a_changes_note_input();
                 true
             }
             // #1060: JIT-author this issue's acceptance-suite slice —

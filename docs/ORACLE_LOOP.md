@@ -369,10 +369,12 @@ Phase 0 steps 1–2 and Phase 1 step 6 above are also reachable by right-clickin
 - **"Approve Gate A"** ✓ → `coord gate-a --approved <repo> <tracking_issue>` — records the verdict
   that actually satisfies Gate A. Sits directly beside the 👁 on purpose: reviewing and recording
   are one gesture.
-- **"Request Gate A changes"** ✎ → `coord gate-a --changes <repo> <tracking_issue>` — records a
-  rejection; dispatch stays refused. Add the substance with
-  `coord acceptance mock <repo> <tracking_issue> --amend "<what to change>"` (the TUI has no
-  text-input on this path, so the `--note` is CLI-only).
+- **"Request Gate A changes"** ✎ → opens a "What needs to change?" text-input prompt first
+  (`pending_gate_a_changes_note`, #2500); Submit fires `coord gate-a --changes <repo>
+  <tracking_issue> --note "<what you typed>"` (blank is fine — falls back to no `--note`), Esc/
+  Cancel aborts the whole dispatch. Records a rejection; dispatch stays refused. The note is a
+  record of intent, not the fix itself — still amend the contract with
+  `coord acceptance mock <repo> <tracking_issue> --amend "<what to change>"`.
 
 **On any ordinary member-issue row of a milestone's `## Work order`** (resolved via
 `milestone_tracking_issue_for`; **not** epic-gated — applies per-issue, independent of the
