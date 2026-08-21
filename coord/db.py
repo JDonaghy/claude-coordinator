@@ -583,13 +583,35 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         -- CHECK pins it to one row so "which cursor?" can never be a
         -- question).  `pull_cursor` is opaque to coord — it is whatever the
         -- portal handed back — and is the replay point on daemon restart.
+        --
+        -- `verdict_watermark_at` / `verdict_watermark_rowid` (#2509 review
+        -- fix): the verdict consumer's OWN read position into
+        -- `portal_events`, independent of the shared `handled_at` column.
+        -- `unhandled_events()`/`mark_event_handled()` are shared plumbing —
+        -- this consumer only stamps `handled_at` for a `changes_requested`
+        -- event it actually dispatched, leaving every other kind (a new
+        -- submission, an `approved` verdict, a Q&A answer) NULL by design so
+        -- a future consumer can still read it.  Scanning by `handled_at IS
+        -- NULL` therefore re-returns that growing, never-marked backlog
+        -- ahead of anything newer forever once it exceeds one page — a real
+        -- `changes-requested` event behind it would never surface.  A
+        -- private watermark sidesteps that: it advances past every event
+        -- this consumer has looked at, acted on or not, so a pile of
+        -- non-actionable events cannot block the ones behind it.
+        -- `(received_at, rowid)` mirrors `unhandled_events`'s own tiebreaker
+        -- ordering.
+        -- Both NULL until the first tick with this column runs (an empty
+        -- `~/.coord/coord.db` or one predating this migration), read as
+        -- `(0.0, 0)` — before every real event's `received_at`/`rowid`.
         CREATE TABLE IF NOT EXISTS portal_sync_state (
-            id                INTEGER PRIMARY KEY CHECK (id = 1),
-            pull_cursor       TEXT,
-            last_pull_at      REAL,
-            last_push_at      REAL,
-            last_heartbeat_at REAL,
-            last_error        TEXT NOT NULL DEFAULT ''
+            id                    INTEGER PRIMARY KEY CHECK (id = 1),
+            pull_cursor           TEXT,
+            last_pull_at          REAL,
+            last_push_at          REAL,
+            last_heartbeat_at     REAL,
+            last_error            TEXT NOT NULL DEFAULT '',
+            verdict_watermark_at    REAL,
+            verdict_watermark_rowid INTEGER
         );
 
         CREATE INDEX IF NOT EXISTS idx_assignments_status ON assignments(status);
@@ -942,6 +964,18 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # predating this migration, same as the column's own default for a
         # freshly-enqueued entry.
         "ALTER TABLE merge_queue ADD COLUMN ci_fix_dispatches INTEGER NOT NULL DEFAULT 0",
+        # #2509 review fix: the verdict consumer's own read position into
+        # `portal_events` — see the CREATE TABLE comment above for why it
+        # cannot reuse the shared `handled_at` column. NULL (read as
+        # `(0.0, 0)`, before every real event) for every database predating
+        # this migration, which replays the full existing inbox exactly once
+        # on upgrade — safe: re-scanning a non-actionable event is a no-op,
+        # and `_consume_verdicts` skips (never re-dispatches) any event
+        # whose `handled_at` is already set, so an already-consumed
+        # `changes_requested` event from before this migration is walked
+        # past, not re-sent — see `coord.portal_sync._consume_verdicts`.
+        "ALTER TABLE portal_sync_state ADD COLUMN verdict_watermark_at REAL",
+        "ALTER TABLE portal_sync_state ADD COLUMN verdict_watermark_rowid INTEGER",
     ]
     for sql in migrations:
         try:

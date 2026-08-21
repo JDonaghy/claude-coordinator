@@ -917,6 +917,164 @@ def test_with_no_config_the_verdict_phase_is_a_no_op_not_a_crash():
     assert [e.event_id for e in portal_store.unhandled_events()] == ["e1"]
 
 
+def test_a_large_non_actionable_backlog_does_not_starve_a_later_changes_requested_event(
+    monkeypatch,
+):
+    """Review finding (#2509): `_consume_verdicts` used to scan
+    `unhandled_events()` — oldest `handled_at IS NULL` rows first — but only
+    ever stamps `handled_at` on a `changes_requested` event it dispatches.
+    Every other kind (here: 150 `"created"` events) piles up unmarked FOREVER,
+    always sorted ahead of anything newer, so once that pile exceeds one page
+    a real sign-off behind it is never returned again by any future tick.
+
+    Reproduced directly against the old code: 150 noise events + 1
+    `changes_requested` event, 5 ticks of `_consume_verdicts(limit=100)`,
+    `consumed == 0` every time and the targeted event never appeared in
+    `unhandled_events()`'s result at all.
+
+    The fix is a private watermark independent of `handled_at`
+    (`portal_store.get/set_verdict_watermark`,
+    `events_after_verdict_watermark`) that advances past every event this
+    consumer has looked at, acted on or not — so paging through the pile,
+    even a handful of events at a time, eventually reaches the real one.
+    """
+    portal_store.link_milestone(
+        repo_name="acme-portal", milestone_number=5, submission_id=SUB
+    )
+    monkeypatch.setattr(portal_sync, "_resolve_tracking_issue", lambda repo_cfg, ms: 42)
+    calls = []
+    monkeypatch.setattr(
+        "coord.mock_author.dispatch_acceptance_mock",
+        lambda repo, issue, cfg, **kw: calls.append(kw.get("amend_briefing")),
+    )
+
+    noise = [
+        {"id": f"noise-{i}", "submission_id": SUB, "type": "created"} for i in range(150)
+    ]
+    portal_store.record_events(noise)
+    portal_store.record_events(
+        [
+            {
+                "id": "signoff-1",
+                "submission_id": SUB,
+                "type": "signoff.changes_requested",
+                "data": {"verdict": "changes_requested", "comments": "fix it"},
+            }
+        ]
+    )
+
+    config = FakeConfig({"acme-portal": FakeRepoCfg()})
+    # One narrow page (50) per simulated tick, on purpose — proves it's the
+    # watermark doing the work, not just a limit generous enough to cover the
+    # whole backlog in a single call.
+    total_consumed = 0
+    for _tick in range(5):
+        consumed, errors = portal_sync._consume_verdicts(config, limit=50, pages=1)
+        total_consumed += consumed
+        assert errors == []
+
+    assert total_consumed == 1
+    assert calls == ["fix it"]
+
+
+def test_a_dispatch_failure_freezes_the_watermark_but_not_later_independent_events(
+    monkeypatch,
+):
+    """A still-broken event must not be silently skipped once the watermark
+    passes it (that would drop the client's feedback) — but a LATER,
+    unrelated `changes_requested` event in the same page must still get its
+    own dispatch attempt (per-event isolation, mirroring `_push`)."""
+    portal_store.link_milestone(
+        repo_name="acme-portal", milestone_number=5, submission_id="sub-bad"
+    )
+    portal_store.link_milestone(
+        repo_name="acme-portal", milestone_number=6, submission_id="sub-good"
+    )
+    monkeypatch.setattr(
+        portal_sync,
+        "_resolve_tracking_issue",
+        lambda repo_cfg, ms: 42 if ms == 5 else 43,
+    )
+    dispatched = []
+
+    def fake_dispatch(repo_name, tracking_issue_number, config, *, amend_briefing=None, **_):
+        if tracking_issue_number == 42:
+            raise RuntimeError("Gate A already in flight")
+        dispatched.append((repo_name, tracking_issue_number, amend_briefing))
+
+    monkeypatch.setattr("coord.mock_author.dispatch_acceptance_mock", fake_dispatch)
+
+    portal_store.record_events(
+        [
+            {
+                "id": "bad-1",
+                "submission_id": "sub-bad",
+                "type": "signoff.changes_requested",
+                "data": {"verdict": "changes_requested", "comments": "broken"},
+            },
+            {
+                "id": "good-1",
+                "submission_id": "sub-good",
+                "type": "signoff.changes_requested",
+                "data": {"verdict": "changes_requested", "comments": "fine"},
+            },
+        ]
+    )
+
+    config = FakeConfig({"acme-portal": FakeRepoCfg()})
+    consumed, errors = portal_sync._consume_verdicts(config)
+
+    assert consumed == 1
+    assert dispatched == [("acme-portal", 43, "fine")]
+    assert any("Gate A already in flight" in e for e in errors)
+    # The failing event is still visible for retry; the successful sibling
+    # was still marked handled despite arriving after it in the same page.
+    unhandled_ids = {e.event_id for e in portal_store.unhandled_events()}
+    assert unhandled_ids == {"bad-1"}
+
+    # Next tick: watermark is frozen before "bad-1", so "good-1" is walked
+    # again (harmless — already `handled_at`, not re-dispatched) and "bad-1"
+    # is retried rather than skipped.
+    dispatched.clear()
+    consumed_again, errors_again = portal_sync._consume_verdicts(config)
+    assert consumed_again == 0
+    assert dispatched == []  # "good-1" was not re-dispatched
+    assert any("Gate A already in flight" in e for e in errors_again)
+
+
+def test_changes_requested_verdict_with_a_space_separator_is_recognized(monkeypatch):
+    """Non-blocking review finding: the portal's own event contract for a
+    sign-off is not fully pinned down — a verdict spelled with a space
+    (`"changes requested"`) rather than a hyphen must still be recognized,
+    not silently left unconsumed."""
+    portal_store.link_milestone(
+        repo_name="acme-portal", milestone_number=5, submission_id=SUB
+    )
+    monkeypatch.setattr(portal_sync, "_resolve_tracking_issue", lambda repo_cfg, ms: 42)
+    calls = []
+    monkeypatch.setattr(
+        "coord.mock_author.dispatch_acceptance_mock",
+        lambda repo, issue, cfg, **kw: calls.append(kw.get("amend_briefing")),
+    )
+    portal_store.record_events(
+        [
+            {
+                "id": "e1",
+                "submission_id": SUB,
+                "type": "signoff",
+                "data": {"verdict": "Changes Requested", "comments": "space separated"},
+            }
+        ]
+    )
+
+    config = FakeConfig({"acme-portal": FakeRepoCfg()})
+    consumed, errors = portal_sync._consume_verdicts(config)
+
+    assert consumed == 1
+    assert errors == []
+    assert calls == ["space separated"]
+
+
 class TestSignoffVerdict:
     def _event(self, kind: str, payload: dict | None = None):
         return portal_store.PortalEvent(

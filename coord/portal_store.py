@@ -206,6 +206,44 @@ def unhandled_events(limit: int = 100) -> list[PortalEvent]:
     return [_event_from_row(r) for r in rows]
 
 
+def events_after_verdict_watermark(
+    received_at: float, rowid: int, *, limit: int = 100
+) -> list[tuple[int, PortalEvent]]:
+    """Events strictly after ``(received_at, rowid)``, oldest first, with rowid.
+
+    The verdict consumer's (#2509) OWN scan, independent of the shared
+    ``handled_at`` column that :func:`unhandled_events` filters on. That
+    column is written by every consumer that ever gets added, but this one
+    only stamps it for a ``changes_requested`` event it actually dispatched —
+    every other kind is deliberately left ``handled_at IS NULL`` forever so a
+    future consumer can still read it. Scanning by ``handled_at IS NULL``
+    would therefore re-return that growing, never-marked backlog ahead of
+    anything newer on every call, and once it exceeds one page a genuinely
+    new ``changes_requested`` event behind it would never surface — see
+    :func:`coord.portal_sync._consume_verdicts`. A private, monotonic
+    watermark sidesteps that: it advances past every event this consumer has
+    *looked at*, whether or not it acted, so a pile of non-actionable events
+    cannot block the ones behind it.
+
+    Returns ``(rowid, event)`` pairs (not just events) so the caller can
+    advance the watermark to the exact row it stopped at without a second
+    query. ``rowid`` is SQLite's own implicit rowid — stable and unique
+    because ``portal_events``' primary key is the (non-integer) ``event_id``,
+    not ``rowid`` itself, so declaring the primary key never aliased it away.
+    """
+    rows = _conn().execute(
+        """
+        SELECT rowid, * FROM portal_events
+         WHERE received_at > ?
+            OR (received_at = ? AND rowid > ?)
+         ORDER BY received_at ASC, rowid ASC
+         LIMIT ?
+        """,
+        (received_at, received_at, rowid, limit),
+    ).fetchall()
+    return [(r["rowid"], _event_from_row(r)) for r in rows]
+
+
 def mark_event_handled(event_id: str, *, now: float | None = None) -> None:
     """Stamp an event as consumed. Idempotent — re-stamping is a plain UPDATE."""
     conn = _conn()
@@ -704,6 +742,8 @@ class SyncState:
     last_push_at: float | None = None
     last_heartbeat_at: float | None = None
     last_error: str = ""
+    verdict_watermark_at: float = 0.0
+    verdict_watermark_rowid: int = 0
 
 
 def get_sync_state() -> SyncState:
@@ -718,6 +758,8 @@ def get_sync_state() -> SyncState:
         last_push_at=row["last_push_at"],
         last_heartbeat_at=row["last_heartbeat_at"],
         last_error=row["last_error"] or "",
+        verdict_watermark_at=row["verdict_watermark_at"] or 0.0,
+        verdict_watermark_rowid=row["verdict_watermark_rowid"] or 0,
     )
 
 
@@ -746,6 +788,36 @@ def set_pull_cursor(cursor: str | None, *, now: float | None = None) -> None:
 def note_pull(*, now: float | None = None) -> None:
     """Record a completed pull that returned nothing new (cursor unchanged)."""
     _update_sync_state(last_pull_at=time.time() if now is None else now)
+
+
+def get_verdict_watermark() -> tuple[float, int]:
+    """The verdict consumer's own read position, ``(0.0, 0)`` if never set.
+
+    ``(0.0, 0)`` sorts before every real ``portal_events`` row (``received_at``
+    is a wall-clock epoch stamp, ``rowid`` starts at 1), so a fresh database
+    or one predating this column reads as "nothing scanned yet" and the next
+    scan starts from the very beginning of the inbox — see
+    :func:`events_after_verdict_watermark`.
+    """
+    row = _conn().execute(
+        "SELECT verdict_watermark_at, verdict_watermark_rowid "
+        "FROM portal_sync_state WHERE id = 1"
+    ).fetchone()
+    if row is None or row["verdict_watermark_at"] is None:
+        return (0.0, 0)
+    return (row["verdict_watermark_at"], row["verdict_watermark_rowid"] or 0)
+
+
+def set_verdict_watermark(received_at: float, rowid: int) -> None:
+    """Advance the verdict consumer's read position past ``(received_at, rowid)``.
+
+    Called after a scan has looked at that row — regardless of whether it was
+    acted on — so a run of non-actionable events cannot make this consumer
+    re-scan them forever (#2509 review fix). Independent of
+    :func:`mark_event_handled`, which is shared, per-event bookkeeping for
+    whatever future consumer looks at ``handled_at`` next.
+    """
+    _update_sync_state(verdict_watermark_at=received_at, verdict_watermark_rowid=rowid)
 
 
 def note_push(*, now: float | None = None) -> None:
