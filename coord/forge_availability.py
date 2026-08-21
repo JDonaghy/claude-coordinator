@@ -14,8 +14,16 @@ adds a single extra network round trip:
    :meth:`coord.ci_github.GitHubCi._fetch` on every live (non-cached)
    ``gh pr checks`` read.
 2. **Forge API calls** — :func:`record_gh_call`, called from
-   :func:`coord.github_ops._gh`, the single seam all 71 public functions in
-   that module funnel through (#1483).
+   :func:`coord.github_ops._gh`, the seam the vast majority of that module's
+   public functions funnel through (#1483). A handful of call sites
+   (``edit_issue``, ``close_issue``, ``reopen_issue``, ``rerun_workflow_run``,
+   ``rerun_workflow_run_failed``, plus ``get_pr_checks`` which is covered
+   separately via seam 1 above) shell out to ``gh`` directly instead of
+   through ``_gh`` — each for a documented reason (idempotent-on-a-specific-
+   stderr-message semantics, or a "never raise, return False" contract that
+   ``_gh``'s raise-only contract can't express) — and each calls
+   :func:`record_gh_call` inline at its own call site instead, so none of
+   them is a silent gap in this measurement (#1896 review).
 3. **Merge-gate refusals** — :func:`record_merge_gate_refusal`, called from
    :func:`coord.merge_queue.process` for each live (never dry-run)
    ``checks_failed``/``checks_pending``/``checks_stale`` :class:`~coord.

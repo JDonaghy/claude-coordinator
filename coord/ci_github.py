@@ -386,10 +386,13 @@ class GitHubCi:
         # #1896 Phase 0: this is the "every CiStore.list_checks_for_pr
         # outcome" seam the forge-availability program asks for — reachable/
         # unreachable, plus the check-level conclusion distribution.
-        # `github_ops.get_pr_checks` already records its own `_gh`-level
-        # observation internally; this is the CI-specific view layered on
-        # top (whether the *check-list read itself* came back usable), and
-        # only fires on a real cache miss — a cached `list_checks_for_pr`
+        # `github_ops.get_pr_checks` does NOT go through `_gh()` — it shells
+        # out to `gh pr checks` directly (a non-zero exit there can still
+        # carry usable JSON on stdout, which `_gh()`'s raise-on-nonzero
+        # contract can't express, see `get_pr_checks`'s own docstring) — so
+        # this call is the *only* forge-availability observation this read
+        # produces. It stands alone, not "layered on top" of anything.
+        # Only fires on a real cache miss — a cached `list_checks_for_pr`
         # hit never reaches here, so this costs nothing extra either.
         _t0 = time.monotonic()
         try:
