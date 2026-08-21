@@ -14,6 +14,20 @@ tui/target/
 tui/*.err
 tui/*.out
 
+# scripts/coord-test-runner.sh scratch output, written into the worktree it
+# is pointed at. Harmless in the throwaway worktree the Test stage uses, but
+# a worker who runs the runner against its own checkout and then `git add -A`
+# commits ~3k lines of log noise — and, worse, leaves the tree permanently
+# `git status`-dirty, which makes setuptools-scm stamp a `.dYYYYMMDD` local
+# version and flips tests/test_release_verify.py::
+# test_spawned_identity_ignores_the_caller_cwd red for reasons that have
+# nothing to do with the branch under test.
+.pytest.out
+.pytest.rerun.out
+.pytest.baseline.out
+.cargo.out
+.cargo-acceptance.out
+
 # #1973: opt-in local quadraui path override (see
 # tui/cargo-config-local-quadraui.toml.example) — never commit a
 # machine-local co-development override.
