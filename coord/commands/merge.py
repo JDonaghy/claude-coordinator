@@ -539,6 +539,85 @@ def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
         save_board(fix_board)
 
 
+def _dispatch_ci_fixes(events, config, *, dry_run: bool) -> None:
+    """#2510: classify any CONFIRMED ``checks_failed`` events and dispatch a
+    bounded CI-fix worker for the eligible ones, escalating to
+    ``HUMAN_REQUIRED`` once the retry cap (``coord.ci_fix.
+    MAX_CI_FIX_DISPATCHES``) is spent.
+
+    Mutates each qualifying event's ``ev.entry.state``/``ev.entry.error`` in
+    place — same shape as :func:`_dispatch_conflict_fixes` — so the caller's
+    own subsequent save-queue step picks the mutation up naturally.
+
+    ``process()`` emits a bare ``"checks_failed"`` event kind at exactly two
+    points, both reached only once the OTHER auto-remedies (the #1892 infra
+    rerun budget, the #2252 one-shot flake re-check) are exhausted or
+    inapplicable — i.e. both ARE the "confirmed real failure" case this leg
+    exists for (see ``coord.ci_fix``'s module docstring). Every other CI
+    outcome (``checks_pending``, ``ci_infra_rerun``, ``ci_flaky_rerun``,
+    ``checks_unreadable``, ``checks_stale``) is still self-healing or
+    mid-retry and must not be touched here.
+
+    Shared by the whole-queue path and the ``--only`` surgical path, same
+    reasoning as ``_dispatch_conflict_fixes``: a bare ``checks_failed`` entry
+    is never reprocessed by a later ``process()`` call (it only acts on
+    ``PENDING`` entries) so whichever caller sees the event first must also
+    be the one to act on it.
+    """
+    ci_events = [ev for ev in events if ev.kind == "checks_failed"]
+    if not ci_events or dry_run:
+        return
+
+    from coord.audit import record_audit  # noqa: PLC0415
+    from coord.ci_fix import MAX_CI_FIX_DISPATCHES, dispatch_ci_fix  # noqa: PLC0415
+    from coord.merge_queue import HUMAN_REQUIRED  # noqa: PLC0415
+    from coord.state import load_board, save_board  # noqa: PLC0415
+
+    fix_board = load_board()
+    if fix_board is None:
+        return
+    dispatched_any = False
+    for ev in ci_events:
+        entry = ev.entry
+        fix = dispatch_ci_fix(entry, fix_board, config, checks_summary=ev.message)
+        if fix is not None:
+            click.echo(
+                f"  {entry.repo_name} #{entry.issue_number}: "
+                f"ci-fix dispatched to {fix.machine_name} "
+                f"({entry.ci_fix_dispatches}/{MAX_CI_FIX_DISPATCHES})"
+            )
+            dispatched_any = True
+            continue
+        if entry.ci_fix_dispatches >= MAX_CI_FIX_DISPATCHES:
+            entry.state = HUMAN_REQUIRED
+            click.echo(
+                f"  {entry.repo_name} #{entry.issue_number}: "
+                f"ci-fix retry cap hit ({entry.ci_fix_dispatches}/"
+                f"{MAX_CI_FIX_DISPATCHES}) — manual resolution required"
+            )
+            record_audit(
+                tier="operational",
+                category="merge",
+                event_type="ci_fix_human_required",
+                actor="daemon",
+                summary=(
+                    f"ci-fix retry cap hit: {entry.repo_name}#"
+                    f"{entry.issue_number} — manual resolution required"
+                ),
+                repo=entry.repo_name,
+                issue=entry.issue_number,
+                assignment_id=entry.assignment_id,
+                details={"reason": "ci_fix_retry_cap", "error": entry.error},
+            )
+            dispatched_any = True  # the HUMAN_REQUIRED mutation needs saving
+        # else: budget remains but dispatch declined for another reason (no
+        # machine, an unrelated fix already in flight, agent unreachable) —
+        # leave the entry PENDING for the next tick to retry, exactly like a
+        # declined conflict-fix dispatch does.
+    if dispatched_any:
+        save_board(fix_board)
+
+
 @click.command(
     "verify-merge",
     help=(
@@ -1927,6 +2006,10 @@ def merge(
         # before the save below so a retry-cap/non-rebaseable HUMAN_REQUIRED
         # mutation on only_entry.state is persisted, not lost.
         _dispatch_conflict_fixes(events_only, cfg_only, dry_run=dry_run)
+        # #2510: same reasoning, for a CONFIRMED checks_failed event — dispatch
+        # a bounded ci-fix worker or escalate to HUMAN_REQUIRED before the
+        # save below, so the mutation on only_entry.state is persisted too.
+        _dispatch_ci_fixes(events_only, cfg_only, dry_run=dry_run)
         # #2246: `--only` merges one entry, but the branch it just moved is
         # shared — every OTHER queued PR based on it may have become
         # CONFLICTING a second ago. This is the drive-queue's path (`coord
@@ -2250,6 +2333,11 @@ def merge(
     # for the eligible ones (extracted to _dispatch_conflict_fixes, #1474
     # review, so the --only path below can share it).
     _dispatch_conflict_fixes(events, cfg, dry_run=dry_run)
+
+    # #2510: classify any CONFIRMED checks_failed events and dispatch a
+    # bounded ci-fix worker for the eligible ones, escalating to
+    # HUMAN_REQUIRED once the retry cap is spent.
+    _dispatch_ci_fixes(events, cfg, dry_run=dry_run)
 
     # #2246: whatever just landed may have invalidated its siblings — ask
     # GitHub now, while the merge that caused it is still the obvious

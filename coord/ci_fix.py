@@ -1,0 +1,209 @@
+"""Auto-dispatch a fix worker for a CONFIRMED CI check failure at the Merge
+gate (#2510).
+
+``coord/merge_queue.py``'s CI gate already classifies a failing check into
+three shapes: a verdictless (infra) failure auto-reruns up to
+``MAX_CI_INFRA_RERUNS``; a verdicted failure gets one flake re-check up to
+``MAX_CI_FLAKY_RERUNS``; and once both budgets are exhausted/inapplicable the
+failure is CONFIRMED — real, not infra, not (as far as one re-run can tell)
+flaky. Both exhaustion points emit a ``"checks_failed"`` :class:`~coord.
+merge_queue.MergeEvent`. Before this module existed that event did nothing
+but set ``entry.error`` — the entry stayed ``PENDING`` in the merge queue
+forever, invisible to any status view that only surfaces ``HUMAN_REQUIRED``
+rows, with no automated path back to a fix.
+
+Why a separate module, following ``coord/conflict_fix.py``'s lead: triggered
+by a merge_queue event, not a planner proposal, so it shares little with
+``coord.dispatch``.
+
+Unlike a merge CONFLICT (mechanical, content-preserving, handled by a
+dedicated ``type="conflict-fix"`` worker whose success needs no fresh
+Test/Review since the diff is unchanged), a confirmed CI failure needs a
+worker that can genuinely change code — the same shape as a review
+``request-changes`` bounce. So this dispatches via
+:func:`coord.auto_loop._dispatch_fix` itself (not a bespoke HTTP POST): the
+new commit lands on the SAME branch/PR, and the existing generic Work→Test→
+Review pipeline (already built to re-drive Test then Review for any bounced
+``WORK_LIKE_TYPES`` fix) picks the new commit up on its own — no separate
+re-review wiring needed here. The merge queue's own ``branch_head_sha``/
+``branch_patch_id`` staleness check (see ``has_approved_review``) already
+invalidates the stale approval once the new commit lands, so the PR
+naturally cannot merge again until it clears Test + Review + CI fresh.
+"""
+
+from __future__ import annotations
+
+import logging
+
+import httpx
+
+from coord.config import Config
+from coord.merge_queue import QueuedMerge, _chain_work_ids
+from coord.models import Assignment, Board
+
+_log = logging.getLogger(__name__)
+
+
+# #2510: bounded the same shape as MAX_CI_INFRA_RERUNS/MAX_CI_FLAKY_RERUNS —
+# a couple of genuine attempts is enough to tell "this is fixable by a
+# worker" from "this needs a human"; a higher cap just burns more of the
+# same exhausted budget the way an unbounded conflict-fix retry would.
+MAX_CI_FIX_DISPATCHES = 2
+
+# Prefix on the dispatched fix worker's issue_title — mirrors
+# `conflict_fix.SEMANTIC_FIX_TITLE_PREFIX`'s visibility purpose: the TUI
+# Pipeline row and the fix briefing itself both make it obvious WHY this
+# round was dispatched (a CI failure, not a review request-changes bounce).
+CI_FIX_TITLE_PREFIX = "[ci-fix]"
+
+
+def build_ci_fix_briefing(
+    *,
+    entry: QueuedMerge,
+    checks_summary: str,
+    attempt: int,
+) -> str:
+    """Assemble the CI-fix worker's briefing. Pure function — testable."""
+    lines: list[str] = [
+        f"# CI failure fix: {entry.repo_github} branch `{entry.branch}`",
+        "",
+        f"Issue #{entry.issue_number} — {entry.issue_title}",
+        "",
+        "Review already approved this PR and it reached the Merge gate, "
+        "where GitHub Actions CI reported a REAL failure (not infra, and "
+        "not resolved by one automatic re-run) on the checks below:",
+        "",
+        f"    {checks_summary}",
+        "",
+        f"This is fix attempt {attempt}/{MAX_CI_FIX_DISPATCHES} for this "
+        "failure streak — the coordinator will escalate to a human if this "
+        "many attempts don't produce a green run.",
+        "",
+        "## What to do",
+        "",
+        "1. You are already on this issue's existing branch — continue on "
+        "it, do NOT start a fresh branch.",
+        "2. Reproduce the failure locally if the project's test command "
+        "covers it (`coord`'s Test stage already runs the same diff-scoped "
+        "suite CI reruns in full — a failure CI alone caught may live in a "
+        "suite that only runs in CI, e.g. a sealed acceptance suite).",
+        "3. Fix the actual regression. Do not edit the failing check's "
+        "workflow config to make it pass without fixing the underlying "
+        "issue, and do not skip/xfail the failing test unless the test "
+        "itself is proven wrong.",
+        "4. Commit and push to the SAME branch. The coordinator re-runs "
+        "Test, Review, and CI from scratch on the new commit — this is not "
+        "a force-merge shortcut.",
+        "",
+        "You will NOT use `gh` — the coordinator owns PR/issue interaction "
+        "and CI status reads.",
+        "",
+        f"Last merge-gate error: {entry.error or checks_summary}",
+    ]
+    return "\n".join(lines)
+
+
+def _has_active_fix(board: Board, entry: QueuedMerge) -> bool:
+    """True when a WORK_LIKE fix for *entry*'s chain is already running or
+    pending — regardless of whether it was dispatched for this CI failure or
+    an unrelated review bounce; either way a second dispatch here would race
+    it onto the same branch.
+    """
+    pool = list(board.completed) + list(board.active)
+    chain_ids = _chain_work_ids(entry, pool)
+    active_ids = {
+        getattr(a, "assignment_id", None) for a in board.active
+    } - {None}
+    for a in pool:
+        aid = getattr(a, "assignment_id", None)
+        if aid is None or aid not in chain_ids or aid == entry.assignment_id:
+            continue
+        if aid in active_ids and getattr(a, "status", None) in ("running", "pending"):
+            return True
+    return False
+
+
+def dispatch_ci_fix(
+    entry: QueuedMerge,
+    board: Board,
+    config: Config,
+    *,
+    checks_summary: str | None = None,
+    http_client: httpx.Client | None = None,
+) -> Assignment | None:
+    """Dispatch a fix worker for *entry*'s confirmed CI failure.
+
+    Returns the new ``Assignment``, or ``None`` when dispatch couldn't
+    proceed: the retry cap (:data:`MAX_CI_FIX_DISPATCHES`) is already spent,
+    a fix for this chain is already in flight, the original work assignment
+    can't be found on *board*, or the underlying ``_dispatch_fix`` call
+    itself declined (no capable machine, agent unreachable, …). The caller
+    (``coord.commands.merge._dispatch_ci_fixes``) is responsible for
+    promoting *entry* to ``HUMAN_REQUIRED`` when this returns ``None`` with
+    the retry cap exhausted, and for persisting the board/queue.
+
+    Does NOT increment ``entry.ci_fix_dispatches`` on a ``None`` return —
+    only a successful dispatch spends the budget, mirroring how
+    ``ci_infra_reruns``/``ci_flaky_reruns`` are only bumped when their
+    respective remedy actually fired.
+    """
+    if entry.ci_fix_dispatches >= MAX_CI_FIX_DISPATCHES:
+        return None
+    if _has_active_fix(board, entry):
+        return None
+    if entry.assignment_id is None:
+        return None
+    work = board.find_by_id(entry.assignment_id)
+    if work is None:
+        _log.warning(
+            "ci_fix: cannot find original work assignment %s for %s#%d — "
+            "no fix dispatched",
+            entry.assignment_id, entry.repo_name, entry.issue_number,
+        )
+        return None
+
+    summary = checks_summary or entry.error or "CI checks failed"
+    briefing = build_ci_fix_briefing(
+        entry=entry, checks_summary=summary, attempt=entry.ci_fix_dispatches + 1,
+    )
+
+    from coord.auto_loop import _dispatch_fix  # noqa: PLC0415
+
+    fix = _dispatch_fix(
+        work, briefing, board, config, entry.ci_fix_dispatches + 1,
+        http_client=http_client,
+    )
+    if fix is None:
+        return None
+
+    # #2510 visibility: mark the row so the TUI/board can tell a CI-triggered
+    # round apart from an ordinary review-bounce fix at a glance, same
+    # purpose as conflict_fix's SEMANTIC_FIX_TITLE_PREFIX.
+    fix.issue_title = f"{CI_FIX_TITLE_PREFIX} {work.issue_title}"
+
+    entry.ci_fix_dispatches += 1
+
+    from coord.audit import record_audit  # noqa: PLC0415
+
+    record_audit(
+        tier="operational",
+        category="merge",
+        event_type="ci_fix_dispatched",
+        actor="daemon",
+        summary=(
+            f"ci-fix dispatched ({entry.ci_fix_dispatches}/"
+            f"{MAX_CI_FIX_DISPATCHES}): {entry.repo_name}#{entry.issue_number} "
+            f"-> {fix.machine_name}"
+        ),
+        repo=entry.repo_name,
+        issue=entry.issue_number,
+        assignment_id=fix.assignment_id,
+        machine=fix.machine_name,
+        details={
+            "merge_entry_id": entry.assignment_id,
+            "ci_fix_dispatches": entry.ci_fix_dispatches,
+            "checks_summary": summary,
+        },
+    )
+
+    return fix
