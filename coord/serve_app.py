@@ -1149,7 +1149,9 @@ def _auto_drain_tick(config: Config) -> "list":
 
     # Build the CI store; fail-open so a transient gh error doesn't disable drain.
     try:
-        ci_store = build_ci_store(config.ci_store.type)
+        ci_store = build_ci_store(
+            config.ci_store.type, host=config.ci_store.host, token_env=config.ci_store.token_env
+        )
     except Exception:  # noqa: BLE001
         ci_store = None
 

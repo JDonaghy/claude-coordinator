@@ -435,7 +435,7 @@ class TestFixFromRedCi:
             _check("test (3.12)", "failure"),
         ]
         monkeypatch.setattr(
-            "coord.ci_store.build_ci_store", lambda _type: fake_store
+            "coord.ci_store.build_ci_store", lambda _type, **_kw: fake_store
         )
 
         captured = {}
@@ -467,7 +467,7 @@ class TestFixFromRedCi:
         fake_store.is_available = True
         fake_store.list_checks_for_pr.return_value = [_check("build", "success")]
         monkeypatch.setattr(
-            "coord.ci_store.build_ci_store", lambda _type: fake_store
+            "coord.ci_store.build_ci_store", lambda _type, **_kw: fake_store
         )
 
         result = CliRunner().invoke(
@@ -490,7 +490,7 @@ class TestFixFromRedCi:
         fake_store.is_available = True
         fake_store.list_checks_for_pr.return_value = [_check("build", "success")]
         monkeypatch.setattr(
-            "coord.ci_store.build_ci_store", lambda _type: fake_store
+            "coord.ci_store.build_ci_store", lambda _type, **_kw: fake_store
         )
 
         result = CliRunner().invoke(
@@ -511,7 +511,7 @@ class TestFixFromRedCi:
         fake_store.is_available = True
         fake_store.list_checks_for_pr.return_value = [_check("build", "success")]
         monkeypatch.setattr(
-            "coord.ci_store.build_ci_store", lambda _type: fake_store
+            "coord.ci_store.build_ci_store", lambda _type, **_kw: fake_store
         )
 
         captured = {}
@@ -649,7 +649,8 @@ class TestFixFromFailedAcceptanceGate:
         )
 
         monkeypatch.setattr(
-            "coord.ci_store.build_ci_store", lambda _type: MagicMock(is_available=False)
+            "coord.ci_store.build_ci_store",
+            lambda _type, **_kw: MagicMock(is_available=False),
         )
 
         result = CliRunner().invoke(

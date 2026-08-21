@@ -1807,7 +1807,7 @@ def live_ci_backend(monkeypatch):
 
     state: dict = {"checks": [], "mergeable": None}
     monkeypatch.setattr(
-        ci_store_module, "build_ci_store", lambda t: _FakeLiveCi(state)
+        ci_store_module, "build_ci_store", lambda t, **_kw: _FakeLiveCi(state)
     )
     # A small, fixed base-commit timestamp: every check below starts well
     # after it, so the #1851 staleness gate reads "fresh", not "stale".

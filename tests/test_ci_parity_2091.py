@@ -268,7 +268,7 @@ class TestCiReadReasons:
 
         fake_store = MagicMock()
         fake_store.is_available = True
-        monkeypatch.setattr("coord.ci_store.build_ci_store", lambda _t: fake_store)
+        monkeypatch.setattr("coord.ci_store.build_ci_store", lambda _t, **_kw: fake_store)
         monkeypatch.setattr("coord.github_ops.find_pr_for_branch", lambda *_a: None)
 
         read = _read_ci(_cfg(ci_config), _work(pr_url=""))
@@ -288,7 +288,7 @@ class TestCiReadReasons:
         fake_store.list_checks_for_pr.return_value = [
             _check("e2e smoke (playwright)", "failure")
         ]
-        monkeypatch.setattr("coord.ci_store.build_ci_store", lambda _t: fake_store)
+        monkeypatch.setattr("coord.ci_store.build_ci_store", lambda _t, **_kw: fake_store)
         monkeypatch.setattr(
             "coord.github_ops.find_pr_for_branch", lambda *_a: {"number": 42}
         )
@@ -305,7 +305,7 @@ class TestCiReadReasons:
         fake_store = MagicMock()
         fake_store.is_available = True
         fake_store.list_checks_for_pr.side_effect = RuntimeError("gh exploded")
-        monkeypatch.setattr("coord.ci_store.build_ci_store", lambda _t: fake_store)
+        monkeypatch.setattr("coord.ci_store.build_ci_store", lambda _t, **_kw: fake_store)
 
         read = _read_ci(_cfg(ci_config), _work())
         assert not read.was_read
@@ -317,7 +317,7 @@ class TestCiReadReasons:
         fake_store = MagicMock()
         fake_store.is_available = True
         fake_store.list_checks_for_pr.return_value = []
-        monkeypatch.setattr("coord.ci_store.build_ci_store", lambda _t: fake_store)
+        monkeypatch.setattr("coord.ci_store.build_ci_store", lambda _t, **_kw: fake_store)
 
         read = _read_ci(_cfg(ci_config), _work())
         assert not read.was_read
@@ -335,7 +335,7 @@ class TestCiReadReasons:
         fake_store.list_checks_for_pr.return_value = [
             _check("e2e smoke (playwright)", None, status="in_progress")
         ]
-        monkeypatch.setattr("coord.ci_store.build_ci_store", lambda _t: fake_store)
+        monkeypatch.setattr("coord.ci_store.build_ci_store", lambda _t, **_kw: fake_store)
 
         read = _read_ci(_cfg(ci_config), _work())
         assert not read.was_read
@@ -349,7 +349,7 @@ class TestCiReadReasons:
         fake_store = MagicMock()
         fake_store.is_available = True
         fake_store.list_checks_for_pr.return_value = [_check("build", "success")]
-        monkeypatch.setattr("coord.ci_store.build_ci_store", lambda _t: fake_store)
+        monkeypatch.setattr("coord.ci_store.build_ci_store", lambda _t, **_kw: fake_store)
 
         read = _read_ci(_cfg(ci_config), _work())
         assert read.was_read
@@ -381,7 +381,7 @@ class TestFixSurfacesWhyCiWasNotRead:
         fake_store = MagicMock()
         fake_store.is_available = True
         fake_store.list_checks_for_pr.return_value = [_check("build", "success")]
-        monkeypatch.setattr("coord.ci_store.build_ci_store", lambda _t: fake_store)
+        monkeypatch.setattr("coord.ci_store.build_ci_store", lambda _t, **_kw: fake_store)
 
         result = CliRunner().invoke(
             main, ["fix", "work-abc", "--config", str(ci_config)]
@@ -413,7 +413,7 @@ class TestStoredPassedVsLiveRedIsAConflict:
         fake_store.list_checks_for_pr.return_value = [
             _check("e2e smoke (playwright)", "failure")
         ]
-        monkeypatch.setattr("coord.ci_store.build_ci_store", lambda _t: fake_store)
+        monkeypatch.setattr("coord.ci_store.build_ci_store", lambda _t, **_kw: fake_store)
 
         with patch("coord.dispatch.dispatch", return_value={"id": "fix-ci"}), \
              patch("coord.github_ops.post_issue_comment"):
@@ -436,7 +436,7 @@ class TestStoredPassedVsLiveRedIsAConflict:
         cheap in-DB path must stay zero-I/O, so CI is never even read."""
         state_mod.save_board(Board(completed=[_work(test_state="failed", smoke_test="fail")]))
 
-        def _boom(_t):
+        def _boom(_t, **_kw):
             raise AssertionError("CI must not be read when the verdict failed")
 
         monkeypatch.setattr("coord.ci_store.build_ci_store", _boom)

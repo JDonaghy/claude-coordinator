@@ -2001,7 +2001,9 @@ def _fetch_live_ci_gate(
 
         cfg = _load_config(config_path)
         board = _load_board()
-        ci_store = build_ci_store(cfg.ci_store.type)
+        ci_store = build_ci_store(
+            cfg.ci_store.type, host=cfg.ci_store.host, token_env=cfg.ci_store.token_env
+        )
         queue_by_key = {
             entry_key(q.repo_name, q.issue_number): q for q in _mq.load_queue()
         }
@@ -2089,7 +2091,9 @@ def _fetch_live_blocked_gate(
 
         cfg = _load_config(config_path)
         board = _load_board()
-        ci_store = build_ci_store(cfg.ci_store.type)
+        ci_store = build_ci_store(
+            cfg.ci_store.type, host=cfg.ci_store.host, token_env=cfg.ci_store.token_env
+        )
         queue_by_key = {
             entry_key(q.repo_name, q.issue_number): q for q in _mq.load_queue()
         }

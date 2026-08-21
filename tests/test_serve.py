@@ -5470,7 +5470,7 @@ def test_auto_drain_ready_entry_merges(
     # NoOpCi so CI gate is always a pass (is_available=False).  Patch at the
     # source module — _auto_drain_tick imports build_ci_store as a local import.
     from coord.ci_store import NoOpCi as _NoOpCi
-    monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t: _NoOpCi())
+    monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t, **_kw: _NoOpCi())
 
     _seed_queued_ready_entry(rw_db)
     drain_config_path = _make_drain_config(tmp_path, auto_drain=True)
@@ -5533,7 +5533,7 @@ def test_auto_drain_reconciles_stale_conflict_before_planning(
         "coord.github_ops.merge_pr", lambda repo, number, method="rebase": (True, "merged"),
     )
     from coord.ci_store import NoOpCi as _NoOpCi
-    monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t: _NoOpCi())
+    monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t, **_kw: _NoOpCi())
 
     drain_config_path = _make_drain_config(tmp_path, auto_drain=True)
     monkeypatch.setenv("COORD_CONFIG", str(drain_config_path))
@@ -5575,7 +5575,7 @@ def test_auto_drain_still_conflicting_entry_stays_parked(
         lambda repo, number, method="rebase": merge_calls.append((repo, number)) or (True, "merged"),
     )
     from coord.ci_store import NoOpCi as _NoOpCi
-    monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t: _NoOpCi())
+    monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t, **_kw: _NoOpCi())
 
     cfg = load_config(_make_drain_config(tmp_path, auto_drain=True))
     events = _auto_drain_tick(cfg)
@@ -5608,7 +5608,7 @@ def test_auto_drain_blocked_entry_not_touched(
         lambda repo, number, method="rebase": merge_calls.append((repo, number)) or (True, "merged"),
     )
     from coord.ci_store import NoOpCi as _NoOpCi
-    monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t: _NoOpCi())
+    monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t, **_kw: _NoOpCi())
 
     _seed_queued_blocked_entry(rw_db)
     cfg = load_config(_make_drain_config(tmp_path, auto_drain=True))
@@ -5694,7 +5694,7 @@ def test_auto_drain_never_triggers_ci_rerun_for_stale_ci(
             rerun_calls.append((repo, number))
             return True
 
-    monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t: _FakeCiStore())
+    monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t, **_kw: _FakeCiStore())
     monkeypatch.setattr(
         "coord.github_ops.get_branch_commit_timestamp",
         lambda repo, branch: 1000.0,  # newer than the check's started_at=500.0
@@ -5783,7 +5783,7 @@ def test_auto_drain_serializes_on_merge_lock(
     from coord.serve_app import _auto_drain_tick, _merge_lock
 
     from coord.ci_store import NoOpCi as _NoOpCi
-    monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t: _NoOpCi())
+    monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t, **_kw: _NoOpCi())
 
     process_called = threading.Event()
 
@@ -6726,7 +6726,7 @@ def test_auto_drain_marks_a_sibling_the_merge_just_conflicted(
         "coord.github_ops.check_pr_mergeable", lambda repo, number: number == 201,
     )
     from coord.ci_store import NoOpCi as _NoOpCi
-    monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t: _NoOpCi())
+    monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t, **_kw: _NoOpCi())
 
     _seed_queued_ready_entry(rw_db)
     # A sibling on the SAME base with an open PR, blocked on something else
@@ -6781,7 +6781,7 @@ def test_auto_drain_leaves_a_clean_sibling_alone(
     )
     monkeypatch.setattr("coord.github_ops.check_pr_mergeable", lambda repo, number: True)
     from coord.ci_store import NoOpCi as _NoOpCi
-    monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t: _NoOpCi())
+    monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t, **_kw: _NoOpCi())
 
     _seed_queued_ready_entry(rw_db)
     rw_db.execute(

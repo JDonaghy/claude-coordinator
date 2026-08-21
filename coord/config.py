@@ -1195,14 +1195,23 @@ class MilestoneConfig:
 class CiStoreConfig:
     """Backend selection for CI check visibility (#240).
 
-    ``type`` is one of ``github`` (shell out to ``gh pr checks``) or
-    ``none`` (always-empty :class:`coord.ci_store.NoOpCi`).  When the block
-    is absent we default to ``github`` since it's a no-op upgrade for users
-    who already have ``gh`` configured.  Future backends (GitLab, Buildkite)
-    add new ``type`` values without breaking existing configs.
+    ``type`` is one of ``github`` (shell out to ``gh pr checks``),
+    ``gitlab`` (#1897: GitLab Pipelines API via ``httpx``), or ``none``
+    (always-empty :class:`coord.ci_store.NoOpCi`).  When the block is absent
+    we default to ``github`` since it's a no-op upgrade for users who
+    already have ``gh`` configured.  Future backends (Buildkite) add new
+    ``type`` values without breaking existing configs.
+
+    ``host``/``token_env`` are consumed only by ``type: gitlab`` — see
+    :class:`coord.ci_gitlab.GitLabCi`. ``token_env`` names an environment
+    variable holding a GitLab personal/project access token; the token
+    itself is deliberately never accepted in this config (coordinator.yml
+    is checked in / shared across machines, an env var is not).
     """
 
     type: str = "github"
+    host: str = "gitlab.com"
+    token_env: str = "GITLAB_TOKEN"
 
 
 @dataclass
@@ -3243,9 +3252,19 @@ def _parse_ci_store(raw: Any) -> CiStoreConfig:
     cfg = CiStoreConfig()
     if "type" in raw:
         value = raw["type"]
-        if not isinstance(value, str) or value not in ("github", "none"):
-            raise ConfigError("ci_store.type must be one of: github, none")
+        if not isinstance(value, str) or value not in ("github", "gitlab", "none"):
+            raise ConfigError("ci_store.type must be one of: github, gitlab, none")
         cfg.type = value
+    if "host" in raw:
+        value = raw["host"]
+        if not isinstance(value, str) or not value:
+            raise ConfigError("ci_store.host must be a non-empty string")
+        cfg.host = value
+    if "token_env" in raw:
+        value = raw["token_env"]
+        if not isinstance(value, str) or not value:
+            raise ConfigError("ci_store.token_env must be a non-empty string")
+        cfg.token_env = value
     return cfg
 
 

@@ -564,16 +564,32 @@ def checks_are_stale(checks: list[CheckRun], base_commit_time: float | None) -> 
     return any(c.started_at is None or c.started_at < base_commit_time for c in checks)
 
 
-def build_ci_store(ci_store_type: str) -> CiStore:
+def build_ci_store(
+    ci_store_type: str, *, host: str | None = None, token_env: str | None = None
+) -> CiStore:
     """Construct the CiStore backend named by ``ci_store_type``.
 
     Centralised here so callers (merge gate, TUI fetcher, tests) don't need to
     branch on the config value themselves. Unknown types fall back to NoOpCi
     so a typo in coordinator.yml doesn't crash the merge command.
+
+    ``host``/``token_env`` (#1897) are only consumed by the ``gitlab``
+    backend — every other backend ignores them, so existing callers that
+    only ever pass ``ci_store_type`` keep working unmodified. Falsy values
+    (``None`` or ``""``) are treated as "use the backend's own default"
+    rather than forwarded as an explicit override.
     """
     if ci_store_type == "github":
         from coord.ci_github import GitHubCi  # noqa: PLC0415
         return GitHubCi()
+    if ci_store_type == "gitlab":
+        from coord.ci_gitlab import GitLabCi  # noqa: PLC0415
+        kwargs: dict[str, str] = {}
+        if host:
+            kwargs["host"] = host
+        if token_env:
+            kwargs["token_env"] = token_env
+        return GitLabCi(**kwargs)
     return NoOpCi()
 
 

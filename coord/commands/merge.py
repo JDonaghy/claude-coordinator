@@ -1657,7 +1657,9 @@ def merge(
 
         _cfg = _load_config(config_path)
         _board = _load_board()
-        _ci = _build_ci_store(_cfg.ci_store.type)
+        _ci = _build_ci_store(
+            _cfg.ci_store.type, host=_cfg.ci_store.host, token_env=_cfg.ci_store.token_env
+        )
 
         # #1477: re-test any parked CONFLICT entry against GitHub's own
         # mergeability computation before building the plan — otherwise a
@@ -1852,7 +1854,11 @@ def merge(
         from coord.models import Board as _Board  # noqa: PLC0415
         _raw_board_only = load_board()
         board_only = _raw_board_only if _raw_board_only is not None else _Board(active=[], completed=[])
-        ci_store_only = build_ci_store(cfg_only.ci_store.type)
+        ci_store_only = build_ci_store(
+            cfg_only.ci_store.type,
+            host=cfg_only.ci_store.host,
+            token_env=cfg_only.ci_store.token_env,
+        )
         # #1695: name the blocking gate(s) up front. Under #1695 a gate-blocked
         # row IS enqueued (visibly BLOCKED) instead of being dropped, so
         # `--only` now resolves it — and the operator needs to be told, before
@@ -2195,7 +2201,9 @@ def merge(
             click.echo(f"  [{x.state}] {x.repo_name} #{x.issue_number} ({x.branch})")
         return
 
-    ci_store = build_ci_store(cfg.ci_store.type)
+    ci_store = build_ci_store(
+        cfg.ci_store.type, host=cfg.ci_store.host, token_env=cfg.ci_store.token_env
+    )
     if skip_review:
         click.echo("  --skip-review: review-approval gate bypassed (#253)")
     if skip_smoke:

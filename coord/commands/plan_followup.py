@@ -559,7 +559,9 @@ def _read_ci(cfg: Config, assignment) -> CiRead:
     # Availability first (#2091): `_resolve_pr_number`'s branch fallback can
     # shell out to `gh`, and there is no point paying for that when the store
     # will refuse to read anything anyway.
-    store = build_ci_store(cfg.ci_store.type)
+    store = build_ci_store(
+        cfg.ci_store.type, host=cfg.ci_store.host, token_env=cfg.ci_store.token_env
+    )
     if not store.is_available:
         return CiRead(
             unread_reason=(
