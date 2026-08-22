@@ -299,6 +299,30 @@ class TestConfirmBranch:
         assert result.refuted is False
         assert result.inconclusive is True
 
+    def test_timeout_captures_the_partial_output_before_the_kill(
+        self, checkout: Path
+    ) -> None:
+        """#2563: a timed-out suite still says SOMETHING — whatever it had
+        printed by the deadline. `subprocess.run(capture_output=True,
+        timeout=...)` fills `TimeoutExpired.stdout`/`.stderr` in on the way
+        out; before this, `confirm_branch` discarded both and a TIMEOUT
+        verdict carried strictly less evidence than a real failure did.
+        """
+        runner = _ScriptedRunner(
+            default=subprocess.TimeoutExpired(
+                cmd="run-the-suite", timeout=1,
+                output="tests/test_x.py::test_a PASSED\ntests/test_x.py::test_b ",
+                stderr="Traceback (hung mid-test)",
+            )
+        )
+        result = ct.confirm_branch(
+            "api", BRANCH, _StubConfig(repo_path=str(checkout)), runner=runner,
+        )
+
+        assert result.kind == KIND_TIMEOUT, result.reason
+        assert "test_a PASSED" in result.output
+        assert "Traceback (hung mid-test)" in result.output
+
     def test_signal_killed_suite_is_inconclusive_not_a_refutation(
         self, checkout: Path
     ) -> None:
@@ -592,6 +616,54 @@ class TestConfirmationEnabled:
         assert ct.confirmation_enabled(object()) is True
 
 
+class TestWriteConfirmationOutput:
+    """#2563: the missing write — a confirmation's captured tail must reach
+    ``COORD_DIR/test_output/<assignment_id>.txt``, the same file `coord fix`
+    (`coord/commands/plan_followup.py`) already prefers over every other
+    evidence source when composing an escalated fix worker's briefing.
+    """
+
+    def test_writes_the_output_tail_keyed_by_assignment_id(
+        self, isolated_coord_dir: Path
+    ) -> None:
+        result = ct.ConfirmationResult(
+            kind=KIND_SUITE,
+            reason="the independently-run suite command FAILED (exit 1)",
+            output="tests/test_x.py::test_a FAILED\nE   assert 0 == 1",
+            returncode=1,
+        )
+
+        stored = ct.write_confirmation_output("work-1", result)
+
+        expected = isolated_coord_dir / "test_output" / "work-1.txt"
+        assert stored == expected
+        assert expected.read_text() == result.output
+
+    def test_no_op_when_the_result_carries_no_output(
+        self, isolated_coord_dir: Path
+    ) -> None:
+        """`KIND_OK` (confirmed) and setup-stage inconclusives carry an empty
+        `.output` — nothing to persist, and nothing should be written."""
+        result = ct.ConfirmationResult(kind=KIND_OK, reason="passed", output="")
+
+        stored = ct.write_confirmation_output("work-1", result)
+
+        assert stored is None
+        assert not (isolated_coord_dir / "test_output").exists()
+
+    def test_a_write_failure_returns_none_rather_than_raising(
+        self, isolated_coord_dir: Path
+    ) -> None:
+        """This runs inside the reap path (`coord.notify`) — a read-only
+        `COORD_DIR`, a full disk, or any other `OSError` must degrade to "no
+        file", never abandon the verdict it is attached to."""
+        # A file sitting where the directory needs to go makes `mkdir` raise.
+        (isolated_coord_dir / "test_output").write_text("not a directory")
+        result = ct.ConfirmationResult(kind=KIND_SUITE, reason="x", output="boom")
+
+        assert ct.write_confirmation_output("work-1", result) is None
+
+
 # ── the wiring: end to end through post_transition ───────────────────────────
 
 
@@ -713,6 +785,51 @@ class TestSmokeVerdictIsConfirmed:
             "the row must say WHY it was overturned, so an operator is not left "
             f"guessing: {row['test_reason']!r}"
         )
+
+    def test_refutation_leaves_the_captured_tail_for_the_fix_briefing(
+        self, coord_db, tmp_path: Path, isolated_coord_dir: Path
+    ) -> None:
+        """#2563: before this, `result.output` reached `log.warning` and
+        nowhere else — the escalated fix worker got a one-line reason and no
+        failing test names, no tracebacks. `coord fix`
+        (`coord/commands/plan_followup.py:962`) reads
+        `COORD_DIR/test_output/<parent_work_id>.txt` ahead of every other
+        evidence source, so that is where the captured tail must land — keyed
+        by the WORK row's id (`work-1`), not the confirming smoke
+        transition's (`smoke-1`), since that is the assignment a fix leg is
+        spawned from.
+        """
+        self._record_work()
+        self._record_smoke()
+        transition, record, entry = self._transition(tmp_path, "SMOKE: pass")
+        captured_output = (
+            "tests/test_drive.py::test_a_dead_end_exit_code_reaches_the_"
+            "drive_exited_audit_row FAILED\n"
+            "tests/test_drive.py:2581: in "
+            "test_a_dead_end_exit_code_reaches_the_drive_exited_audit_row\n"
+            "    assert len(escalations) == 1\n"
+            "E   assert 0 == 1"
+        )
+
+        self._reap(
+            transition, record, entry,
+            ct.ConfirmationResult(
+                kind=KIND_SUITE,
+                reason="the independently-run suite command FAILED (exit 1)",
+                output=captured_output,
+                returncode=1,
+            ),
+        )
+
+        stored = isolated_coord_dir / "test_output" / "work-1.txt"
+        assert stored.exists(), (
+            "a refuted pass claim must leave the captured tail at "
+            f"{stored} for `coord fix` to read"
+        )
+        assert stored.read_text() == captured_output
+        # And nothing lands under the smoke leg's OWN id — `coord fix` is
+        # dispatched against the work row, not the smoke transition.
+        assert not (isolated_coord_dir / "test_output" / "smoke-1.txt").exists()
 
     def test_self_recorded_pass_is_overturned_by_a_failing_real_run(
         self, coord_db, tmp_path: Path
@@ -850,9 +967,14 @@ class TestSmokeVerdictIsConfirmed:
         )
 
     def test_baseline_red_confirmation_records_skipped(
-        self, coord_db, tmp_path: Path
+        self, coord_db, tmp_path: Path, isolated_coord_dir: Path
     ) -> None:
-        """#2170's convention: not the branch's fault, so no fix round burns."""
+        """#2170's convention: not the branch's fault, so no fix round burns.
+
+        #2563: a `skipped` verdict whose evidence is unreadable is only
+        marginally better than a bare one — the baseline-red tail gets the
+        same test_output-file treatment as a REFUTED one.
+        """
         self._record_work()
         self._record_smoke()
         transition, record, entry = self._transition(tmp_path, "SMOKE: pass")
@@ -860,7 +982,9 @@ class TestSmokeVerdictIsConfirmed:
         self._reap(
             transition, record, entry,
             ct.ConfirmationResult(
-                kind=KIND_BASELINE_RED, reason="every failure reproduces on the base",
+                kind=KIND_BASELINE_RED,
+                reason="every failure reproduces on the base",
+                output="tests/test_x.py::test_a FAILED (also red on main)",
             ),
         )
 
@@ -868,6 +992,8 @@ class TestSmokeVerdictIsConfirmed:
         assert row["test_state"] == "skipped", (
             f"expected 'skipped' for a red baseline, got {row['test_state']!r}"
         )
+        stored = isolated_coord_dir / "test_output" / "work-1.txt"
+        assert stored.read_text() == "tests/test_x.py::test_a FAILED (also red on main)"
 
     def test_a_fail_marker_does_not_spend_a_confirmation_run(
         self, coord_db, tmp_path: Path

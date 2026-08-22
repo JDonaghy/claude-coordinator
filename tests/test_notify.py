@@ -2689,7 +2689,7 @@ class TestConfirmedPassVerdictSignalKill:
             "coord.notify._run_pass_confirmation", return_value=killed,
         ):
             state, reason = _confirmed_pass_verdict(
-                self._transition(), entry, claim_reason="SMOKE: pass",
+                self._transition(), entry, "work-1", claim_reason="SMOKE: pass",
             )
 
         assert state == "passed", (
