@@ -9,6 +9,7 @@ import pytest
 
 from coord.acceptance import (
     ForPathResolutionError,
+    MANIFEST_FRAGMENTS_DIRNAME,
     MOCK_EXT_TO_DRIVER_KIND,
     ManifestData,
     ManifestError,
@@ -93,6 +94,42 @@ class TestLoadManifest:
         (root / "ms01").mkdir(parents=True)
         (root / "ms01" / "manifest.yml").write_text("")
         assert load_manifest(root) == {}
+
+    def test_reads_per_issue_fragments(self, tmp_path: Path) -> None:
+        """#2543: two issues' slices under the SAME milestone, each writing
+        only its own manifest.d/<issue>.yml fragment — never one shared
+        file — merge into one mapping exactly like two ms-dirs' legacy
+        manifest.yml files already did."""
+        root = tmp_path / "tests" / "acceptance"
+        frag_dir = root / "ms01" / MANIFEST_FRAGMENTS_DIRNAME
+        frag_dir.mkdir(parents=True)
+        (frag_dir / "944.yml").write_text("issues:\n  944: [ms01::a, ms01::b]\n")
+        (frag_dir / "945.yml").write_text("issues:\n  945: [ms01::c]\n")
+        manifest = load_manifest(root)
+        assert manifest == {"ms01::a": 944, "ms01::b": 944, "ms01::c": 945}
+
+    def test_merges_legacy_file_and_fragments_in_same_ms_dir(self, tmp_path: Path) -> None:
+        """Backward compat (#2543): an already-merged legacy manifest.yml
+        (this repo's own tests/acceptance/ms-33/manifest.yml shape) keeps
+        working unchanged alongside NEW per-issue fragments landing in the
+        same ms-dir going forward."""
+        root = tmp_path / "tests" / "acceptance"
+        ms = root / "ms01"
+        ms.mkdir(parents=True)
+        (ms / "manifest.yml").write_text("tests:\n  ms01::legacy: 900\n")
+        frag_dir = ms / MANIFEST_FRAGMENTS_DIRNAME
+        frag_dir.mkdir()
+        (frag_dir / "944.yml").write_text("issues:\n  944: [ms01::a]\n")
+        manifest = load_manifest(root)
+        assert manifest == {"ms01::legacy": 900, "ms01::a": 944}
+
+    def test_fragment_dir_with_non_manifest_files_ignores_them(self, tmp_path: Path) -> None:
+        root = tmp_path / "tests" / "acceptance"
+        frag_dir = root / "ms01" / MANIFEST_FRAGMENTS_DIRNAME
+        frag_dir.mkdir(parents=True)
+        (frag_dir / "944.yml").write_text("issues:\n  944: [ms01::a]\n")
+        (frag_dir / "README.md").write_text("not a manifest fragment\n")
+        assert load_manifest(root) == {"ms01::a": 944}
 
 
 class TestTestIdsForIssue:
@@ -180,6 +217,16 @@ class TestMsDirForIssue:
         (root / "ms01" / "manifest.yml").write_text("tests: [not, a, mapping\n")
         with pytest.raises(ManifestError):
             ms_dir_for_issue(root, 945)
+
+    def test_finds_owning_dir_via_fragment(self, tmp_path: Path) -> None:
+        """#2543: the issue's own manifest.d/<issue>.yml fragment resolves
+        to its OWNING ms-dir name, not the fragment directory's own name
+        ("manifest.d")."""
+        root = tmp_path / "tests" / "acceptance"
+        frag_dir = root / "ms01" / MANIFEST_FRAGMENTS_DIRNAME
+        frag_dir.mkdir(parents=True)
+        (frag_dir / "944.yml").write_text("issues:\n  944: [ms01::a]\n")
+        assert ms_dir_for_issue(root, 944) == "ms01"
 
 
 class TestParseManifestText:
@@ -314,6 +361,41 @@ class TestLoadExpectedRed:
         )
         assert load_expected_red(root, driver_kind="web-playwright") == {
             "bare_bug_test": 9
+        }
+
+    def test_merges_per_issue_fragments(self, tmp_path: Path) -> None:
+        """#2543: expected_red recorded in a per-issue manifest.d/<issue>.yml
+        fragment merges exactly like a legacy shared manifest.yml's block
+        did."""
+        root = tmp_path / "tests" / "acceptance"
+        frag_dir = root / "ms11" / MANIFEST_FRAGMENTS_DIRNAME
+        frag_dir.mkdir(parents=True)
+        (frag_dir / "554.yml").write_text("expected_red:\n  554:\n    - a\n")
+        (frag_dir / "600.yml").write_text("expected_red:\n  600:\n    - c\n")
+        assert load_expected_red(root) == {"a": 554, "c": 600}
+
+    def test_driver_kind_resolves_ms_dir_for_a_fragment_path(self, tmp_path: Path) -> None:
+        """#2543: driver_kind filtering must resolve the OWNING ms-dir's
+        mocks/ for a fragment path (its grandparent), not the manifest.d/
+        directory itself (which never has a mocks/ sibling)."""
+        root = tmp_path / "tests" / "acceptance"
+        ms_tui = root / "ms65"
+        (ms_tui / "mocks").mkdir(parents=True)
+        (ms_tui / "mocks" / "board.screen").write_text("mock")
+        frag_dir = ms_tui / MANIFEST_FRAGMENTS_DIRNAME
+        frag_dir.mkdir()
+        (frag_dir / "2282.yml").write_text(
+            "expected_red:\n  2282:\n    - board_tabs_2282::a\n"
+        )
+
+        ms_cli = root / "ms37"
+        (ms_cli / "mocks").mkdir(parents=True)
+        (ms_cli / "mocks" / "usage.out").write_text("mock")
+        (ms_cli / "manifest.yml").write_text("expected_red:\n  1118:\n    - test_x\n")
+
+        assert load_expected_red(root, driver_kind="cli-pytest") == {"test_x": 1118}
+        assert load_expected_red(root, driver_kind="tui-tuidriver") == {
+            "board_tabs_2282::a": 2282
         }
 
 
@@ -526,6 +608,15 @@ class _FakeApiGhOps:
             raise RuntimeError(f"not found: {path}")
         return self.files[path], f"sha-{path}"
 
+    def list_repo_dir(self, repo: str, path: str, branch: str = "develop") -> list[str]:
+        """Filenames directly under *path* — #2543's fragment-dir listing
+        (``manifest.d/``) needs this alongside ``list_repo_subdirs``."""
+        prefix = path + "/"
+        return sorted(
+            name[len(prefix):] for name in self.files
+            if name.startswith(prefix) and "/" not in name[len(prefix):]
+        )
+
     def get_default_branch_head(self, repo: str, branch: str) -> str:
         return self.default_branch_head
 
@@ -574,6 +665,33 @@ class TestFindMsManifestForIssueViaApi:
             pass
 
         assert find_ms_manifest_for_issue_via_api("acme/x", "main", 944, gh_ops=Bare()) is None
+
+    def test_finds_the_issue_via_its_own_fragment(self) -> None:
+        """#2543: an issue whose data lives ONLY in its own
+        manifest.d/<issue>.yml fragment (no legacy manifest.yml at all) is
+        still found — a targeted fetch by exact, predictable filename."""
+        ops = _FakeApiGhOps({
+            "tests/acceptance/ms01/manifest.d/944.yml": MS01_MANIFEST,
+        })
+        found = find_ms_manifest_for_issue_via_api("acme/x", "main", 944, gh_ops=ops)
+        assert found is not None
+        path, text, blob_sha, data = found
+        assert path == "tests/acceptance/ms01/manifest.d/944.yml"
+        assert data.expected_red == {944: frozenset({"ms01::a"})}
+
+    def test_fragment_and_legacy_file_coexist_each_found_by_its_own_issue(self) -> None:
+        """Sibling issues in the same ms-dir: one's data is in the legacy
+        manifest.yml, the other's is in its own fragment — each is found
+        independently, proving the two never had to collide on one file."""
+        ops = _FakeApiGhOps({
+            "tests/acceptance/ms01/manifest.yml": "tests:\n  ms01::legacy: 900\n",
+            "tests/acceptance/ms01/manifest.d/944.yml": MS01_MANIFEST,
+        })
+        found_frag = find_ms_manifest_for_issue_via_api("acme/x", "main", 944, gh_ops=ops)
+        assert found_frag is not None and found_frag[0].endswith("manifest.d/944.yml")
+        found_legacy = find_ms_manifest_for_issue_via_api("acme/x", "main", 900, gh_ops=ops)
+        assert found_legacy is not None and found_legacy[0].endswith("manifest.yml")
+        assert "manifest.d" not in found_legacy[0]
 
 
 class TestMissingExpectedRedWarning:
@@ -650,6 +768,50 @@ class TestListExpectedRedViaApi:
         ops = _FakeApiGhOps({"tests/acceptance/ms01/manifest.yml": "tests:\n  a: 1\n"})
         assert list_expected_red_via_api("acme/x", "main", gh_ops=ops) == {}
 
+    def test_merges_fragments_alongside_legacy_file(self) -> None:
+        """#2543: expected_red split across per-issue manifest.d/ fragments
+        (enumerated via list_repo_dir) merges into the same per-ms-dir view
+        a legacy shared manifest.yml would have produced."""
+        ops = _FakeApiGhOps({
+            "tests/acceptance/ms01/manifest.yml": MS01_MANIFEST,
+            "tests/acceptance/ms01/manifest.d/945.yml": (
+                "expected_red:\n  945:\n    - ms01::z\n"
+            ),
+        })
+        result = list_expected_red_via_api("acme/x", "main", gh_ops=ops)
+        assert result == {
+            "ms01": {944: frozenset({"ms01::a"}), 945: frozenset({"ms01::z"})},
+        }
+
+    def test_fragments_only_no_legacy_file(self) -> None:
+        ops = _FakeApiGhOps({
+            "tests/acceptance/ms01/manifest.d/944.yml": (
+                "expected_red:\n  944:\n    - ms01::a\n"
+            ),
+        })
+        assert list_expected_red_via_api("acme/x", "main", gh_ops=ops) == {
+            "ms01": {944: frozenset({"ms01::a"})},
+        }
+
+    def test_degrades_gracefully_without_list_repo_dir(self) -> None:
+        """A gh_ops that supports the legacy surface but not list_repo_dir
+        (an older stub) still reports the legacy file's entries — fragments
+        are just invisible to it, never a hard failure."""
+
+        class NoListDir:
+            def __init__(self, inner: _FakeApiGhOps):
+                self._inner = inner
+
+            def list_repo_subdirs(self, *a, **kw):
+                return self._inner.list_repo_subdirs(*a, **kw)
+
+            def get_repo_file_with_sha(self, *a, **kw):
+                return self._inner.get_repo_file_with_sha(*a, **kw)
+
+        inner = _FakeApiGhOps({"tests/acceptance/ms01/manifest.yml": MS01_MANIFEST})
+        result = list_expected_red_via_api("acme/x", "main", gh_ops=NoListDir(inner))
+        assert result == {"ms01": {944: frozenset({"ms01::a"})}}
+
 
 class TestClearExpectedRedViaPr:
     """#2164 review fix: clearing now goes through a real PR
@@ -698,6 +860,22 @@ class TestClearExpectedRedViaPr:
         ops = _FakeApiGhOps({})
         msg = clear_expected_red_via_pr("acme/x", "coord-tui", "main", 944, gh_ops=ops)
         assert "no expected_red entries found" in msg
+
+    def test_clears_a_per_issue_fragment_file(self) -> None:
+        """#2543: clearing an issue whose expected_red lives in its OWN
+        manifest.d/<issue>.yml fragment edits exactly that file, and the
+        derived throwaway branch name still keys off the real ms-dir (not
+        "manifest.d", the fragment's immediate parent)."""
+        ops = _FakeApiGhOps({
+            "tests/acceptance/ms01/manifest.d/944.yml": MS01_MANIFEST,
+        })
+        msg = clear_expected_red_via_pr("acme/x", "coord-tui", "main", 944, gh_ops=ops)
+        assert "cleared expected_red for #944: ms01::a" in msg
+        [update] = ops.updated_files
+        path, branch, content = update
+        assert path == "tests/acceptance/ms01/manifest.d/944.yml"
+        assert "expected_red" not in content
+        assert branch.startswith("coord/clear-expected-red-944-ms01")
 
 
 class TestClassifyExpectedRedClearResult:

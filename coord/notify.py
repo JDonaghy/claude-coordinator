@@ -1524,8 +1524,13 @@ def dispatch_stalled_pipeline_action(
         # `dispatch_conflict_fix` a sealed-aware branch (keyed off
         # `entry.assignment_type`, the same field checked below) that CAN
         # resolve the one shape that guarantee doesn't hold for: a conflict
-        # confined to a milestone's `manifest.yml` — the file every slice
-        # under that milestone additively appends its own block to.
+        # confined to a milestone's `manifest.yml`. Pre-#2543 that was the
+        # file every slice under that milestone additively appended its own
+        # block to; #2543 moved that per-issue traffic into
+        # `manifest.d/<issue>.yml` fragments instead (a legacy manifest.yml
+        # can still carry it too, and always can conflict with itself on a
+        # same-issue retry), so `sealed_conflict_could_touch_manifest`
+        # (below) checks both shapes via `conflict_fix._is_sealed_manifest_path`.
         #
         # `sealed_files` here is `entry`'s WHOLE branch diff (the three-dot
         # compare), not the actual conflicting subset — GitHub's compare API

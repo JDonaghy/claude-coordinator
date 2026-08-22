@@ -40,6 +40,7 @@ import uuid
 
 import httpx
 
+from coord.acceptance import MANIFEST_FRAGMENTS_DIRNAME
 from coord.config import Config
 from coord.dispatch import AGENT_PORT
 from coord.merge_queue import QueuedMerge
@@ -245,10 +246,13 @@ date or conflicts with another slice.
 This repo's CLAUDE.md tells every ordinary worker to never touch \
 `tests/acceptance/**` — that rule keeps the acceptance oracle independent \
 of the workers it grades. It does NOT apply to you for this one narrow \
-purpose: resolving a merge conflict in a milestone's \
-`tests/acceptance/ms-NN/{SEALED_MANIFEST_FILENAME}`, the file every slice \
-under that milestone appends its own block to. You are explicitly \
-authorized to edit ONLY that file, and only additively.
+purpose: resolving a merge conflict in a milestone's shared \
+`tests/acceptance/ms-NN/{SEALED_MANIFEST_FILENAME}` and/or a per-issue \
+`tests/acceptance/ms-NN/manifest.d/<issue>.(yml|json)` fragment (#2543 — \
+each issue's own manifest data lives in its own fragment file now, so a \
+DIFFERENT-issue collision mostly can't happen any more; this path is for a \
+legacy single-file milestone or a same-issue retry). You are explicitly \
+authorized to edit ONLY those manifest file(s), and only additively.
 
 Rules:
 - The coordinator denies `gh` and `git push --force` for this worker. \
@@ -256,21 +260,22 @@ Don't try to use them — the harness will reject the call.
 - Stay on the worker's branch — do NOT push to main / develop / target.
 - Use git push --force-with-lease (NOT --force).
 - Rebase onto the target branch. If the ONLY conflict is inside a \
-`{SEALED_MANIFEST_FILENAME}` under `tests/acceptance/`, resolve it \
-ADDITIVELY: keep BOTH sides' issue blocks, without reordering or rewriting \
-any block that isn't yours. Never delete or rewrite another issue's block \
-— this mirrors the "one block per issue, later slices merge in" rule the \
-manifest files document in their own header comment.
+`{SEALED_MANIFEST_FILENAME}` or a `manifest.d/<issue>.(yml|json)` fragment \
+under `tests/acceptance/`, resolve it ADDITIVELY: keep BOTH sides' issue \
+blocks, without reordering or rewriting any block that isn't yours. Never \
+delete or rewrite another issue's block — this mirrors the "one block per \
+issue, later slices merge in" rule the manifest files document in their \
+own header comment.
 - Do NOT create, edit, or delete ANY OTHER file under `tests/acceptance/` \
 — not a test body, not `contract.md`, not a mock, not a fixture, not an \
 entry-point registration. Those stay sealed even for you.
-- If the conflict is NOT confined to a `{SEALED_MANIFEST_FILENAME}` — it \
-also touches a test body or any other sealed file, OR the \
-`{SEALED_MANIFEST_FILENAME}` conflict itself is not a clean additive case \
-(e.g. the same issue's own block was edited two different ways) — DO NOT \
-GUESS and do NOT touch it. Exit non-zero with a STUCK: line that starts \
-with the exact marker `{SEALED_SCOPE_STUCK_MARKER}` and then names the \
-file(s) in conflict, e.g.
+- If the conflict is NOT confined to a `{SEALED_MANIFEST_FILENAME}` or a \
+`manifest.d/<issue>.(yml|json)` fragment — it also touches a test body or \
+any other sealed file, OR the manifest conflict itself is not a clean \
+additive case (e.g. the same issue's own block was edited two different \
+ways) — DO NOT GUESS and do NOT touch it. Exit non-zero with a STUCK: line \
+that starts with the exact marker `{SEALED_SCOPE_STUCK_MARKER}` and then \
+names the file(s) in conflict, e.g.
   STUCK: {SEALED_SCOPE_STUCK_MARKER} tests/acceptance/ms-33/audit.rs:1-40 \
 — conflict is in a test body, not {SEALED_MANIFEST_FILENAME}
 The coordinator reads that marker and hands this off to a human — there is \
@@ -296,15 +301,17 @@ def build_sealed_manifest_conflict_briefing(
     :data:`coord.models.SEALED_PATH_AUTHOR_TYPES` branch (#2555).
 
     Unlike :func:`build_conflict_fix_briefing`, this worker IS authorized to
-    edit one specific sealed file — the milestone's ``manifest.yml`` —
-    because that is the one file every acceptance slice under a milestone
-    appends an additive block to (see e.g.
-    ``tests/acceptance/ms-33/manifest.yml``'s own header comment), so a
-    two-slice collision there is a mechanical, written-down-rule merge, not
-    a semantic one. Everything else under ``tests/acceptance/`` stays
-    off-limits — see :data:`SEALED_MANIFEST_CONFLICT_SYSTEM_PROMPT`'s
-    "Rules" for the exact boundary and :data:`SEALED_SCOPE_STUCK_MARKER`,
-    the marker the worker uses to escalate when the conflict crosses it.
+    edit the sealed manifest — the milestone's shared ``manifest.yml`` and/or
+    a per-issue ``manifest.d/<issue>.(yml|json)`` fragment (#2543) — because
+    those are mechanical, written-down-rule merges (an issue's own block, or
+    a legacy milestone's additive block), not semantic ones. Since #2543 the
+    common two-DIFFERENT-slices collision this was built for mostly can't
+    happen any more (each issue writes its own fragment file), but a legacy
+    milestone or a same-issue retry can still land here. Everything else
+    under ``tests/acceptance/`` stays off-limits — see
+    :data:`SEALED_MANIFEST_CONFLICT_SYSTEM_PROMPT`'s "Rules" for the exact
+    boundary and :data:`SEALED_SCOPE_STUCK_MARKER`, the marker the worker
+    uses to escalate when the conflict crosses it.
     """
     test_cmd = test_command or "echo '(no test command configured)'"
     lines: list[str] = [
@@ -316,8 +323,8 @@ def build_sealed_manifest_conflict_briefing(
         f"Issue: #{entry.issue_number} — {entry.issue_title}",
         f"Assignment type: `{entry.assignment_type}` — this branch's whole "
         "job was authoring under `tests/acceptance/`, so its conflict is "
-        f"almost always another slice's additive edit to the same "
-        f"milestone's `{SEALED_MANIFEST_FILENAME}`.",
+        f"almost always an additive edit to a `{SEALED_MANIFEST_FILENAME}` "
+        "or a `manifest.d/<issue>.(yml|json)` fragment (#2543).",
         "",
         "## Where you are",
         "",
@@ -334,7 +341,8 @@ def build_sealed_manifest_conflict_briefing(
         "1. `git fetch origin`",
         f"2. `git pull --rebase origin {entry.target_branch}`",
         f"3. If a conflict marker appears in a `{SEALED_MANIFEST_FILENAME}` "
-        "under `tests/acceptance/`, resolve it by keeping BOTH sides' issue "
+        "or a `manifest.d/<issue>.(yml|json)` fragment under "
+        "`tests/acceptance/`, resolve it by keeping BOTH sides' issue "
         "blocks (additive — see the system prompt's rules). If a conflict "
         "marker appears ANYWHERE ELSE, stop — see \"When NOT to guess\" "
         "below.",
@@ -344,12 +352,13 @@ def build_sealed_manifest_conflict_briefing(
         "",
         "## When NOT to guess",
         "",
-        f"You are authorized to edit ONLY a `{SEALED_MANIFEST_FILENAME}` "
-        "under `tests/acceptance/`, and only additively. If the conflict "
+        f"You are authorized to edit ONLY a `{SEALED_MANIFEST_FILENAME}` or "
+        "a `manifest.d/<issue>.(yml|json)` fragment under "
+        "`tests/acceptance/`, and only additively. If the conflict "
         "touches a test body, `contract.md`, a mock, a fixture, an "
         "entry-point registration, or anything else sealed — or the "
-        f"`{SEALED_MANIFEST_FILENAME}` conflict is not a clean additive "
-        "case — DO NOT touch it. Exit non-zero with a `STUCK:` line "
+        "manifest conflict is not a clean additive case — DO NOT touch it. "
+        "Exit non-zero with a `STUCK:` line "
         f"starting with the exact marker `{SEALED_SCOPE_STUCK_MARKER}` and "
         "the file(s)/reason, e.g.",
         "",
@@ -379,9 +388,29 @@ def sealed_scope_verdict_in_text(text: str | None) -> bool:
 
 
 def _is_sealed_manifest_path(path: str) -> bool:
-    """True when *path* is (any milestone's) ``manifest.yml`` — the one file
-    a sealed-author conflict-fix dispatch is authorized to touch."""
-    return path.rsplit("/", 1)[-1] == SEALED_MANIFEST_FILENAME
+    """True when *path* is (any milestone's) shared ``manifest.yml`` OR a
+    per-issue ``manifest.d/<issue>.(yml|yaml|json)`` fragment (#2543) — the
+    files a sealed-author conflict-fix dispatch is authorized to touch.
+
+    #2543 moves the routine per-issue `issues:`/`expected_red:` traffic out
+    of the single shared file into per-issue fragments (two different
+    fragment files can't textually conflict at all — the collision this
+    whole sealed-conflict-fix mechanism exists to resolve mostly stops
+    happening by construction going forward), but a fragment path is still
+    recognized here for completeness — a legacy single-file milestone, or a
+    same-issue retry that manages to conflict with itself, still resolves
+    the same additive way.
+    """
+    parts = path.split("/")
+    name = parts[-1]
+    if name == SEALED_MANIFEST_FILENAME:
+        return True
+    return (
+        len(parts) >= 2
+        and parts[-2] == MANIFEST_FRAGMENTS_DIRNAME
+        and name.rsplit(".", 1)[-1] in ("yml", "yaml", "json")
+        and "." in name
+    )
 
 
 def sealed_conflict_is_manifest_only(files: list[str]) -> bool:

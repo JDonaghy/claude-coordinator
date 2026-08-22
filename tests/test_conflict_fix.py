@@ -307,6 +307,24 @@ class TestSealedConflictIsManifestOnly:
             ["tests/acceptance/ms-4/other_manifest.yml"]
         ) is False
 
+    def test_true_for_a_per_issue_fragment(self) -> None:
+        """#2543: a manifest.d/<issue>.yml fragment is also a "manifest"
+        file the sealed conflict-fix branch is authorized to touch."""
+        assert sealed_conflict_is_manifest_only(
+            ["tests/acceptance/ms-4/manifest.d/944.yml"]
+        ) is True
+
+    def test_true_for_fragment_alongside_legacy_manifest(self) -> None:
+        assert sealed_conflict_is_manifest_only([
+            "tests/acceptance/ms-4/manifest.yml",
+            "tests/acceptance/ms-4/manifest.d/944.yml",
+        ]) is True
+
+    def test_false_for_a_non_manifest_file_inside_manifest_d(self) -> None:
+        assert sealed_conflict_is_manifest_only(
+            ["tests/acceptance/ms-4/manifest.d/README.md"]
+        ) is False
+
 
 class TestSealedConflictCouldTouchManifest:
     """#2555 review fix: the notify.py gate must key off "does a manifest.yml
@@ -340,6 +358,15 @@ class TestSealedConflictCouldTouchManifest:
         assert sealed_conflict_could_touch_manifest(
             ["tests/acceptance/ms-4/other_manifest.yml"]
         ) is False
+
+    def test_true_when_a_per_issue_fragment_is_present(self) -> None:
+        """#2543: the common case going forward — a JIT slice's own diff
+        plus its manifest.d/<issue>.yml fragment, no shared manifest.yml
+        at all."""
+        assert sealed_conflict_could_touch_manifest([
+            "tests/acceptance/ms-4/manifest.d/944.yml",
+            "tests/acceptance/ms-4/new_spec.rs",
+        ]) is True
 
 
 class TestDispatchSealedAuthorBranch:

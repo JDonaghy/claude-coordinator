@@ -199,15 +199,78 @@ class ManifestError(Exception):
     """Raised when a manifest file exists but is malformed."""
 
 
-def _manifest_paths(acceptance_root: Path) -> list[Path]:
-    """``ms-NN/manifest.(yml|yaml|json)`` paths under *acceptance_root*,
-    sorted for deterministic scan order. ``[]`` when the dir doesn't exist."""
-    if not acceptance_root.exists():
+# #2543: per-issue manifest fragments. Before this, every JIT test-author
+# slice appended its own `issues:`/`expected_red:` block to ONE shared
+# `ms-NN/manifest.yml` (`coord.test_author`'s "Later slices MERGE into this
+# file" convention) — two slices authored concurrently, or one authored
+# against a base that predates a sibling's already-merged slice, collide on
+# that single file even though their actual content never overlaps (each
+# writes a distinct, differently-keyed block). See coord-portal#122/#128/#132.
+#
+# The fix: each issue's `issues:`/`expected_red:` entries live in their OWN
+# file, `ms-NN/manifest.d/<issue>.(yml|yaml|json)` — two slices writing two
+# different files can never textually conflict, no matter how they're
+# scheduled. `manifest.yml` itself keeps carrying the MILESTONE-level blocks
+# (`gate_a:`, `exempt:`) that are rare, hand-edited, and not part of the
+# per-slice JIT-authoring hot path, so it stays a single shared file by
+# choice, not oversight.
+#
+# Backward compatible by construction: every reader below still accepts a
+# legacy single-file `ms-NN/manifest.(yml|json)` that ALSO carries
+# `issues:`/`tests:`/`expected_red:` (this repo's own already-merged
+# `tests/acceptance/ms-33/manifest.yml` and friends) — fragments and a
+# legacy file under the same `ms-NN/` dir are simply merged together, same
+# "later manifest wins on a bare collision" rule as across milestones. No
+# migration script is needed: existing manifests keep working as-is, and new
+# per-issue entries land in `manifest.d/` going forward.
+MANIFEST_FRAGMENTS_DIRNAME = "manifest.d"
+
+
+def _manifest_fragment_paths(ms_dir: Path) -> list[Path]:
+    """``<ms_dir>/manifest.d/*.(yml|yaml|json)`` fragment files, sorted for
+    deterministic scan order. ``[]`` when the fragments dir doesn't exist."""
+    frag_dir = ms_dir / MANIFEST_FRAGMENTS_DIRNAME
+    if not frag_dir.is_dir():
         return []
     return sorted(
-        p for p in acceptance_root.glob("*/manifest.*")
-        if p.suffix in (".yml", ".yaml", ".json")
+        p for p in frag_dir.iterdir()
+        if p.is_file() and p.suffix in (".yml", ".yaml", ".json")
     )
+
+
+def _manifest_paths(acceptance_root: Path) -> list[Path]:
+    """Every manifest SOURCE path under *acceptance_root*, sorted for
+    deterministic scan order: per ``ms-NN``/``issue-NN`` directory, the
+    legacy single-file ``manifest.(yml|yaml|json)`` (if present) followed by
+    each ``manifest.d/<issue>.(yml|yaml|json)`` fragment (#2543). ``[]`` when
+    *acceptance_root* doesn't exist.
+
+    Callers that need to know which owning directory a given path came from
+    (a fragment's is its grandparent, not its parent) should go through
+    :func:`_ms_dir_for_manifest_path` rather than assuming ``path.parent``.
+    """
+    if not acceptance_root.exists():
+        return []
+    paths: list[Path] = []
+    for ms_dir in sorted(p for p in acceptance_root.iterdir() if p.is_dir()):
+        paths.extend(
+            sorted(
+                p for p in ms_dir.glob("manifest.*")
+                if p.suffix in (".yml", ".yaml", ".json")
+            )
+        )
+        paths.extend(_manifest_fragment_paths(ms_dir))
+    return paths
+
+
+def _ms_dir_for_manifest_path(path: Path) -> Path:
+    """The owning ``ms-NN``/``issue-NN`` directory for a manifest source
+    *path* returned by :func:`_manifest_paths` — itself for a legacy
+    single-file manifest, or its grandparent for a
+    ``manifest.d/<issue>.(yml|json)`` fragment (#2543)."""
+    if path.parent.name == MANIFEST_FRAGMENTS_DIRNAME:
+        return path.parent.parent
+    return path.parent
 
 
 @dataclass(frozen=True)
@@ -329,6 +392,50 @@ def parse_manifest_text(text: str, *, source: str = "<manifest>") -> ManifestDat
     )
 
 
+def merge_manifest_data(*datas: ManifestData) -> ManifestData:
+    """Merge multiple :class:`ManifestData` instances into one, as if their
+    source files had been scanned together (#2543) — same "later source
+    wins on a bare collision" rule :func:`load_manifest`/:func:`_manifest_paths`
+    already apply across files, just operating on already-parsed data
+    instead of paths. Shared by both the local-checkout readers (which
+    merge ``_manifest_paths``' legacy-file-then-fragments per ``ms-NN``) and
+    the API-only dispatch-time reader
+    (:func:`coord.milestone_dispatch._fetch_manifest_data`, which fetches
+    the legacy file and one issue's fragment separately over ``gh`` and
+    needs to combine them the same way).
+
+    ``tests``/``exempt``/``expected_red`` union across every *datas* entry
+    (a later entry's ``tests`` mapping overwrites an earlier one's on an
+    exact test-id collision; ``exempt``/``expected_red`` union rather than
+    overwrite since those are naturally per-issue-keyed sets, not a flat
+    mapping that can collide). ``gate_a_exempt``/``gate_a_exempt_reason``
+    are milestone-level, not per-issue, so they come from whichever entry
+    sets ``gate_a_exempt=True`` last — in practice always the legacy shared
+    file, since only that carries the ``gate_a:`` block (#2543 keeps it
+    there by choice; per-issue fragments never set it).
+    """
+    tests: dict[str, int] = {}
+    exempt: set[int] = set()
+    expected_red: dict[int, frozenset[str]] = {}
+    gate_a_exempt = False
+    gate_a_exempt_reason = ""
+    for data in datas:
+        tests.update(data.tests)
+        exempt |= set(data.exempt)
+        for issue_number, test_ids in data.expected_red.items():
+            expected_red[issue_number] = expected_red.get(issue_number, frozenset()) | test_ids
+        if data.gate_a_exempt:
+            gate_a_exempt = True
+            gate_a_exempt_reason = data.gate_a_exempt_reason or gate_a_exempt_reason
+    return ManifestData(
+        tests=tests,
+        exempt=frozenset(exempt),
+        gate_a_exempt=gate_a_exempt,
+        gate_a_exempt_reason=gate_a_exempt_reason,
+        expected_red=expected_red,
+    )
+
+
 def _parse_manifest_file(path: Path) -> dict[str, int]:
     """Parse one manifest file into ``{test_id: issue_number}`` (the
     ``exempt:`` list, if any, is dropped — callers that need it use
@@ -415,7 +522,7 @@ def load_expected_red(
     mapping: dict[str, int] = {}
     for path in _manifest_paths(acceptance_root):
         if driver_kind is not None:
-            resolved = _driver_kind_for_manifest_dir(path.parent)
+            resolved = _driver_kind_for_manifest_dir(_ms_dir_for_manifest_path(path))
             if resolved is not None and resolved != driver_kind:
                 continue
         try:
@@ -441,7 +548,7 @@ def ms_dir_for_issue(acceptance_root: Path, issue_number: int) -> str | None:
     for path in _manifest_paths(acceptance_root):
         mapping = _parse_manifest_file(path)
         if test_ids_for_issue(mapping, issue_number):
-            return path.parent.name
+            return _ms_dir_for_manifest_path(path).name
     return None
 
 
@@ -873,16 +980,27 @@ def _default_github_ops():
     return github_ops
 
 
-def _fetch_ms_manifest_via_api(
-    repo_github: str, branch: str, ms_dir: str, get_file: Callable[..., "tuple[str, str]"],
+def _fetch_manifest_source_via_api(
+    repo_github: str,
+    branch: str,
+    dir_path: str,
+    filename_stem: str,
+    get_file: Callable[..., "tuple[str, str]"],
 ) -> "tuple[str, str, str, ManifestData] | None":
-    """One ms-dir's ``manifest.(yml|yaml|json)`` via *get_file* (a
-    ``get_repo_file_with_sha``-shaped callable), trying each extension in
-    turn like :func:`_manifest_paths` does on local disk. Returns ``(path,
-    text, blob_sha, data)`` for the first extension that exists and parses,
-    or ``None`` if none does / the one that exists is malformed."""
+    """One manifest source file — ``<dir_path>/<filename_stem>.(yml|yaml|
+    json)`` — via *get_file* (a ``get_repo_file_with_sha``-shaped callable),
+    trying each extension in turn like :func:`_manifest_paths` does on local
+    disk. Returns ``(path, text, blob_sha, data)`` for the first extension
+    that exists and parses, or ``None`` if none does / the one that exists is
+    malformed.
+
+    Shared primitive (#2543) behind both the legacy single-file fetch
+    (:func:`_fetch_ms_manifest_via_api`, ``filename_stem="manifest"``) and a
+    per-issue fragment fetch (:func:`_fetch_ms_manifest_fragment_via_api`,
+    ``filename_stem=str(issue_number)`` under ``<ms_dir>/manifest.d/``).
+    """
     for ext in (".yml", ".yaml", ".json"):
-        path = f"{ACCEPTANCE_DIRNAME}/{ms_dir}/manifest{ext}"
+        path = f"{dir_path}/{filename_stem}{ext}"
         try:
             text, blob_sha = get_file(repo_github, path, branch)
         except Exception:  # noqa: BLE001 — this extension doesn't exist, or a transient gh hiccup
@@ -895,13 +1013,52 @@ def _fetch_ms_manifest_via_api(
     return None
 
 
+def _fetch_ms_manifest_via_api(
+    repo_github: str, branch: str, ms_dir: str, get_file: Callable[..., "tuple[str, str]"],
+) -> "tuple[str, str, str, ManifestData] | None":
+    """One ms-dir's LEGACY single-file ``manifest.(yml|yaml|json)`` via
+    *get_file* — see :func:`_fetch_manifest_source_via_api`. Since #2543,
+    per-issue data more commonly lives in a ``manifest.d/<issue>.(yml|json)``
+    fragment instead (:func:`_fetch_ms_manifest_fragment_via_api`); this
+    still covers the milestone-level ``gate_a:``/``exempt:`` blocks (which
+    stay in the single shared file by choice, #2543) and any not-yet-migrated
+    milestone whose per-issue data is still all in one file."""
+    return _fetch_manifest_source_via_api(
+        repo_github, branch, f"{ACCEPTANCE_DIRNAME}/{ms_dir}", "manifest", get_file,
+    )
+
+
+def _fetch_ms_manifest_fragment_via_api(
+    repo_github: str,
+    branch: str,
+    ms_dir: str,
+    issue_number: int,
+    get_file: Callable[..., "tuple[str, str]"],
+) -> "tuple[str, str, str, ManifestData] | None":
+    """*issue_number*'s own ``ms-NN/manifest.d/<issue_number>.(yml|yaml|
+    json)`` fragment via *get_file* (#2543) — see
+    :func:`_fetch_manifest_source_via_api`. A targeted fetch by exact,
+    predictable filename, no directory listing required, since the caller
+    already knows the issue number it's looking for."""
+    return _fetch_manifest_source_via_api(
+        repo_github,
+        branch,
+        f"{ACCEPTANCE_DIRNAME}/{ms_dir}/{MANIFEST_FRAGMENTS_DIRNAME}",
+        str(issue_number),
+        get_file,
+    )
+
+
 def find_ms_manifest_for_issue_via_api(
     repo_github: str, branch: str, issue_number: int, *, gh_ops: Any = None,
 ) -> "tuple[str, str, str, ManifestData] | None":
     """API-only (no local checkout) equivalent of :func:`ms_dir_for_issue`:
-    search every ``tests/acceptance/ms-*/manifest.(yml|yaml|json)`` on
-    *branch* via the GitHub Contents API for the one whose ``tests``/
-    ``issues``/``expected_red`` mapping covers *issue_number*.
+    search every ``tests/acceptance/ms-*/`` on *branch* via the GitHub
+    Contents API for the one whose ``tests``/``issues``/``expected_red``
+    mapping covers *issue_number* — checking, per ms-dir, *issue_number*'s
+    own ``manifest.d/<issue_number>.(yml|json)`` fragment (#2543) FIRST
+    (a targeted, exact-filename fetch), then the legacy single-file
+    ``manifest.(yml|yaml|json)``.
 
     Returns ``(path, text, blob_sha, data)`` for the first match (ms-dirs
     scanned in sorted-name order for determinism), or ``None`` when nothing
@@ -923,6 +1080,15 @@ def find_ms_manifest_for_issue_via_api(
         return None
 
     for name in sorted(subdirs):
+        frag = _fetch_ms_manifest_fragment_via_api(
+            repo_github, branch, name, issue_number, get_file,
+        )
+        if frag is not None:
+            _path, _text, _blob_sha, data = frag
+            if issue_number in data.expected_red or test_ids_for_issue(
+                data.tests, issue_number
+            ):
+                return frag
         found = _fetch_ms_manifest_via_api(repo_github, branch, name, get_file)
         if found is None:
             continue
@@ -1014,10 +1180,19 @@ def list_expected_red_via_api(
     with at least one expected_red entry are included. ``{}`` on any
     listing failure or when nothing is expected-red anywhere (best-effort,
     matches the rest of this module's read paths).
+
+    #2543: merges BOTH the legacy single-file ``manifest.(yml|json)`` and
+    every ``manifest.d/<issue>.(yml|json)`` fragment for each ms-dir — a
+    milestone whose per-issue data has moved to fragments must not go dark
+    here just because ``list_repo_dir`` (needed to enumerate the fragments
+    dir) is unavailable on *gh_ops*: that case degrades to "legacy file
+    only", same fail-open posture as everywhere else in this module, not to
+    "nothing found."
     """
     ops = gh_ops or _default_github_ops()
     list_subdirs = getattr(ops, "list_repo_subdirs", None)
     get_file = getattr(ops, "get_repo_file_with_sha", None)
+    list_dir = getattr(ops, "list_repo_dir", None)
     if list_subdirs is None or get_file is None:
         return {}
     try:
@@ -1027,12 +1202,37 @@ def list_expected_red_via_api(
 
     out: dict[str, dict[int, frozenset[str]]] = {}
     for name in sorted(subdirs):
+        merged: dict[int, frozenset[str]] = {}
+
         found = _fetch_ms_manifest_via_api(repo_github, branch, name, get_file)
-        if found is None:
-            continue
-        _path, _text, _blob_sha, data = found
-        if data.expected_red:
-            out[name] = dict(data.expected_red)
+        if found is not None:
+            _path, _text, _blob_sha, data = found
+            for issue, ids in data.expected_red.items():
+                merged[issue] = merged.get(issue, frozenset()) | ids
+
+        if list_dir is not None:
+            frag_dir = f"{ACCEPTANCE_DIRNAME}/{name}/{MANIFEST_FRAGMENTS_DIRNAME}"
+            try:
+                filenames = list_dir(repo_github, frag_dir, branch)
+            except Exception:  # noqa: BLE001 — no fragments dir, or a transient hiccup
+                filenames = []
+            for filename in filenames:
+                if Path(filename).suffix not in (".yml", ".yaml", ".json"):
+                    continue
+                frag_path = f"{frag_dir}/{filename}"
+                try:
+                    text, _sha = get_file(repo_github, frag_path, branch)
+                except Exception:  # noqa: BLE001
+                    continue
+                try:
+                    frag_data = parse_manifest_text(text, source=frag_path)
+                except ManifestError:
+                    continue
+                for issue, ids in frag_data.expected_red.items():
+                    merged[issue] = merged.get(issue, frozenset()) | ids
+
+        if merged:
+            out[name] = merged
     return out
 
 
@@ -1101,7 +1301,11 @@ def clear_expected_red_via_pr(
     except Exception as exc:  # noqa: BLE001
         return f"warning: could not resolve {default_branch} tip: {exc}"
 
-    ms_dir = path.split("/")[-2] if "/" in path else "ms"
+    # #2543: for a manifest.d/<issue>.yml fragment, path.parent is the
+    # `manifest.d` directory itself, not the ms-NN dir — go through
+    # _ms_dir_for_manifest_path so a fragment-clear derives the SAME
+    # branch-name component a legacy-file clear would.
+    ms_dir = _ms_dir_for_manifest_path(Path(path)).name if "/" in path else "ms"
     branch_name = f"coord/clear-expected-red-{issue_number}-{ms_dir}"
     # #944-style idempotency: a prior attempt may have already created this
     # branch (e.g. a partial failure on a previous merge-queue tick) — a

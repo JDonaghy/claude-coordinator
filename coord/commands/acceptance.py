@@ -209,7 +209,8 @@ def _scoped_verdict(
     "--ci", "ci_mode", is_flag=True,
     help=(
         "#2164: the CI wrapper. Only valid with --all. Honours each "
-        "ms-NN/manifest.yml's `expected_red:` registry — a listed test-id "
+        "ms-NN/manifest.yml AND manifest.d/<issue>.yml fragment's (#2543) "
+        "`expected_red:` registry — a listed test-id "
         "that FAILS does not fail the run (a sealed slice is red by design "
         "before its fix exists); one that PASSES is a hard, loud failure "
         "(the vacuous-assertion case #1965 cares about). Point your repo's "
