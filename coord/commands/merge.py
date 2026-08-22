@@ -11,7 +11,7 @@ import click
 
 
 from coord.commands._common import _CONFIG_OPTION, _load_config
-from coord.models import WORK_LIKE_TYPES
+from coord.models import WORK_LIKE_TYPES, effective_issue_number
 
 
 def _machine_for_assignment(board, assignment_id: str | None) -> str | None:
@@ -726,10 +726,26 @@ def verify_merge(
                 err=True,
             )
             sys.exit(2)
+        extra_allowed: frozenset[int] = frozenset()
     else:
         repo_name = work.repo_name
         issue_num = int(work.issue_number)
         branch_display = work.branch or "(unknown)"
+        # #2545: a `type="test-author"`/`"mock-author"` merge entry's
+        # `issue_number` is always the milestone's TRACKING issue (every JIT
+        # slice for one milestone shares a branch/PR), but its commit
+        # correctly cites the slice's OWN child issue — resolved via the
+        # canonical `effective_issue_number` helper (built for exactly this
+        # tracking-vs-slice distinction, #1553) rather than reading
+        # `for_issue_number` directly, so this stays in sync with the other
+        # callers of that helper (e.g. `merge_queue._test_author_effective_
+        # issue_number`) instead of drifting as an independent copy. Ordinary
+        # `work` assignments have no `for_issue_number`, so this resolves to
+        # `issue_num` itself — already in the "home" set, a harmless no-op.
+        _for_issue = effective_issue_number(work)
+        extra_allowed = (
+            frozenset({_for_issue}) if _for_issue and _for_issue != issue_num else frozenset()
+        )
 
     repo_cfg = cfg.repo(repo_name)
     base = (repo_cfg.default_branch if repo_cfg else None) or "main"
@@ -747,14 +763,23 @@ def verify_merge(
     repo_github = repo_cfg.github if repo_cfg else None
     wt_path = Path(path_opt).expanduser() if path_opt else Path.cwd()
 
-    mv = verify_merge_branch(wt_path, base=base, issue_number=issue_num)
+    mv = verify_merge_branch(
+        wt_path,
+        base=base,
+        issue_number=issue_num,
+        extra_allowed_issue_numbers=extra_allowed,
+    )
     # #1279: only worth a `gh` round-trip when the cheap git-only pass above
     # actually found blocking foreign commits — corroborate against GitHub's
     # closed-issue state and re-verify with the downgrade signal populated.
     closed = resolve_closed_issue_numbers(repo_github, mv.foreign, issue_num)
     if closed:
         mv = verify_merge_branch(
-            wt_path, base=base, issue_number=issue_num, closed_issue_numbers=closed
+            wt_path,
+            base=base,
+            issue_number=issue_num,
+            extra_allowed_issue_numbers=extra_allowed,
+            closed_issue_numbers=closed,
         )
 
     click.echo(f"branch:        {branch_display}")

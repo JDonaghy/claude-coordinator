@@ -3355,6 +3355,26 @@ def _dispatch_merge_of(
         )
         sys.exit(2)
 
+    # #2545: a `type="test-author"`/`"mock-author"` work row's `issue_number`
+    # (== `issue` above) is always the milestone's TRACKING issue, but its
+    # commit correctly cites the slice's OWN child issue — resolved via the
+    # canonical `coord.models.effective_issue_number` helper (built for
+    # exactly this tracking-vs-slice distinction, #1553) rather than reading
+    # `for_issue_number` directly, so this stays in sync with the other
+    # callers of that helper (e.g. `merge_queue._test_author_effective_
+    # issue_number`) instead of drifting as an independent copy. Without
+    # allowing the resolved issue too, the #604 FOREIGN check below flags
+    # every JIT slice's own, correctly-labeled commit on every single verify.
+    # Ordinary `work` assignments have no `for_issue_number`, so this
+    # resolves to `issue` itself — already in the "home" set, a harmless
+    # no-op.
+    from coord.models import effective_issue_number as _mg_effective_issue_number  # noqa: PLC0415
+
+    _mg_for_issue = _mg_effective_issue_number(work)
+    _mg_extra_allowed = (
+        frozenset({_mg_for_issue}) if _mg_for_issue and _mg_for_issue != issue else frozenset()
+    )
+
     resolved_model = model if model else cfg.models.default
     assignment_id = _uuid.uuid4().hex[:12]
     if _is_local:
@@ -3607,6 +3627,9 @@ def _dispatch_merge_of(
                 # #604: git truth overrides the agent's self-report on the
                 # merge path — a botched rebase records `blocked`, not `done`.
                 verify_merge=True,
+                # #2545: allow the JIT slice's own child issue, not just the
+                # tracking issue, in the FOREIGN check.
+                extra_allowed_issue_numbers=_mg_extra_allowed,
                 branch=work.branch,
             )
             _echo_merge_finalize(finalize_result, merge_target_branch)
@@ -3869,6 +3892,9 @@ def _dispatch_merge_of(
             exit_code=exit_code,
             started_at=started_at,
             verify_merge=True,
+            # #2545: allow the JIT slice's own child issue, not just the
+            # tracking issue, in the FOREIGN check.
+            extra_allowed_issue_numbers=_mg_extra_allowed,
         )
         _echo_merge_finalize(finalize_result, merge_target_branch)
         _mv = finalize_result.merge_verify
