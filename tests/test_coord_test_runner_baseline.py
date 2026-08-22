@@ -97,6 +97,15 @@ if [[ "$1" == "-m" && "$2" == "pytest" ]]; then
             printf '%s passed\n' "2"
             exit 0
         fi
+        # #2562: a PARTIAL isolation re-run — one node id genuinely still
+        # fails, the rest passed. Distinct from FAKE_RERUN_PASSES (all pass,
+        # exit 0) and from the "no override" default (everything in
+        # FAKE_BRANCH_FAILED fails again, as if isolation changed nothing).
+        if [[ "$_targeted" -eq 1 && -n "${FAKE_RERUN_STILL_FAILING:-}" ]]; then
+            _emit_failed "$FAKE_RERUN_STILL_FAILING"
+            printf '1 failed, 1 passed\n'
+            exit 1
+        fi
         _emit_failed "${FAKE_BRANCH_FAILED:-}"
         printf '2 failed\n'
         exit 1
@@ -391,6 +400,74 @@ def test_a_flake_is_still_a_flake_and_never_consults_the_baseline(repo: Path) ->
     assert "FLAKE(python)" in result.stdout
     assert "RESULT: PASS" in result.stdout
     assert "baseline:" not in result.stdout + result.stderr
+
+
+# ── #2562: partial-flake pruning feeds baseline comparison ──────────────────
+#
+# The all-or-nothing bug: `pytest $failed` re-ran the whole failing set
+# together, so ONE genuine failure alongside a flake kept the flake in
+# `$failed` — and that poisoned set then went to `python_baseline_is_red`,
+# itself unanimity-gated, where the flake (which passes on the baseline same
+# as everywhere else) short-circuited a correct BASELINE-RED downgrade. The
+# fix rebuilds `$failed` from the isolation re-run's own `FAILED ` lines
+# before doing anything else with it.
+
+
+def test_mixed_flake_and_genuine_prunes_to_baseline_red(repo: Path) -> None:
+    """{genuine, flake} prunes to {genuine}, and BASELINE-RED fires on just
+    that remainder — the exact CC#2556 shape from the issue: a real flake
+    sitting next to a test that fails identically on the merge-base must not
+    suppress the downgrade.
+    """
+    result = _run(
+        repo,
+        # Isolation re-run: test_one still fails, test_two (the flake) passed
+        # and dropped out.
+        FAKE_RERUN_STILL_FAILING="tests/test_ambient.py::test_one",
+        # Baseline reproduces the one that's left.
+        FAKE_BASELINE_FAILED="tests/test_ambient.py::test_one",
+    )
+
+    assert result.returncode == 4, (result.returncode, result.stdout, result.stderr)
+    assert "RESULT: BASELINE-RED (python)" in result.stdout
+    assert "1 of 2 failing test(s) passed in isolation" in result.stdout
+    assert "comparing the remaining 1 against the baseline" in result.stdout
+    assert "BASELINE-RED(python): all 1 failing test(s) fail identically" in result.stdout
+    # The pruned flake must not appear as part of the (now genuine-only) set.
+    assert "tests/test_ambient.py::test_one" in result.stdout
+    assert "RESULT: FAIL" not in result.stdout
+
+
+def test_mixed_flake_and_genuine_prunes_to_a_smaller_genuine_fail(repo: Path) -> None:
+    """Same pruning, but the remainder is NOT baseline-red: still a FAIL, but
+    for the pruned count and node id only — the reported list must match
+    what actually failed on the isolation re-run, not the original set.
+    """
+    result = _run(
+        repo,
+        FAKE_RERUN_STILL_FAILING="tests/test_ambient.py::test_one",
+        # FAKE_BASELINE_FAILED unset ⇒ baseline is green for test_one too.
+    )
+
+    assert result.returncode == 1
+    assert "RESULT: FAIL (python)" in result.stdout
+    assert "BASELINE-RED" not in result.stdout
+    assert "1 of 2 failing test(s) passed in isolation" in result.stdout
+    assert "FAIL(python): 1 test(s) fail on re-run — genuine" in result.stdout
+    assert "tests/test_ambient.py::test_one" in result.stdout
+    assert "tests/test_ambient.py::test_two" not in (
+        result.stdout.split("FAIL(python): 1 test(s) fail on re-run — genuine")[1]
+    )
+
+
+def test_all_genuine_failing_set_is_unaffected_by_pruning(repo: Path) -> None:
+    """Both failures still fail in isolation ⇒ nothing pruned, and behaviour
+    matches the pre-#2562 baseline-red path exactly (no pruning log line)."""
+    result = _run(repo, FAKE_BASELINE_FAILED=BRANCH_FAILED)
+
+    assert result.returncode == 4
+    assert "RESULT: BASELINE-RED (python)" in result.stdout
+    assert "passed in isolation" not in result.stdout
 
 
 # ── #2180 review fix: the Test stage must agree with CI on tests/acceptance ─
