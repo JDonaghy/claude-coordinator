@@ -1216,7 +1216,17 @@ the busy state — announces the window it already knows about, every tick
    fires the roll: `systemctl --user start --no-block
    coord-release-window.service`. `--no-block` matters: the roll swaps the
    venv the tick is executing from, so it must outlive the tick's own
-   process tree, never run inline.
+   process tree, never run inline. **The tick never clears the marker
+   itself on a fire** — `--no-block` returns the moment the start request is
+   *queued*, not once the spawned unit has even begun running, so an
+   in-process `clear_roll_pending()` right after it would race the freshly
+   spawned process out from under it (it re-resolves its target from a PyPI
+   lookup + a fleet health gather before it ever reads the marker). Only the
+   spawned `coord release nightly-window` clears it, and only once `coord
+   release propagate` has actually confirmed the roll. A `systemctl start`
+   against an already-active `Type=oneshot` unit is systemd's own no-op, so
+   the tick harmlessly re-requests the fire every ~3 minutes until the
+   marker is gone.
 4. The marker is bounded two independent ways —
    `ROLL_PENDING_DEFAULT_TTL_SECONDS` (wall-clock, default 1h) and
    `ROLL_PENDING_DEFAULT_MAX_DEFERRALS` (a tick-count ceiling, default 20,
@@ -1245,7 +1255,13 @@ release propagate`, no `--force`, ever). See
 expected; `STATUS_DRAIN_TIMEOUT` no longer occurs (nothing drains any more).
 A marker still present well past an hour with the fleet visibly idle is a
 bug, not a busy fleet — check `coord-release-window.service`'s own journal
-for why the tick's `systemctl start` request didn't land.
+for why the spawned run never confirmed a roll (it, not the tick, is the
+one that clears the marker — see point 3 above). Seeing the tick's own
+journal log a `systemctl start` request for `coord-release-window.service`
+on *every* tick while the fleet stays idle is expected while a fire attempt
+is in flight or repeatedly failing to confirm — it costs nothing against an
+already-active unit — but the marker itself must still clear well within
+the hour; if it does not, that is where to look.
 
 ## `coord.db` backups to the external SSD (interim — #1822 owns the real thing)
 

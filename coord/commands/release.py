@@ -2915,7 +2915,12 @@ def release_nightly_window(
                 f"({daemon_name} currently reports "
                 f"v{record.daemon_version or '?'}) — the drive-queue tick "
                 "fires `coord release propagate` at the next inter-drive gap "
-                f"(#2587); {queue_timer} is never stopped"
+                # #2587 review nit: this must name the REAL timer #2587 never
+                # stops (`rw.DEFAULT_QUEUE_TIMER`), not the now-ignored
+                # `--queue-timer` value — a caller who still passes a custom
+                # value here would otherwise read this line as a claim about
+                # a timer this command no longer even looks at.
+                f"(#2587); {rw.DEFAULT_QUEUE_TIMER} is never stopped"
             )
         _finish(rw.STATUS_DRY_RUN, 0)
 
@@ -3012,7 +3017,9 @@ def release_nightly_window(
     click.echo(
         f"roll pending: v{record.target_version} — the drive-queue tick will "
         f"fire `coord release propagate` at the next inter-drive gap "
-        f"(#2587); {queue_timer} is never stopped"
+        # See the --dry-run branch above for why this names
+        # `rw.DEFAULT_QUEUE_TIMER`, not the ignored `--queue-timer` value.
+        f"(#2587); {rw.DEFAULT_QUEUE_TIMER} is never stopped"
     )
     _finish(rw.STATUS_ROLL_PENDING, 0)
 

@@ -29,6 +29,7 @@ from click.testing import CliRunner
 from coord import machine_pause as mp
 from coord import release_propagate as rp
 from coord.cli import main
+from coord.commands import drive_queue as dq_cmd
 from coord.commands import release as release_cmd
 from coord.config import load as load_config
 from coord.drive_queue import HOLD_FIRED, STATE_RUNNING
@@ -442,6 +443,59 @@ def test_a_busy_daemon_host_defers_the_whole_run(
     record = _records(state_dir)[0]
     assert record["status"] == rp.STATUS_DEFERRED
     assert record["lanes"] == []
+
+    # #2587 review: this is the ONE place `coord release propagate` itself
+    # hits the daemon-busy deadlock `coord release nightly-window` exists to
+    # route around (`_ensure_roll_pending_marker`) — a plain, periodic
+    # `coord-release-propagate.timer` run must arm the SAME marker the
+    # drive-queue tick watches, not just defer silently and rely on an
+    # operator to separately reach for `nightly-window`.
+    pending = dq_cmd.read_roll_pending()
+    assert pending is not None, (
+        "a daemon-busy deferral in `coord release propagate` must arm the "
+        "#2587 roll-pending marker, not just record a deferral"
+    )
+    assert pending.target_version == "0.4.111"
+    assert pending.reason == "propagate"
+
+
+def test_a_second_busy_daemon_deferral_does_not_re_arm_the_marker(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """`_ensure_roll_pending_marker`'s own contract: never reset an
+    already-live marker's clock for the SAME target. A periodic
+    `coord-release-propagate.timer` firing every ~20 minutes while the fleet
+    stays busy must not keep re-arming `set_at`/`deferrals` every run — that
+    would make the #2587 TTL bound unreachable in practice, exactly the
+    "never actually bounded" failure the bound exists to prevent."""
+    monkeypatch.setattr(
+        release_cmd, "_fetch_board",
+        lambda: ({"assignments": [{"machine_name": "server", "issue_number": 9,
+                                   "status": "RUNNING"}]}, None),
+    )
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+                 daemon="server")
+
+    def _run() -> None:
+        result = CliRunner().invoke(
+            main,
+            ["release", "propagate", "--config", str(valid_config_path),
+             "--target", "0.4.111"],
+        )
+        assert result.exit_code == 0, result.output
+
+    _run()
+    first = dq_cmd.read_roll_pending()
+    assert first is not None
+    assert first.target_version == "0.4.111"
+
+    _run()
+    second = dq_cmd.read_roll_pending()
+    assert second is not None
+    assert second.target_version == "0.4.111"
+    # Untouched — same marker, not a fresh one.
+    assert second.set_at == first.set_at
+    assert second.deferrals == first.deferrals
 
 
 def test_force_rolls_over_per_host_busyness_too(

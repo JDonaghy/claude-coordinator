@@ -1979,10 +1979,33 @@ def write_roll_pending(pending: RollPending) -> None:
     Used both for the INITIAL set (`coord release propagate`/
     `nightly-window`) and for this module's own re-write after bumping
     ``deferrals`` each tick it does not fire the roll.
+
+    Atomic tempfile-then-rename — the same pattern
+    `coord.machine_pause._save_state` uses for its own shared JSON state
+    file. This one has THREE independent process families writing it (this
+    module's own tick, and `coord release propagate`/`nightly-window`) with
+    no cross-process lock between them (#2587 review) — a plain
+    ``write_text`` is a real torn-read window a concurrent
+    :func:`read_roll_pending` could land in, even though that reader's
+    fail-soft parse degrades a torn read to "no marker" rather than raising.
     """
+    import os  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+
     path = roll_pending_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_json.dumps(pending.to_dict(), sort_keys=True), encoding="utf-8")
+    payload = _json.dumps(pending.to_dict(), sort_keys=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=".roll_pending.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def clear_roll_pending() -> None:
@@ -3068,14 +3091,21 @@ def drive_queue_tick(
 
     #2587: when a fleet roll is pending (`coord release propagate`/
     `nightly-window` set the marker instead of draining — see
-    `coord.drive_queue.RollPending`), this tick behaves exactly as if
-    `--reconcile-only` had been passed, whatever `--max-parallel` says —
-    reconciliation still runs, launching nothing — and, once THIS tick's own
-    reconciliation empties the queue out (zero entries still occupying a
-    slot), fires the roll itself (`systemctl --user start --no-block
-    coord-release-window.service`) and clears the marker. Never stops
-    `coord-drive-queue.timer` to get there — see the marker's own docstring
-    for why that would reproduce #2569.
+    `coord.drive_queue.RollPending`), this tick refuses to LAUNCH, whatever
+    `--max-parallel` says — the same capacity-0 posture `--reconcile-only`
+    gives #2110 — and, once THIS tick's own reconciliation empties the queue
+    out (zero entries still occupying a slot), fires the roll
+    (`systemctl --user start --no-block coord-release-window.service`).
+    Unlike an EXPLICIT `--reconcile-only`/`--max-parallel 0` run, a pending
+    roll does not also skip the #2350 direct-merge fast path: merging an
+    already-fully-approved entry is not "launching new work", and letting it
+    proceed frees that entry rather than leaving it queued for the whole
+    span the marker survives. Never stops `coord-drive-queue.timer` to reach
+    the gap — see the marker's own docstring for why that would reproduce
+    #2569. Firing the roll does NOT clear the marker itself — see
+    `RollPending`'s own docstring for why that clear belongs solely to the
+    spawned `coord-release-window.service`, once it has actually confirmed
+    the roll.
     """
     from coord.filelock import FileLock, LockBusy, drive_queue_lock_path  # noqa: PLC0415
     from coord.state import list_drive_queue, update_drive_queue_entry  # noqa: PLC0415
@@ -3094,6 +3124,15 @@ def drive_queue_tick(
     # one flag is a mnemonic for the other rather than a second code path, so
     # there is exactly one way this behaves, not two that could drift apart.
     reconcile_only = reconcile_only or max_parallel == 0
+    # #2587 review: captured BEFORE a pending roll (below) forces
+    # `reconcile_only` too — this is the operator's own EXPLICIT request,
+    # used only to gate the #2350 merge-only fast path and the #2535
+    # CI-revalidate sweep (both real external actions that flag's contract
+    # promises not to take). A roll-pending marker must NOT also suppress
+    # those: merging an already-approved entry is not "launching new work",
+    # and skipping it would leave a mergeable entry queued for the marker's
+    # entire span for no reason connected to the roll.
+    explicit_reconcile_only = reconcile_only
 
     lock = FileLock(drive_queue_lock_path())
     try:
@@ -3122,10 +3161,12 @@ def drive_queue_tick(
 
         # #2587: is a fleet roll queued for the next inter-drive gap? Read
         # BEFORE `effective_capacity` is resolved — a live, unexpired marker
-        # forces this tick into the exact same posture `--reconcile-only`
+        # forces this tick into the same capacity-0 posture `--reconcile-only`
         # already gives #2110 (see `RollPending`'s docstring for why this
-        # reuses that path rather than inventing a new one): reconcile, skip
-        # the merge-only/CI-revalidate side effects below, launch nothing.
+        # reuses that path rather than inventing a new one): reconcile,
+        # launch nothing. It does NOT also force `explicit_reconcile_only`
+        # (captured above, BEFORE this), so the #2350 merge-only fast path
+        # below still runs — see this function's own docstring for why.
         # An EXPIRED marker (TTL or deferral ceiling — `RollPending.expired`)
         # is dropped right here, loudly (`_escalate_roll_pending_expired`),
         # and this tick proceeds exactly as if no marker had ever been set —
@@ -3289,8 +3330,51 @@ def drive_queue_tick(
             if plan.occupied == 0:
                 fired, detail = _fire_pending_roll()
                 if fired:
-                    clear_roll_pending()
-                    click.echo(f"roll fired for {roll_pending.describe()}: {detail}")
+                    # #2587 review: this must NOT clear the marker. `fired`
+                    # here only means `systemctl --user start --no-block`
+                    # returned 0 — i.e. the start request was ACCEPTED — not
+                    # that a roll happened; `--no-block` returns the instant
+                    # the job is queued, before the spawned unit has even
+                    # begun executing, let alone reached its own read of this
+                    # marker. Clearing it here, in this same statement, raced
+                    # the freshly spawned `coord-release-window.service` out
+                    # from under it on every real invocation: that process
+                    # (`coord.commands.release.release_nightly_window`, run
+                    # with no `--target`) re-resolves the target from scratch
+                    # — a PyPI lookup plus a fleet-wide health gather, both
+                    # real network I/O — before it ever reaches its own
+                    # `existing = read_roll_pending()`. By then this tick's
+                    # `clear_roll_pending()` had already run, so `existing`
+                    # was always `None` and the spawned process took the "no
+                    # marker pending -> (re)set one and return" branch
+                    # instead of ever calling `coord release propagate` — the
+                    # roll never actually happened, silently, forever.
+                    #
+                    # The marker now stays exactly as it was (nothing here
+                    # rewrites `set_at`/`deferrals` either — this tick spends
+                    # no deferral on a successful fire attempt) and is
+                    # cleared ONLY by the spawned process itself, and only
+                    # once it has confirmed the roll — see
+                    # `release_nightly_window`'s "existing marker pending for
+                    # THIS target" branch, which attempts `coord release
+                    # propagate` and clears the marker on a verified/rolled/
+                    # up-to-date outcome. A `systemctl --user start` against
+                    # an already-active `Type=oneshot` unit is systemd's own
+                    # no-op (see `deploy/coord-release-window.service`), so
+                    # re-firing on every subsequent tick while that process
+                    # is still mid-run (or has already finished and cleared
+                    # the marker, in which case `roll_pending` reads `None`
+                    # next tick and this branch is never reached again) costs
+                    # nothing. Bounded, as ever, by the marker's own TTL — a
+                    # roll that never confirms still self-clears, per
+                    # `RollPending.expired`, rather than holding the queue
+                    # down waiting for a confirmation that never comes.
+                    click.echo(
+                        f"requested roll for {roll_pending.describe()}: {detail} "
+                        "— marker left in place; coord-release-window.service "
+                        "clears it once `coord release propagate` confirms the "
+                        "roll"
+                    )
                 else:
                     # Could not even hand off to systemd — stays pending, one
                     # deferral spent, retried next tick. Loud (stderr): a
@@ -3317,20 +3401,29 @@ def drive_queue_tick(
 
         # #2350: attempt the direct merges `plan_tick` marked `merge_only`,
         # right after the rest of the plan's writes have landed. Skipped
-        # under `--reconcile-only` (also forced by `--max-parallel 0`, see
-        # `effective_capacity` above) — that mode's whole contract is
-        # "update queue state, launch nothing", and a live `coord merge
-        # --only` attempt is exactly the external action it promises not to
-        # take, same posture as the launch subprocess further down.
-        if not reconcile_only:
+        # under an EXPLICIT `--reconcile-only`/`--max-parallel 0`
+        # (`explicit_reconcile_only`, captured above before a roll-pending
+        # marker can force plain `reconcile_only`) — that mode's whole
+        # contract is "update queue state, launch nothing", and a live
+        # `coord merge --only` attempt is exactly the external action it
+        # promises not to take, same posture as the launch subprocess
+        # further down. Deliberately NOT skipped merely because a roll is
+        # pending (#2587 review): merging an already-fully-approved entry
+        # is not "launching new work" — it is completing work the queue
+        # already decided to do — and letting it proceed frees that entry
+        # instead of leaving it queued, unmerged, for the marker's entire
+        # span for no reason connected to the roll.
+        if not explicit_reconcile_only:
             _run_merge_only_candidates(plan, config_path)
 
         # #2535: independent of the drive-queue plan above (this scans the
         # MERGE queue directly, not drive-queue rows) — a bounded, best-effort
         # CI re-run for any entry blocked solely on stale-but-green checks
-        # with an already-approved review. Same `not reconcile_only` posture
-        # as the merge-only fast path just above: a `gh run rerun` is a real
-        # external action that mode promises not to take.
+        # with an already-approved review. Still gated on the FULL
+        # `reconcile_only` (roll-pending included, unlike the merge-only fast
+        # path just above) — a `gh run rerun` is a real external action, and
+        # unlike a direct merge it does not free a queued entry on its own,
+        # so there is no equivalent reason to run it while a roll is pending.
         if not reconcile_only:
             _run_auto_revalidate_checks_stale(config_path)
 

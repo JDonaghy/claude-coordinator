@@ -392,9 +392,46 @@ class TestTickFiresAtTheInterDriveGap:
         assert "coord-drive-queue.timer" not in joined
         assert "stop" not in joined
 
-        # The marker's job is done: fired and cleared.
-        assert dq_cmd.read_roll_pending() is None
-        assert "roll fired" in second.output
+        # #2587 review: the tick must NEVER clear the marker itself on a
+        # fire — `_fire_pending_roll` returning True only means `systemctl
+        # --user start --no-block` was ACCEPTED, not that a roll happened.
+        # Clearing it here, in the tick's own process, raced the freshly
+        # spawned `coord-release-window.service` out from under it on every
+        # real invocation (see `RollPending`'s own docstring): that process
+        # re-resolves its target from a PyPI lookup + a fleet health gather
+        # before it ever reads this same marker, by which point the tick
+        # would already have deleted it. So the marker must survive,
+        # unchanged, for that process to find.
+        survived = dq_cmd.read_roll_pending()
+        assert survived is not None, (
+            "the tick cleared the roll-pending marker itself — the spawned "
+            "coord-release-window.service will never see it"
+        )
+        assert survived.target_version == "9.9.9"
+        # 1, from tick 1's "still busy" deferral — the fire attempt itself
+        # (this tick) spends no ADDITIONAL deferral; only "still busy" ticks
+        # bump the counter.
+        assert survived.deferrals == 1
+        assert "roll fired" not in second.output  # no longer claims confirmed success
+        assert "requested roll" in second.output
+        assert "coord-release-window.service" in second.output
+
+        # ── a third tick, while the spawned service is (from this test's
+        #    perspective) still mid-run: still nothing to launch, so the gap
+        #    still reads as arrived. Re-firing costs nothing — `systemctl
+        #    start` against an already-active `Type=oneshot` unit is
+        #    systemd's own no-op — and the marker still isn't this tick's to
+        #    clear.
+        third = cli("tick")
+        assert third.exit_code == 0, third.output
+        assert len(launches) == 2, launches
+        assert "coord-release-window.service" in launches[1]
+        still_pending = dq_cmd.read_roll_pending()
+        assert still_pending is not None
+        assert still_pending.target_version == "9.9.9"
+        # Still 1 — a repeated fire attempt (this tick too saw the gap) is
+        # not a "still busy" deferral either.
+        assert still_pending.deferrals == 1
 
     def test_status_shows_the_marker_while_it_is_live(self, cli, seed):
         """#2587's own non-negotiable: a deliberately held queue must never
@@ -411,6 +448,46 @@ class TestTickFiresAtTheInterDriveGap:
         as_json = cli("status", "--json")
         payload = __import__("json").loads(as_json.output)
         assert payload["roll_pending"]["target_version"] == "0.5.230"
+
+
+class TestRollPendingDoesNotBlockDirectMerges:
+    """#2587 review (non-blocking): forcing the tick's reconcile-only
+    capacity posture while a roll is pending must not also suppress the
+    #2350 direct-merge fast path (`_run_merge_only_candidates`) — merging an
+    already-fully-approved entry is not "launching new work", and skipping
+    it would leave that entry queued, unmerged, for the marker's entire
+    span, for no reason connected to the roll. An EXPLICIT
+    `--reconcile-only`/`--max-parallel 0` request is unaffected: THAT flag's
+    own contract still promises to touch nothing external."""
+
+    def test_merge_only_still_runs_while_a_roll_is_pending(self, cli, seed, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            dq_cmd, "_run_merge_only_candidates",
+            lambda plan, config_path: calls.append(plan),
+        )
+        seed(issues={1650: "open"})
+        cli("add", REPO, "1650")
+        dq_cmd.write_roll_pending(_pending())
+
+        result = cli("tick")
+        assert result.exit_code == 0, result.output
+        assert len(calls) == 1, "roll-pending must not skip the merge-only fast path"
+
+    def test_merge_only_is_still_skipped_under_an_explicit_reconcile_only(
+        self, cli, seed, monkeypatch
+    ):
+        calls = []
+        monkeypatch.setattr(
+            dq_cmd, "_run_merge_only_candidates",
+            lambda plan, config_path: calls.append(plan),
+        )
+        seed(issues={1650: "open"})
+        cli("add", REPO, "1650")
+
+        result = cli("tick", "--reconcile-only")
+        assert result.exit_code == 0, result.output
+        assert calls == [], "an explicit --reconcile-only must still skip it"
 
 
 # ── 3. the marker self-clears at its bound ────────────────────────────────
@@ -563,7 +640,49 @@ class TestNightlyWindowHandsOffToTheTick:
         # Exactly the roll-firing subprocess, never a `coord drive` launch.
         assert len(launches) == 1, launches
         assert "coord-release-window.service" in launches[0]
-        assert dq_cmd.read_roll_pending() is None  # fired -> cleared
+
+        # #2587 review: the tick's fire must NOT have cleared this marker —
+        # `systemctl --user start --no-block` returning 0 only means the
+        # start request was accepted, before the spawned process has even
+        # begun running. See `TestTickFiresAtTheInterDriveGap`'s own
+        # regression test for the isolated version of this assertion.
+        assert dq_cmd.read_roll_pending() is not None, (
+            "the tick cleared the marker before the spawned "
+            "coord-release-window.service could ever read it"
+        )
+
+        # Close the loop for real: a THIRD invocation of `coord release
+        # nightly-window`, run the same way the real
+        # `deploy/coord-release-window.service` unit's `ExecStart=` runs it —
+        # no `--target` at all, so it re-resolves "latest" from scratch
+        # (stubbed here to land on the SAME version already pending, exactly
+        # what happens in production since nothing changed on PyPI between
+        # the tick's fire and this run). This is what the freshly spawned
+        # process actually does; it must find the still-live marker from
+        # above and drive it to completion via `coord release propagate`.
+        from coord import release_propagate as rp
+
+        monkeypatch.setattr(release_cmd, "_resolve_expected", lambda *a, **k: ("9.9.9", None))
+        prop_calls: list[dict] = []
+
+        def _fake_run_propagate(**kwargs):
+            prop_calls.append(kwargs)
+            return rp.STATUS_VERIFIED, 0, "verified", None
+
+        monkeypatch.setattr(release_cmd, "_run_propagate", _fake_run_propagate)
+
+        spawned_result = CliRunner().invoke(
+            main,
+            ["release", "nightly-window", "--config", str(config_file),
+             "--daemon-host", "dellserver"],
+        )
+        assert spawned_result.exit_code == 0, spawned_result.output
+        # It found the marker and attempted the real fire — not the "no
+        # marker pending -> set a fresh one" branch the pre-fix race always
+        # took.
+        assert len(prop_calls) == 1, prop_calls
+        assert prop_calls[0]["target_version"] == "9.9.9"
+        assert dq_cmd.read_roll_pending() is None  # NOW it is actually cleared
 
 
 # ── 5. `coord notify` dispatches no NEW leg while the marker is set ───────
