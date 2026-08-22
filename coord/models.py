@@ -292,6 +292,16 @@ WORK_LIKE_TYPES: frozenset[str] = frozenset({"work", "mock-author", "test-author
 # needs to be added in one place.
 SEALED_PATH_AUTHOR_TYPES: frozenset[str] = frozenset({"test-author", "mock-author"})
 
+# #2555: filename of the one sealed-acceptance file a `type="conflict-fix"`
+# dispatch is ever authorized to edit for a SEALED_PATH_AUTHOR_TYPES branch —
+# every milestone's `tests/acceptance/ms-NN/manifest.yml`, which every slice
+# under that milestone additively appends its own issue block to (see e.g.
+# `tests/acceptance/ms-33/manifest.yml`'s own header comment: "Merged (never
+# clobbered) across issues"). `coord.conflict_fix`'s sealed-author dispatch
+# branch and `coord.notify`'s stalled-pipeline confinement check both key off
+# this exact name, kept here as a single shared constant so they can't drift.
+SEALED_MANIFEST_FILENAME = "manifest.yml"
+
 # #1077: subset of WORK_LIKE_TYPES whose ``issue_number`` is the issue the PR
 # actually *resolves* — i.e. merging it should auto-close that issue. "work"
 # qualifies. "mock-author" (Gate A) is WORK_LIKE (it flows through the same
