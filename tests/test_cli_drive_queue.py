@@ -3562,6 +3562,39 @@ def test_log_intervention_attaches_to_the_most_recent_episode_when_already_close
     assert episode["intervention_categories"] == ["infra"]
 
 
+def test_log_intervention_reports_failure_when_the_write_does_not_land(
+    cli, block_log
+):
+    """The #2540 review finding, reproduced directly: a failed append (full
+    disk / read-only $HOME / etc.) must NOT print "logged" on the strength of
+    "did not raise" alone — that is the exact "unconfirmed success" shape
+    epic #2096's checklist forbids, and it is the worst possible failure mode
+    for a command whose whole job is giving an operator a durable paper
+    trail. Simulated here by chmod'ing the log file read-only, the same
+    reproduction the reviewer used."""
+    _seed_enter(REPO, 1762, reason="checks_failed")
+    before = block_log_records(block_log)
+    assert [r["event"] for r in before] == ["enter"]
+
+    block_log.chmod(0o444)
+    try:
+        result = cli(
+            "log-intervention", REPO, "1762",
+            "--category", "infra", "--note", "should not land",
+        )
+    finally:
+        block_log.chmod(0o644)
+
+    assert result.exit_code != 0, result.output
+    assert "failed to log intervention" in result.output
+    assert "logged a " not in result.output
+    assert "logged, but" not in result.output
+
+    # The append genuinely did not happen — no false record left behind.
+    after = block_log_records(block_log)
+    assert [r["event"] for r in after] == ["enter"]
+
+
 # ── #2276 Phase 1: the read-only diagnostician, end to end ───────────────────
 #
 # Phase 0's `block-log` above shows what the queue SAID. These drive

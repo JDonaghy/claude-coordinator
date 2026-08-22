@@ -908,7 +908,29 @@ merge --only`/`coord pr`/`coord fix`), and `infra`. It is safe to run at any
 point relative to the actual fix landing — mid-recovery or afterward —
 `block-log` folds the record onto whichever episode was open at the time, or
 the most recently closed one otherwise. Skipping it breaks nothing
-mechanically, but it is exactly how real operator effort goes uncounted.
+mechanically, but it is exactly how real operator effort goes uncounted —
+and it stays a manual step: nothing here infers intervention automatically,
+so a recovery session where every command *except* `log-intervention` gets
+run still reports `0 needed a human`, same as before #2540.
+
+**Run it on the host that recorded the stall.** The block log is per-host by
+design (`coord/block_log.py`'s own docstring) and `log-intervention` inherits
+that — it only ever reads/writes *this* host's log. Run it from your laptop
+against a stall the daemon host actually recorded, and it will print "no
+recorded stall on this host's block log yet", write the record to a log file
+`coord drive-queue block-log` on the daemon host will never see, and the
+intervention will never attach to the episode it was about. In practice that
+means: run it on the daemon host (dellserver), the same place
+`coord-drive-queue.timer` runs the tick that recorded the stall in the first
+place — not wherever you happen to be running `git`/`coord test`/etc. by
+hand.
+
+As of #2540, the command also refuses to lie about a write it cannot
+confirm: if the append itself fails (full disk, read-only `$HOME`) or the
+record can't be read back immediately after, it exits non-zero with a
+`failed to log intervention` message instead of printing `logged ...` —
+`unconfirmed success` is a bug (epic #2096), and this is exactly the tool
+that exists to give operators a durable, trustworthy paper trail.
 
 ## Daemon-host unit inventory — what dellserver runs
 
