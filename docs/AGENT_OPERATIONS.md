@@ -1006,14 +1006,19 @@ relaunches on a 3-minute tick and propagation retries every 20, so the roll
 waits on a short inter-drive gap coinciding with a propagate tick — which
 happens, but can take hours.
 
-To force the window deliberately (hold, do not kill):
-
-```bash
-systemctl --user stop coord-drive-queue.timer   # no NEW drives launch
-coord drive-queue tick --reconcile-only         # drain any row the timer would have caught
-coord release propagate --daemon-host dellserver
-systemctl --user start coord-drive-queue.timer
-```
+**Do not force the window by stopping `coord-drive-queue.timer` by hand.**
+That used to be the documented fix here, and on 2026-08-22 an attended manual
+roll run through its wrapper (`coord release nightly-window`) sat for the
+full 60-minute deadline with the timer stopped, drained nothing, and rolled
+nothing — because a continuously-busy queue essentially never reaches
+fleet-wide quiescence, and stopping the timer also stops the reconciliation
+that would let the queue's true state ever be seen. See "Roll at the next
+inter-drive gap (`coord-release-window`, #2112/#2587)" below for the
+mechanism that replaced it: `coord release propagate`'s own daemon-busy
+deferral, and `coord release nightly-window`, now both just set a
+**roll-pending marker** and return immediately — `coord drive-queue tick`
+fires the actual roll itself, the instant it notices the queue's own next
+inter-drive gap, never stopping any timer to get there.
 
 **#2124 (fixed 2026-08-13):** step 3 used to undo step 1. `coord release
 propagate`'s own `deploy/**` lane (`POST /deploy-units`) asserts every
@@ -1164,6 +1169,83 @@ since it has nothing to pass as `--config`. See
 `tests/test_release_cordon_2101.py`'s `#2373` section for the seeded
 end-to-end shape (a `running` entry pinned to a non-daemon host, cordoned
 past the drain deadline, resolved without an operator SSH session).
+
+### Roll at the next inter-drive gap (`coord-release-window`, #2112/#2587)
+
+The daemon host is the one case a per-host quiescent window (above) cannot
+reach on its own — cordoning does not help, because cordoning only stops NEW
+work from *routing* to a host, and it is the daemon host's *own* drive-queue
+tick that keeps launching work onto itself. #2112 built a separate mechanism
+for exactly this case: `coord release nightly-window`, paired with
+`coord-release-window.timer` (03:00 local nightly).
+
+**2026-08-22 incident.** #2112's original mechanism stopped
+`coord-drive-queue.timer`, polled a bounded drain (default one hour) for
+whatever was already running to finish, rolled, and always restarted the
+timer. An attended manual run (`coord release nightly-window`) sat for the
+**full 60-minute deadline, drained nothing, rolled nothing** — with
+`coord-drive-queue.timer`, and therefore all reconciliation and all new
+dispatch, stopped the entire time. The insight: the tick launches at most
+one drive per run, so the fleet genuinely goes idle **between** one drive
+finishing and the next launching — several times an hour on a busy queue —
+but the mechanism was waiting for a DIFFERENT, much rarer event
+(fleet-wide idle for the whole drain window) that a continuously-refilling
+queue essentially never produces.
+
+**#2587 fix: invert the handoff.** Rather than a command polling for a
+window with a deadline, the drive queue — which is the thing that *creates*
+the busy state — announces the window it already knows about, every tick
+(`coord-drive-queue.timer`, ~3 minutes in production), for free:
+
+1. `coord release propagate` (when it hits the daemon-busy deferral above)
+   and `coord release nightly-window` both just set a **roll-pending
+   marker** — `~/.coord/roll_pending.json`
+   (`coord.drive_queue.RollPending`, written via
+   `coord.commands.drive_queue.write_roll_pending`) — naming the target
+   version, and return immediately. **No timer is ever stopped.**
+2. While the marker is live, `coord drive-queue tick` (`coord/commands/
+   drive_queue.py`) behaves exactly as if `--reconcile-only` had been
+   passed — reconciliation runs completely normally, launching nothing
+   — and `coord notify` dispatches no NEW leg (smoke/review/auto-loop
+   fix-or-re-review/stalled-pipeline action), though it keeps posting
+   completion/stuck/needs-attention/liveness signals for work already in
+   flight.
+3. The instant a tick's OWN reconciliation empties the queue out
+   (`TickPlan.occupied == 0` — no drive-queue row still holds a live tmux
+   session or a live board assignment) — the inter-drive gap — that tick
+   fires the roll: `systemctl --user start --no-block
+   coord-release-window.service`. `--no-block` matters: the roll swaps the
+   venv the tick is executing from, so it must outlive the tick's own
+   process tree, never run inline.
+4. The marker is bounded two independent ways —
+   `ROLL_PENDING_DEFAULT_TTL_SECONDS` (wall-clock, default 1h) and
+   `ROLL_PENDING_DEFAULT_MAX_DEFERRALS` (a tick-count ceiling, default 20,
+   independent of the clock) — so a pending or failed roll can never hold
+   the queue down indefinitely; whichever bound is hit first clears the
+   marker, records a loud escalation (`(roll-pending)` in `coord drive
+   escalations`, separate from the ordinary queue alert so it cannot be
+   silently overwritten by the same tick's own alert handling), and
+   launching resumes THAT SAME tick.
+
+**Visible in `coord drive-queue status`** (and its `--json` output) while
+live — the whole point is that a held-for-a-roll queue must never read as
+broken, so it gets its own line, not the alert channel a cordon or a stalled
+entry uses.
+
+**Same unit, two triggers.** `coord-release-window.service`'s `ExecStart=`
+is always `coord release nightly-window` — the SAME command handles both its
+own nightly timer (resolve the target; if nothing is pending yet, set the
+marker) and a tick-triggered `systemctl start` (a marker is already pending
+for this target — make one best-effort attempt to fire it via `coord
+release propagate`, no `--force`, ever). See
+`deploy/coord-release-window.service`'s header for the full walkthrough.
+
+**Diagnosing a stuck roll:** `coord drive-queue status` /
+`coord release window-history` — a `roll-pending` status is healthy and
+expected; `STATUS_DRAIN_TIMEOUT` no longer occurs (nothing drains any more).
+A marker still present well past an hour with the fleet visibly idle is a
+bug, not a busy fleet — check `coord-release-window.service`'s own journal
+for why the tick's `systemctl start` request didn't land.
 
 ## `coord.db` backups to the external SSD (interim — #1822 owns the real thing)
 

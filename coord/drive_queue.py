@@ -459,6 +459,35 @@ DEFAULT_MAX_PARALLEL_PER_REPO = 1
 # longer relies on it.
 DRIVE_STARTUP_GRACE_SECONDS = 300.0
 
+# ── #2587: roll-pending bounds ────────────────────────────────────────────────
+#
+# A "roll at the next inter-drive gap" marker (see `RollPending` below) must
+# never hold the queue down indefinitely — the whole point of #2587 is to
+# replace a drain that waited an unbounded 60 minutes for a window that never
+# came. Two independent bounds, mirroring #2240's cordon-deferral ceiling
+# (`coord/release_cordon.py`'s `max_deferrals`/`release_cooldown`) rather than
+# inventing a third shape for "give up eventually":
+#
+# * `ROLL_PENDING_DEFAULT_TTL_SECONDS` — wall-clock. Same default as
+#   `coord/release_window.py`'s (pre-#2587) `DEFAULT_DRAIN_WAIT_SECONDS`: an
+#   hour leaves ample room inside a quiet-hours window even set as late as
+#   03:00, and keeps the bound recognisable to an operator who already knows
+#   that number from the old drain.
+# * `ROLL_PENDING_DEFAULT_MAX_DEFERRALS` — a tick-count ceiling, independent of
+#   the clock. `coord-drive-queue.timer` fires roughly every 3 minutes in
+#   production, so 20 deferrals is ~an hour of ticks that each found the fleet
+#   still busy — the same order of magnitude as the TTL, reached the other
+#   way. Two independent measures catch different failure shapes: a wedged
+#   clock defeats a TTL-only bound; a tick loop firing far faster than
+#   expected defeats a deferral-only one.
+#
+# Whichever bound is hit first clears the marker and resumes normal launching
+# — see `RollPending.expired` — and the shell (`coord.commands.drive_queue`)
+# is responsible for reporting that loudly (#2587's "never silently held"
+# requirement), the same posture #2240 forced onto an expired cordon.
+ROLL_PENDING_DEFAULT_TTL_SECONDS = 3600.0
+ROLL_PENDING_DEFAULT_MAX_DEFERRALS = 20
+
 # ── the queue-level alert's synthetic escalation key ─────────────────────────
 #
 # #1754 asks for "one queue-level record per tick, written through the DQ-1
@@ -1391,6 +1420,120 @@ class QueueAlert:
 
 
 @dataclass(frozen=True)
+class RollPending:
+    """#2587: a fleet roll is queued for the next INTER-DRIVE GAP, not a drain.
+
+    Set by `coord release propagate` / `coord release nightly-window` when the
+    daemon host is behind and busy, instead of stopping
+    `coord-drive-queue.timer` and polling a bounded drain for up to an hour
+    (2026-08-22: that drain ran 60 minutes, drained nothing, rolled nothing —
+    #2569's exact shape, and #2569 is *why* a timer must never be stopped to
+    reach quiescence again). While this marker is live, `plan_tick` refuses to
+    launch — see its ``roll_pending_reason`` parameter — but reconciliation
+    (steps 1/1b) runs completely unaffected, exactly the posture
+    `--reconcile-only` already gives a #2101 release cordon. The tick launches
+    at most one drive per run, so the moment reconciliation leaves the queue
+    with nothing occupying a slot (:attr:`TickPlan.occupied` ``== 0``) IS an
+    inter-drive gap — which happens several times an hour on a busy queue, not
+    never. The shell (`coord.commands.drive_queue`) is what notices that and
+    fires the actual roll (``systemctl --user start --no-block
+    coord-release-window.service``) — this dataclass only carries the
+    decision-relevant facts, no I/O.
+
+    Persisted as JSON by the shell (`coord.commands.drive_queue.
+    write_roll_pending`) — never read or written from this module, which
+    stays pure; see the module docstring.
+    """
+
+    #: The version this roll is for — carried through to the alert/status
+    #: prose and to the eventual `coord release propagate --target` call, so
+    #: a marker set at 22:00 rolls the version resolved THEN even if a newer
+    #: release lands on PyPI before the gap arrives.
+    target_version: str
+    #: `time.time()` when this marker was set — the TTL's epoch.
+    set_at: float
+    #: Free text naming who/why set it ("nightly-window" / "propagate"),
+    #: threaded into the status line so an operator sees provenance, not just
+    #: a bare version.
+    reason: str = ""
+    ttl_seconds: float = ROLL_PENDING_DEFAULT_TTL_SECONDS
+    max_deferrals: int = ROLL_PENDING_DEFAULT_MAX_DEFERRALS
+    #: Consecutive ticks that observed this marker still pending and the
+    #: fleet still busy — bumped by the shell each tick it does NOT fire the
+    #: roll. Never bumped by `plan_tick` itself (pure; no counting state).
+    deferrals: int = 0
+
+    def expired(self, now: float) -> bool:
+        """Has this marker outlived ITS OWN bound — TTL or deferral ceiling?
+
+        Either bound alone can fail (a wedged clock defeats the TTL; a tick
+        loop firing far faster than the production 3-minute cadence defeats
+        the deferral count) — see the constants' own comment for why both are
+        checked. `ttl_seconds <= 0` / `max_deferrals <= 0` disables that half
+        of the check (unbounded), matching `--max-parallel-per-repo 0`'s
+        "0 disables this ceiling" convention elsewhere in this module.
+        """
+        if self.ttl_seconds > 0 and (now - self.set_at) >= self.ttl_seconds:
+            return True
+        return self.max_deferrals > 0 and self.deferrals >= self.max_deferrals
+
+    def describe(self) -> str:
+        return f"roll pending: v{self.target_version}" + (
+            f" ({self.reason})" if self.reason else ""
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "target_version": self.target_version,
+            "set_at": self.set_at,
+            "reason": self.reason,
+            "ttl_seconds": self.ttl_seconds,
+            "max_deferrals": self.max_deferrals,
+            "deferrals": self.deferrals,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "RollPending":
+        """Tolerant parse of :meth:`to_dict`'s shape — see `expired`'s note on
+        why a malformed/missing bound reads as *unbounded* rather than
+        raising: a marker this module cannot parse must still eventually
+        clear via the shell's own fallback, never wedge the queue forever
+        because a JSON file on disk got hand-edited.
+        """
+        target_version = str(data.get("target_version") or "").strip()
+        if not target_version:
+            raise ValueError("roll_pending record has no target_version")
+        try:
+            set_at = float(data["set_at"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("roll_pending record has no usable set_at") from None
+        return cls(
+            target_version=target_version,
+            set_at=set_at,
+            reason=str(data.get("reason") or ""),
+            ttl_seconds=_as_float(data.get("ttl_seconds"), ROLL_PENDING_DEFAULT_TTL_SECONDS),
+            max_deferrals=_as_int_default(
+                data.get("max_deferrals"), ROLL_PENDING_DEFAULT_MAX_DEFERRALS
+            ),
+            deferrals=_as_int_default(data.get("deferrals"), 0),
+        )
+
+
+def _as_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_int_default(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+@dataclass(frozen=True)
 class TickPlan:
     """Everything one tick decided, and nothing it has done yet."""
 
@@ -1431,6 +1574,15 @@ class TickPlan:
     # must say why in a field the shell can render, not just a log line
     # nobody is watching an unattended tick for.
     drift_reason: str = ""
+    # #2587: non-empty when a fleet roll is queued for the next inter-drive
+    # gap (see `RollPending`), in which case nothing launched this tick and
+    # `launch` is guaranteed None — same shape as `cordon_reason`/
+    # `drift_reason` and for the same reason. Carries `RollPending.describe()`
+    # ("roll pending: v0.5.230 (nightly-window)") rather than a bool so the
+    # render names WHICH version, the same "say why or it reads as a mystery"
+    # rule the other two follow. Reconciliation is unaffected by this field —
+    # see `RollPending`'s own docstring for why that is the whole mechanism.
+    roll_pending_reason: str = ""
 
     @property
     def free_slots(self) -> int:
@@ -3072,6 +3224,7 @@ def plan_tick(
     live_blocked_gate: Mapping[str, bool] | None = None,
     editable_drift: tuple[str, str] | None = None,
     merge_only_ready: Mapping[str, bool] | None = None,
+    roll_pending_reason: str = "",
 ) -> TickPlan:
     """Decide one tick.  Pure; the caller executes the returned plan.
 
@@ -3324,6 +3477,22 @@ def plan_tick(
     the launch outright for anything launched more recently, whatever put it
     back in ``waiting``.  Between them, no single tick can start a second
     ``coord drive`` for an issue whose first one may still be coming up.
+
+    *roll_pending_reason* (#2587) is non-empty when a fleet roll is queued for
+    the next inter-drive gap (see :class:`RollPending`) — the shell's rendered
+    ``RollPending.describe()``, e.g. ``"roll pending: v0.5.230
+    (nightly-window)"``. Checked immediately after the drift check (step 2c)
+    and, like both it and the cordon, BEFORE capacity: this tick launches
+    NOTHING however many slots are free, however many entries are eligible.
+    Reconciliation (steps 1/1b) still runs — same reasoning as the cordon and
+    drift checks: the whole point of #2587 is that the tick keeps noticing
+    reality even while it refuses to act on it, so :attr:`TickPlan.occupied`
+    stays truthful and the shell can tell the moment it drops to ``0`` — the
+    inter-drive gap this marker is waiting for. This function does not decide
+    WHEN to fire the roll or how long the marker may stay pending; it merely
+    plays the same "launch nothing, but say why" role the cordon and drift
+    checks do. The shell owns the TTL/deferral-ceiling bound (:meth:`RollPending
+    .expired`) and the actual ``systemctl`` call once ``occupied`` reaches 0.
     """
     ordered = sorted(entries, key=lambda e: (e.position, e.key))
     states: dict[str, str] = {e.key: e.state for e in ordered}
@@ -3849,6 +4018,26 @@ def plan_tick(
             drift_reason=drift_text,
         )
 
+    # #2587 step 2d: is a fleet roll queued for the next inter-drive gap?
+    # Checked right after the drift check (same reasoning again: reconciliation
+    # above already ran and must stay unaffected) and, like the cordon and
+    # drift checks, before capacity — a pending roll launches nothing however
+    # many slots are free. No alert here (unlike the cordon/drift branches):
+    # #2587 is explicit that a held-for-a-roll queue must never read as
+    # broken, and the alert channel is for exactly that — see
+    # `coord.commands.drive_queue`'s `status` rendering of the marker itself
+    # for the (non-alarming) visibility this state gets instead.
+    if roll_pending_reason:
+        return TickPlan(
+            **plan_base,
+            reconciles=tuple(reconciles),
+            blocked=tuple(blocked),
+            deferrals=(),
+            alert=None,
+            launch=None,
+            roll_pending_reason=roll_pending_reason,
+        )
+
     if capacity - occupied <= 0:
         return TickPlan(
             **plan_base,
@@ -4293,6 +4482,16 @@ def render_plan(plan: TickPlan, *, dry_run: bool = False) -> list[str]:
         # cordon branch above — this host's own `coord` is untrustworthy
         # right now, not the queue.
         lines.append(f"  no launch — this host's coord is {plan.drift_reason}")
+    elif plan.roll_pending_reason:
+        # #2587: same "name it or it reads as a mystery" reasoning again —
+        # this is the fleet deliberately holding for its own upcoming roll,
+        # not a stall. Fires the instant `occupied` (just above, unaffected
+        # by this branch) reads 0 — see `coord.commands.drive_queue`'s tick
+        # shell for the actual trigger.
+        lines.append(
+            f"  no launch — {plan.roll_pending_reason} "
+            f"({plan.occupied} entries still occupying a slot)"
+        )
     elif plan.capacity and plan.free_slots == 0:
         # Naming the reason matters more here than anywhere else in this
         # render: #1794 was diagnosed entirely from a journal, and "no launch"

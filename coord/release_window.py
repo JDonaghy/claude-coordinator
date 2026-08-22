@@ -1,5 +1,26 @@
 """Decision half of the nightly daemon-host release window (#2112).
 
+#2587 UPDATE — read this before the rest of this docstring, which otherwise
+describes a mechanism this module no longer drives directly. Measured
+2026-08-22: the "stop the timer, poll a bounded drain, roll, restart the
+timer" sequence this module was built around ran for its full 60-minute
+deadline, drained nothing, and rolled nothing — the fleet-wide quiescent
+window it waited for never arrived, because the drive queue refills from its
+own backlog continuously. `coord.commands.release.release_nightly_window`
+no longer calls the drain loop described below; it sets a roll-pending
+marker (`coord.drive_queue.RollPending`, persisted via
+`coord.commands.drive_queue.write_roll_pending`) and returns immediately.
+The marker is what `coord drive-queue tick` checks every ~3 minutes — the
+fleet's OWN natural inter-drive gap, which happens far more often than a
+fleet-wide idle window — and the tick fires the roll the instant it observes
+one, never stopping any timer to get there. `needs_roll`, the
+`WindowRecord`/journal machinery, and `render_record` below are all still
+live (the journal now also records `STATUS_ROLL_PENDING` runs); `DrainOutcome`
+and the bounded-drain constants below describe the RETIRED mechanism, kept
+only because `coord.commands.release._drain`/`_run_reconcile_tick` (and
+their own direct unit tests) still exist as a manual escape hatch, wired to
+nothing by default.
+
 `coord release propagate` (#1835/#2067) rolls each host at ITS OWN quiescent
 window — except the daemon host, which the daemon-first lane order (#1835's
 LANE ORDER, the documented 405) forces to gate the *whole run*: no lane may
@@ -120,11 +141,21 @@ STATUS_DRAIN_TIMEOUT = "drain-timeout"
 STATUS_PROPAGATE_DEFERRED = "propagate-deferred"
 STATUS_PROPAGATE_FAILED = "propagate-failed"
 STATUS_ERROR = "error"
+#: #2587: this run set (or found, and left standing) a roll-pending marker —
+#: the drive-queue tick, not this command, will fire the actual roll at the
+#: next inter-drive gap. A GOOD outcome (see OK_STATUSES below), not a
+#: failure to roll: the whole point of #2587 is that "not rolled THIS
+#: instant" and "not working" are different things, and #2112's old
+#: STATUS_DRAIN_TIMEOUT — the loud, failing outcome it replaces for the
+#: still-busy case — must never be confused with it.
+STATUS_ROLL_PENDING = "roll-pending"
 
 #: Statuses meaning "this window did what it was for, or correctly had
 #: nothing to do" — everything else is a night propagation was supposed to
 #: happen and did not (trap 3: loud, not silent).
-OK_STATUSES = frozenset({STATUS_UP_TO_DATE, STATUS_ROLLED, STATUS_DRY_RUN})
+OK_STATUSES = frozenset(
+    {STATUS_UP_TO_DATE, STATUS_ROLLED, STATUS_DRY_RUN, STATUS_ROLL_PENDING}
+)
 
 #: The inverse of OK_STATUSES, spelled out for readability at call sites.
 LOUD_STATUSES = frozenset(
@@ -303,6 +334,7 @@ _STATUS_MARK = {
     STATUS_PROPAGATE_DEFERRED: "~",
     STATUS_PROPAGATE_FAILED: "✗",
     STATUS_ERROR: "✗",
+    STATUS_ROLL_PENDING: "…",
 }
 
 

@@ -1,28 +1,49 @@
-"""Black-box tests for `coord release nightly-window` (#2112).
+"""Black-box tests for `coord release nightly-window` (#2112, rewritten #2587).
 
 `coord release propagate` cannot roll the daemon host past a busy fleet on
 its own: the daemon leads every roll (the documented 405), and dellserver's
 own drive-queue tick charges itself busy for essentially any queued drive —
 see `coord/release_window.py`'s module docstring for the full mechanism.
-This command manufactures the window propagate can't: stop the queue, drain
-what's already running (bounded), roll, ALWAYS restart the queue.
 
-These tests drive the running command through Click, per this repo's bar
-for a behaviour-changing PR — the pure judgement (`needs_roll`, the journal
-shape) is covered in `tests/test_release_window.py`. What's tested here is
-the wiring, and #2112's five acceptance criteria directly:
+#2587 REWRITE: this command used to manufacture the window itself — stop
+`coord-drive-queue.timer`, poll a bounded drain (up to an hour), roll, ALWAYS
+restart the timer. Measured 2026-08-22: that drain ran the full 60-minute
+deadline, drained nothing, rolled nothing, with the timer (and therefore ALL
+reconciliation and ALL new dispatch) stopped the entire time — the fleet-wide
+quiescent window it waited for never arrives on a continuously-busy queue.
+Now this command sets a roll-pending marker naming the target version and
+returns immediately; `coord drive-queue tick` is what watches for the
+fleet's own natural inter-drive gap (several times an hour, not never) and
+fires the actual roll — see `tests/test_release_roll_window_handoff.py` for
+that side of the mechanism, and `tests/test_release_window.py` for the pure
+judgement (`needs_roll`, the journal shape, `STATUS_ROLL_PENDING`).
 
-1. idle fleet at the window -> rolled, timer running again.
-2. a drive still running at the drain deadline -> timer restarted, nothing
-   rolled, the reason is in the surfaced message.
-3. the fleet already current -> the queue is never touched at all.
-4. the queue timer is running after the job in EVERY path, including a
-   crash mid-window.
-5. success is never reported for a roll the job did not confirm.
+What's tested here is this command's own wiring:
+
+1. a needed roll with nothing already pending -> sets the marker, touches no
+   timer, calls `coord release propagate` zero times, returns immediately.
+2. a marker already pending for a DIFFERENT (stale) target -> replaced, no
+   fire attempt.
+3. a marker already pending for the SAME target -> one best-effort attempt to
+   fire it directly (never `--force`), for the operator-at-the-console case
+   where the fleet happens to already be idle:
+   a. verified/rolled/up-to-date -> marker cleared, reported as a success.
+   b. still deferred (fleet busy) -> marker left exactly as it was, for the
+      tick to keep watching; a normal, quiet, non-escalated outcome.
+   c. a genuine failure -> marker survives (bounded by its own TTL/deferral
+      ceiling — see `RollPending`), and this is loud (escalated).
+4. the fleet already current -> nothing is touched at all.
+5. success is never reported for a roll that was not actually confirmed
+   (#2187's original bug, preserved through the rewrite via the SAME
+   `_run_propagate` interpretation logic).
+6. `--ensure-queue-running` (the legacy escape hatch) still just starts the
+   timer and exits — nothing else in this command reaches for it any more.
 
 Nothing here touches a real fleet or a real systemd: `_systemctl`,
-`_run_reconcile_tick`, `_run_propagate`, and `coord.release_verify.gather`/
-`.verify` are all seams.
+`_run_propagate`, and `coord.release_verify.gather`/`.verify` are all seams.
+The retired `_drain`/`_run_reconcile_tick` helpers are still directly unit
+tested further down in this file — they remain valid, callable code, simply
+no longer wired into this command's default path.
 """
 
 from __future__ import annotations
@@ -33,7 +54,9 @@ from click.testing import CliRunner
 from coord import release_propagate as rp
 from coord import release_window as rw
 from coord.cli import main
+from coord.commands import drive_queue as dq_cmd
 from coord.commands import release as release_cmd
+from coord.drive_queue import RollPending
 
 
 @pytest.fixture(autouse=True)
@@ -154,7 +177,13 @@ def _stub_propagate(monkeypatch, *, status: str, exit_code: int, output: str = "
     return calls
 
 
-# ── acceptance 3: already current -> the queue is never touched ──────────
+def _pending(**overrides):
+    kwargs = {"target_version": "0.5.31", "set_at": 1000.0, "reason": "nightly-window"}
+    kwargs.update(overrides)
+    return RollPending(**kwargs)
+
+
+# ── the fleet already current -> nothing is touched at all ───────────────
 
 
 def test_an_already_current_daemon_never_touches_the_queue(
@@ -162,7 +191,7 @@ def test_an_already_current_daemon_never_touches_the_queue(
 ):
     _stub_verify(monkeypatch, daemon_version="0.5.31")
     systemctl_calls = _stub_systemctl(monkeypatch)
-    drain_calls = _stub_drain(monkeypatch, drained=True)
+    prop_calls = _stub_propagate(monkeypatch, status=rp.STATUS_VERIFIED, exit_code=0)
 
     result = CliRunner().invoke(
         main,
@@ -171,24 +200,28 @@ def test_an_already_current_daemon_never_touches_the_queue(
     )
     assert result.exit_code == 0, result.output
     assert systemctl_calls == []
-    assert drain_calls == []
+    assert prop_calls == []
     assert not escalations
+    assert dq_cmd.read_roll_pending() is None
     record = _records(state_dir)[0]
     assert record["status"] == rw.STATUS_UP_TO_DATE
     assert record["queue_stopped"] is None
     assert record["queue_restarted"] is None
 
 
-# ── acceptance 1: idle fleet -> rolled, timer running again ──────────────
-
-
-def test_an_idle_fleet_rolls_and_the_timer_ends_up_running(
+def test_an_already_current_daemon_clears_a_now_stale_pending_marker(
     valid_config_path, state_dir, no_network, escalations, monkeypatch
 ):
-    _stub_verify(monkeypatch, daemon_version="0.5.30")
+    """The daemon reached the target some OTHER way (a human ran `coord
+    release propagate` by hand) while a marker from an earlier run was still
+    pending — leaving it standing would force `--reconcile-only` posture on
+    the queue for nothing, up to its own TTL/deferral ceiling. No systemctl
+    call and no `coord release propagate` subprocess either way (acceptance
+    3 is still "nothing EXTERNAL is touched")."""
+    _stub_verify(monkeypatch, daemon_version="0.5.31")
     systemctl_calls = _stub_systemctl(monkeypatch)
-    drain_calls = _stub_drain(monkeypatch, drained=True, elapsed=2.0)
     prop_calls = _stub_propagate(monkeypatch, status=rp.STATUS_VERIFIED, exit_code=0)
+    dq_cmd.write_roll_pending(_pending(target_version="0.5.31"))
 
     result = CliRunner().invoke(
         main,
@@ -196,149 +229,295 @@ def test_an_idle_fleet_rolls_and_the_timer_ends_up_running(
          "--target", "0.5.31", "--daemon-host", "server"],
     )
     assert result.exit_code == 0, result.output
-    # stop, THEN start — in that order, and start always happens.
-    assert systemctl_calls == [
-        ("coord-drive-queue.timer", "stop"),
-        ("coord-drive-queue.timer", "start"),
-    ]
-    assert len(drain_calls) == 1
-    assert drain_calls[0]["daemon_host"] == "server"
-    assert len(prop_calls) == 1
-    assert prop_calls[0]["daemon_host"] == "server"
-    assert prop_calls[0]["target_version"] == "0.5.31"
-    assert not escalations
-    record = _records(state_dir)[0]
-    assert record["status"] == rw.STATUS_ROLLED
-    assert record["queue_stopped"] is True
-    assert record["drained"] is True
-    assert record["queue_restarted"] is True
-
-
-def test_propagate_reporting_up_to_date_after_a_drain_is_still_a_success(
-    valid_config_path, state_dir, no_network, monkeypatch
-):
-    """A race: the daemon host became current between this run's own check
-    and the drained roll attempt (e.g. a human rolled it by hand mid-drain).
-    Not a defect — `coord release propagate` itself said up-to-date."""
-    _stub_verify(monkeypatch, daemon_version="0.5.30")
-    _stub_systemctl(monkeypatch)
-    _stub_drain(monkeypatch, drained=True)
-    _stub_propagate(monkeypatch, status=rp.STATUS_UP_TO_DATE, exit_code=0)
-
-    result = CliRunner().invoke(
-        main,
-        ["release", "nightly-window", "--config", str(valid_config_path),
-         "--target", "0.5.31", "--daemon-host", "server"],
-    )
-    assert result.exit_code == 0, result.output
+    assert systemctl_calls == []
+    assert prop_calls == []
+    assert dq_cmd.read_roll_pending() is None
     assert _records(state_dir)[0]["status"] == rw.STATUS_UP_TO_DATE
 
 
-# ── acceptance 2: drain deadline hit -> timer restarted, nothing rolled,
-#    reason surfaced ──────────────────────────────────────────────────────
+# ── a needed roll with nothing pending yet: set the marker, return ───────
 
 
-def test_a_blown_drain_deadline_restarts_the_queue_rolls_nothing_and_says_why(
+def test_a_needed_roll_with_no_marker_pending_sets_one_and_returns_immediately(
     valid_config_path, state_dir, no_network, escalations, monkeypatch
 ):
+    """#2587's whole point: no stopped timer, no drain, no synchronous wait —
+    a needed roll with nothing already pending just arms the marker the
+    drive-queue tick watches, and returns."""
     _stub_verify(monkeypatch, daemon_version="0.5.30")
     systemctl_calls = _stub_systemctl(monkeypatch)
-    _stub_drain(monkeypatch, drained=False, elapsed=3600.0,
-               detail="claude-coordinator#2054 still running on server")
     prop_calls = _stub_propagate(monkeypatch, status=rp.STATUS_VERIFIED, exit_code=0)
 
-    result = CliRunner().invoke(
-        main,
-        ["release", "nightly-window", "--config", str(valid_config_path),
-         "--target", "0.5.31", "--daemon-host", "server",
-         "--drain-deadline", "3600"],
-    )
-    assert result.exit_code != 0, result.output
-    # Never rolled: propagate must not even be invoked once the drain gave up.
-    assert prop_calls == []
-    # The timer comes back regardless.
-    assert systemctl_calls == [
-        ("coord-drive-queue.timer", "stop"),
-        ("coord-drive-queue.timer", "start"),
-    ]
-    record = _records(state_dir)[0]
-    assert record["status"] == rw.STATUS_DRAIN_TIMEOUT
-    assert record["queue_restarted"] is True
-    # The reason is asserted on the SURFACED message (#2112's own wording),
-    # not just an internal flag.
-    assert "claude-coordinator#2054" in record["error"]
-    assert "claude-coordinator#2054" in result.output
-    assert len(escalations) == 1
-    assert "claude-coordinator#2054" in escalations[0]["reason"]
-    assert escalations[0]["stage"] == "release-window"
-
-
-# ── acceptance 4: the queue timer is running after the job in EVERY path,
-#    including a crash mid-window ─────────────────────────────────────────
-
-
-def test_stopping_the_queue_failing_still_restarts_it_and_rolls_nothing(
-    valid_config_path, state_dir, no_network, escalations, monkeypatch
-):
-    _stub_verify(monkeypatch, daemon_version="0.5.30")
-    systemctl_calls = _stub_systemctl(monkeypatch, stop_ok=False, start_ok=True)
-    drain_calls = _stub_drain(monkeypatch, drained=True)
-    prop_calls = _stub_propagate(monkeypatch, status=rp.STATUS_VERIFIED, exit_code=0)
+    assert dq_cmd.read_roll_pending() is None
 
     result = CliRunner().invoke(
         main,
         ["release", "nightly-window", "--config", str(valid_config_path),
          "--target", "0.5.31", "--daemon-host", "server"],
     )
-    assert result.exit_code != 0, result.output
-    assert drain_calls == []  # never even tried to drain without a stopped queue
-    assert prop_calls == []
-    assert systemctl_calls == [
-        ("coord-drive-queue.timer", "stop"),
-        ("coord-drive-queue.timer", "start"),
-    ]
-    assert _records(state_dir)[0]["status"] == rw.STATUS_ERROR
+    assert result.exit_code == 0, result.output
+    assert systemctl_calls == []  # never touches any timer
+    assert prop_calls == []  # nothing fired yet — the drive-queue tick does that
+
+    pending = dq_cmd.read_roll_pending()
+    assert pending is not None
+    assert pending.target_version == "0.5.31"
+    assert pending.reason == "nightly-window"
+    assert pending.deferrals == 0
+
+    assert not escalations
+    record = _records(state_dir)[0]
+    assert record["status"] == rw.STATUS_ROLL_PENDING
+    assert record["status"] in rw.OK_STATUSES
+    assert record["queue_stopped"] is None
+    assert record["queue_restarted"] is None
+
+
+def test_a_marker_pending_for_a_different_target_is_replaced(
+    valid_config_path, state_dir, no_network, escalations, monkeypatch
+):
+    """A stale marker (an older release still waiting for its window) must
+    not silently block or shadow the newly resolved target."""
+    _stub_verify(monkeypatch, daemon_version="0.5.30")
+    prop_calls = _stub_propagate(monkeypatch, status=rp.STATUS_VERIFIED, exit_code=0)
+    dq_cmd.write_roll_pending(_pending(target_version="0.5.29", set_at=1000.0))
+
+    result = CliRunner().invoke(
+        main,
+        ["release", "nightly-window", "--config", str(valid_config_path),
+         "--target", "0.5.31", "--daemon-host", "server"],
+    )
+    assert result.exit_code == 0, result.output
+    assert prop_calls == []  # a different, stale target — never attempted a fire
+
+    pending = dq_cmd.read_roll_pending()
+    assert pending is not None
+    assert pending.target_version == "0.5.31"
+    assert pending.set_at > 1000.0
+
+    record = _records(state_dir)[0]
+    assert record["status"] == rw.STATUS_ROLL_PENDING
+    assert not escalations
+
+
+# ── a marker already pending for the SAME target: one best-effort fire ───
+
+
+def test_a_marker_pending_for_the_same_target_is_fired_and_cleared_on_success(
+    valid_config_path, state_dir, no_network, escalations, monkeypatch
+):
+    _stub_verify(monkeypatch, daemon_version="0.5.30")
+    prop_calls = _stub_propagate(monkeypatch, status=rp.STATUS_VERIFIED, exit_code=0)
+    dq_cmd.write_roll_pending(_pending(target_version="0.5.31"))
+
+    result = CliRunner().invoke(
+        main,
+        ["release", "nightly-window", "--config", str(valid_config_path),
+         "--target", "0.5.31", "--daemon-host", "server"],
+    )
+    assert result.exit_code == 0, result.output
+    assert len(prop_calls) == 1
+    assert prop_calls[0]["daemon_host"] == "server"
+    assert prop_calls[0]["target_version"] == "0.5.31"
+    # Never --force from an unattended/semi-attended path (trap 1) — the
+    # seam itself (`_run_propagate`) never accepts one, so its absence here
+    # is structural, not just an unasserted default.
+    assert "force" not in prop_calls[0]
+
+    assert dq_cmd.read_roll_pending() is None  # fired -> cleared
+    record = _records(state_dir)[0]
+    assert record["status"] == rw.STATUS_ROLLED
+    assert not escalations
+
+
+def test_a_marker_pending_for_the_same_target_up_to_date_race_clears_it_too(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """A race: the daemon host became current between this run's own check
+    and the fire attempt (e.g. a human rolled it by hand in the meantime).
+    Not a defect — `coord release propagate` itself said up-to-date, and the
+    marker's job is done either way."""
+    _stub_verify(monkeypatch, daemon_version="0.5.30")
+    _stub_propagate(monkeypatch, status=rp.STATUS_UP_TO_DATE, exit_code=0)
+    dq_cmd.write_roll_pending(_pending(target_version="0.5.31"))
+
+    result = CliRunner().invoke(
+        main,
+        ["release", "nightly-window", "--config", str(valid_config_path),
+         "--target", "0.5.31", "--daemon-host", "server"],
+    )
+    assert result.exit_code == 0, result.output
+    assert dq_cmd.read_roll_pending() is None
+    assert _records(state_dir)[0]["status"] == rw.STATUS_UP_TO_DATE
+
+
+def test_a_marker_pending_for_the_same_target_still_busy_leaves_it_untouched(
+    valid_config_path, state_dir, no_network, escalations, monkeypatch
+):
+    """The fleet is still busy: a completely normal, quiet outcome — the
+    marker survives EXACTLY as it was (this attempt spends none of its own
+    TTL/deferral bound; only the drive-queue tick's per-tick deferrals do)
+    for the tick to keep watching."""
+    _stub_verify(monkeypatch, daemon_version="0.5.30")
+    _stub_propagate(monkeypatch, status=rp.STATUS_DEFERRED, exit_code=0,
+                    output='{"status": "deferred"}')
+    dq_cmd.write_roll_pending(_pending(target_version="0.5.31", deferrals=3))
+
+    result = CliRunner().invoke(
+        main,
+        ["release", "nightly-window", "--config", str(valid_config_path),
+         "--target", "0.5.31", "--daemon-host", "server"],
+    )
+    assert result.exit_code == 0, result.output
+    pending = dq_cmd.read_roll_pending()
+    assert pending is not None
+    assert pending.target_version == "0.5.31"
+    assert pending.deferrals == 3  # untouched by this command
+    assert pending.set_at == 1000.0  # untouched — TTL still measures the ORIGINAL set
+
+    record = _records(state_dir)[0]
+    assert record["status"] == rw.STATUS_ROLL_PENDING
+    assert record["status"] in rw.OK_STATUSES
+    assert not escalations
+
+
+def test_a_marker_pending_for_the_same_target_a_genuine_failure_is_escalated(
+    valid_config_path, state_dir, no_network, escalations, monkeypatch
+):
+    """A real failure, not a mere deferral, IS loud (trap 3) — but the
+    marker survives so the tick keeps trying too, bounded by its own
+    TTL/deferral ceiling rather than given up on after one bad attempt."""
+    _stub_verify(monkeypatch, daemon_version="0.5.30")
+    _stub_propagate(monkeypatch, status=rp.STATUS_ROLLED_BACK, exit_code=2,
+                    output='{"status": "rolled-back"}')
+    dq_cmd.write_roll_pending(_pending(target_version="0.5.31"))
+
+    result = CliRunner().invoke(
+        main,
+        ["release", "nightly-window", "--config", str(valid_config_path),
+         "--target", "0.5.31", "--daemon-host", "server"],
+    )
+    assert result.exit_code == 2, result.output
+    pending = dq_cmd.read_roll_pending()
+    assert pending is not None
+    assert pending.target_version == "0.5.31"
+    record = _records(state_dir)[0]
+    assert record["status"] == rw.STATUS_PROPAGATE_FAILED
     assert len(escalations) == 1
 
 
-def test_a_crash_mid_drain_still_restarts_the_queue(
-    valid_config_path, state_dir, no_network, monkeypatch
+def test_a_propagate_subprocess_that_cannot_even_run_is_reported_not_a_success(
+    valid_config_path, state_dir, no_network, escalations, monkeypatch
 ):
-    """Simulates the job being killed mid-window (#2112 acceptance 4): make
-    the drain step itself blow up instead of returning. A Python `finally`
-    still runs while the stack unwinds through a real exception — this is
-    the in-process half of the guarantee; `--ensure-queue-running` wired as
-    the unit's ExecStopPost= (tested separately below) is the SIGKILL-safe
-    half a `finally` cannot be."""
     _stub_verify(monkeypatch, daemon_version="0.5.30")
-    systemctl_calls = _stub_systemctl(monkeypatch)
+    dq_cmd.write_roll_pending(_pending(target_version="0.5.31"))
 
-    def _boom(**kwargs):
-        raise RuntimeError("simulated kill mid-drain")
-
-    monkeypatch.setattr(release_cmd, "_drain", _boom)
-
+    monkeypatch.setattr(release_cmd, "_run_propagate",
+                        lambda **k: ("error: TimeoutError: propagate subprocess timed out",
+                                    1, "TimeoutError: propagate subprocess timed out", None))
     result = CliRunner().invoke(
         main,
         ["release", "nightly-window", "--config", str(valid_config_path),
          "--target", "0.5.31", "--daemon-host", "server"],
     )
     assert result.exit_code != 0
-    assert isinstance(result.exception, RuntimeError)
-    # The worst outcome this mechanism exists to prevent did NOT happen:
-    # the timer was stopped, and — despite the crash — restarted too.
-    assert systemctl_calls == [
-        ("coord-drive-queue.timer", "stop"),
-        ("coord-drive-queue.timer", "start"),
-    ]
+    assert _records(state_dir)[0]["status"] == rw.STATUS_PROPAGATE_FAILED
+    assert dq_cmd.read_roll_pending() is not None  # survives for the tick to retry
+
+
+# ── no resolvable target / no daemon host: setup failures are loud too ───
+
+
+def test_no_resolvable_target_fails_loudly(
+    valid_config_path, state_dir, no_network, escalations, monkeypatch
+):
+    monkeypatch.setattr(
+        release_cmd, "_resolve_expected", lambda *a, **k: (None, "PyPI unreachable")
+    )
+    result = CliRunner().invoke(
+        main, ["release", "nightly-window", "--config", str(valid_config_path)]
+    )
+    assert result.exit_code == 1
+    assert _records(state_dir)[0]["status"] == rw.STATUS_ERROR
+    assert len(escalations) == 1
+    assert dq_cmd.read_roll_pending() is None
+
+
+def test_an_unidentifiable_daemon_host_refuses_instead_of_guessing(
+    valid_config_path, state_dir, no_network, escalations, monkeypatch
+):
+    monkeypatch.setattr(release_cmd, "_daemon_machine_name", lambda *a, **k: None)
+    _stub_verify(monkeypatch, daemon_version="0.5.30", daemon="server")
+    systemctl_calls = _stub_systemctl(monkeypatch)
+
+    result = CliRunner().invoke(
+        main,
+        ["release", "nightly-window", "--config", str(valid_config_path),
+         "--target", "0.5.31"],
+    )
+    assert result.exit_code == 1, result.output
+    assert systemctl_calls == []  # never touched a timer it couldn't safely resume
+    record = _records(state_dir)[0]
+    assert record["status"] == rw.STATUS_ERROR
+    assert len(escalations) == 1
+    assert dq_cmd.read_roll_pending() is None
+
+
+# ── --dry-run: the plan, without touching anything ────────────────────────
+
+
+def test_a_dry_run_prints_the_plan_and_touches_nothing(
+    valid_config_path, state_dir, no_network, escalations, monkeypatch
+):
+    _stub_verify(monkeypatch, daemon_version="0.5.30")
+    systemctl_calls = _stub_systemctl(monkeypatch)
+    prop_calls = _stub_propagate(monkeypatch, status=rp.STATUS_VERIFIED, exit_code=0)
+
+    result = CliRunner().invoke(
+        main,
+        ["release", "nightly-window", "--config", str(valid_config_path),
+         "--target", "0.5.31", "--daemon-host", "server", "--dry-run"],
+    )
+    assert result.exit_code == 0, result.output
+    assert systemctl_calls == []
+    assert prop_calls == []
+    assert not escalations
+    assert _records(state_dir) == []  # dry-run writes nothing
+    assert dq_cmd.read_roll_pending() is None  # dry-run sets nothing either
+
+
+def test_a_dry_run_with_an_existing_marker_describes_the_fire_attempt(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    _stub_verify(monkeypatch, daemon_version="0.5.30")
+    prop_calls = _stub_propagate(monkeypatch, status=rp.STATUS_VERIFIED, exit_code=0)
+    dq_cmd.write_roll_pending(_pending(target_version="0.5.31"))
+
+    result = CliRunner().invoke(
+        main,
+        ["release", "nightly-window", "--config", str(valid_config_path),
+         "--target", "0.5.31", "--daemon-host", "server", "--dry-run"],
+    )
+    assert result.exit_code == 0, result.output
+    assert prop_calls == []
+    assert "already pending" in result.output
+    pending = dq_cmd.read_roll_pending()
+    assert pending is not None
+    assert pending.target_version == "0.5.31"  # untouched by --dry-run
+
+
+# ── ensure-queue-running: the legacy escape hatch, unchanged by #2587 ────
 
 
 def test_ensure_queue_running_only_starts_the_timer_and_exits(
     valid_config_path, monkeypatch
 ):
-    """The SIGKILL-safe half (ExecStopPost=, deploy/coord-release-window.
-    service): does ONLY `systemctl --user start <timer>`, regardless of
-    anything else — no board read, no version resolution, no daemon lookup."""
+    """The legacy hand-invocation escape hatch: does ONLY `systemctl --user
+    start <timer>`, regardless of anything else — no board read, no version
+    resolution, no daemon lookup. #2587 no longer wires this as
+    `deploy/coord-release-window.service`'s ExecStopPost= (the timer is
+    never stopped in the first place), but the flag itself still works for
+    an operator who stopped it by hand."""
     monkeypatch.setattr(
         release_cmd, "_fetch_board",
         lambda: pytest.fail("--ensure-queue-running must not touch the board"),
@@ -363,161 +542,6 @@ def test_ensure_queue_running_reports_failure_honestly(valid_config_path, monkey
     assert result.exit_code == 1
 
 
-# ── acceptance 5: never report success for a roll that was not confirmed ─
-
-
-def test_propagate_still_deferring_after_a_clean_drain_is_reported_not_hidden(
-    valid_config_path, state_dir, no_network, escalations, monkeypatch
-):
-    """The daemon host drained clean, but `coord release propagate` itself
-    still deferred (e.g. some OTHER host is busy, unattributable to the
-    daemon). This must not be reported as a roll."""
-    _stub_verify(monkeypatch, daemon_version="0.5.30")
-    _stub_systemctl(monkeypatch)
-    _stub_drain(monkeypatch, drained=True)
-    _stub_propagate(monkeypatch, status=rp.STATUS_DEFERRED, exit_code=0,
-                    output='{"status": "deferred"}')
-
-    result = CliRunner().invoke(
-        main,
-        ["release", "nightly-window", "--config", str(valid_config_path),
-         "--target", "0.5.31", "--daemon-host", "server"],
-    )
-    assert result.exit_code != 0, result.output
-    record = _records(state_dir)[0]
-    assert record["status"] == rw.STATUS_PROPAGATE_DEFERRED
-    assert record["status"] not in rw.OK_STATUSES
-    assert len(escalations) == 1
-
-
-def test_propagate_failing_is_reported_with_its_own_exit_code(
-    valid_config_path, state_dir, no_network, escalations, monkeypatch
-):
-    _stub_verify(monkeypatch, daemon_version="0.5.30")
-    _stub_systemctl(monkeypatch)
-    _stub_drain(monkeypatch, drained=True)
-    _stub_propagate(monkeypatch, status=rp.STATUS_ROLLED_BACK, exit_code=2,
-                    output='{"status": "rolled-back"}')
-
-    result = CliRunner().invoke(
-        main,
-        ["release", "nightly-window", "--config", str(valid_config_path),
-         "--target", "0.5.31", "--daemon-host", "server"],
-    )
-    assert result.exit_code == 2, result.output
-    record = _records(state_dir)[0]
-    assert record["status"] == rw.STATUS_PROPAGATE_FAILED
-    assert len(escalations) == 1
-
-
-def test_a_propagate_subprocess_that_cannot_even_run_is_reported_not_a_success(
-    valid_config_path, state_dir, no_network, escalations, monkeypatch
-):
-    _stub_verify(monkeypatch, daemon_version="0.5.30")
-    _stub_systemctl(monkeypatch)
-    _stub_drain(monkeypatch, drained=True)
-
-    def _boom(**kwargs):
-        raise TimeoutError("propagate subprocess timed out")
-
-    monkeypatch.setattr(release_cmd, "_run_propagate",
-                        lambda **k: ("error: TimeoutError: propagate subprocess timed out",
-                                    1, "TimeoutError: propagate subprocess timed out", None))
-    result = CliRunner().invoke(
-        main,
-        ["release", "nightly-window", "--config", str(valid_config_path),
-         "--target", "0.5.31", "--daemon-host", "server"],
-    )
-    assert result.exit_code != 0
-    assert _records(state_dir)[0]["status"] == rw.STATUS_PROPAGATE_FAILED
-
-
-# ── no resolvable target / no daemon host: setup failures are loud too ───
-
-
-def test_no_resolvable_target_fails_loudly(
-    valid_config_path, state_dir, no_network, escalations, monkeypatch
-):
-    monkeypatch.setattr(
-        release_cmd, "_resolve_expected", lambda *a, **k: (None, "PyPI unreachable")
-    )
-    result = CliRunner().invoke(
-        main, ["release", "nightly-window", "--config", str(valid_config_path)]
-    )
-    assert result.exit_code == 1
-    assert _records(state_dir)[0]["status"] == rw.STATUS_ERROR
-    assert len(escalations) == 1
-
-
-def test_an_unidentifiable_daemon_host_refuses_instead_of_guessing(
-    valid_config_path, state_dir, no_network, escalations, monkeypatch
-):
-    monkeypatch.setattr(release_cmd, "_daemon_machine_name", lambda *a, **k: None)
-    _stub_verify(monkeypatch, daemon_version="0.5.30", daemon="server")
-    systemctl_calls = _stub_systemctl(monkeypatch)
-
-    result = CliRunner().invoke(
-        main,
-        ["release", "nightly-window", "--config", str(valid_config_path),
-         "--target", "0.5.31"],
-    )
-    assert result.exit_code == 1, result.output
-    assert systemctl_calls == []  # never stopped a queue it couldn't safely resume
-    record = _records(state_dir)[0]
-    assert record["status"] == rw.STATUS_ERROR
-    assert len(escalations) == 1
-
-
-# ── --dry-run: the plan, without touching a host ──────────────────────────
-
-
-def test_a_dry_run_prints_the_plan_and_touches_nothing(
-    valid_config_path, state_dir, no_network, escalations, monkeypatch
-):
-    _stub_verify(monkeypatch, daemon_version="0.5.30")
-    systemctl_calls = _stub_systemctl(monkeypatch)
-    drain_calls = _stub_drain(monkeypatch, drained=True)
-    prop_calls = _stub_propagate(monkeypatch, status=rp.STATUS_VERIFIED, exit_code=0)
-
-    result = CliRunner().invoke(
-        main,
-        ["release", "nightly-window", "--config", str(valid_config_path),
-         "--target", "0.5.31", "--daemon-host", "server", "--dry-run"],
-    )
-    assert result.exit_code == 0, result.output
-    assert systemctl_calls == []
-    assert drain_calls == []
-    assert prop_calls == []
-    assert not escalations
-    assert _records(state_dir) == []  # dry-run writes nothing
-
-
-# ── the queue restart failing is itself escalated ─────────────────────────
-
-
-def test_a_failed_queue_restart_after_a_successful_roll_is_still_escalated(
-    valid_config_path, state_dir, no_network, escalations, monkeypatch
-):
-    """The worst outcome this mechanism exists to prevent: even a CLEAN roll
-    must not go quiet if the timer fails to come back."""
-    _stub_verify(monkeypatch, daemon_version="0.5.30")
-    _stub_systemctl(monkeypatch, stop_ok=True, start_ok=False)
-    _stub_drain(monkeypatch, drained=True)
-    _stub_propagate(monkeypatch, status=rp.STATUS_VERIFIED, exit_code=0)
-
-    result = CliRunner().invoke(
-        main,
-        ["release", "nightly-window", "--config", str(valid_config_path),
-         "--target", "0.5.31", "--daemon-host", "server"],
-    )
-    assert result.exit_code == 0, result.output  # the ROLL itself succeeded
-    record = _records(state_dir)[0]
-    assert record["status"] == rw.STATUS_ROLLED
-    assert record["queue_restarted"] is False
-    assert len(escalations) == 1
-    assert "restart FAILED" in escalations[0]["reason"]
-
-
 # ── window-history ─────────────────────────────────────────────────────
 
 
@@ -525,9 +549,6 @@ def test_window_history_reads_back_what_was_journalled(
     valid_config_path, state_dir, no_network, monkeypatch
 ):
     _stub_verify(monkeypatch, daemon_version="0.5.30")
-    _stub_systemctl(monkeypatch)
-    _stub_drain(monkeypatch, drained=True)
-    _stub_propagate(monkeypatch, status=rp.STATUS_VERIFIED, exit_code=0)
     CliRunner().invoke(
         main,
         ["release", "nightly-window", "--config", str(valid_config_path),
@@ -536,7 +557,7 @@ def test_window_history_reads_back_what_was_journalled(
 
     result = CliRunner().invoke(main, ["release", "window-history"])
     assert result.exit_code == 0, result.output
-    assert rw.STATUS_ROLLED in result.output
+    assert rw.STATUS_ROLL_PENDING in result.output
     assert "v0.5.31" in result.output
 
 
@@ -546,7 +567,9 @@ def test_window_history_on_an_empty_journal_says_so(state_dir):
     assert "no nightly-window attempts" in result.output
 
 
-# ── _drain itself: the bounded loop, with an injected clock ──────────────
+# ── _drain itself: retired from this command's default path (#2587), but
+#    still a callable, directly-tested helper (the bounded loop, with an
+#    injected clock) — kept as a manual escape hatch. ─────────────────────
 
 
 def test_drain_stops_as_soon_as_the_daemon_host_is_free():
@@ -620,12 +643,10 @@ def test_drain_treats_an_unreadable_board_as_fleet_wide_busy():
 
 
 def test_drain_is_blocked_by_a_paused_daemon_host(valid_config_path, monkeypatch):
-    """#2174: `_drain`'s default `extra_busy_fetch` — the one the real
-    `coord release nightly-window` call site uses (it passes `config=`) —
-    must also see `coord pause`/quiet-hours state, not just tmux. A paused
-    daemon host must never read as 'drained' just because the board and
-    tmux are both quiet; before the fix nothing here ever consulted the
-    pause store at all."""
+    """#2174: `_drain`'s default `extra_busy_fetch` must also see `coord
+    pause`/quiet-hours state, not just tmux. A paused daemon host must never
+    read as 'drained' just because the board and tmux are both quiet; before
+    the fix nothing here ever consulted the pause store at all."""
     from coord import machine_pause as mp
     from coord.config import load as load_config
 
@@ -652,13 +673,12 @@ def test_drain_is_blocked_by_a_paused_daemon_host(valid_config_path, monkeypatch
 # ── #2187: a VERIFIED, exit-0 propagate must never be reported as
 #    `propagate-failed` — the whole bug this issue is about ─────────────────
 #
-# The tests above all stub `_run_propagate` wholesale via `_stub_propagate`,
-# which bypasses the exact code that was broken: parsing what a REAL
-# `coord release propagate --json` subprocess prints. These exercise
-# `_parse_trailing_json`, `_latest_propagate_record_since` and
+# These exercise `_parse_trailing_json`, `_latest_propagate_record_since` and
 # `_run_propagate` itself directly, then drive the full CLI command with a
 # faked subprocess boundary (not `_run_propagate` itself) so the fix is
-# proven end to end, the same way the real bug reached production.
+# proven end to end, the same way the real bug reached production. Unaffected
+# by #2587 — `_run_propagate`'s own interpretation is reused verbatim by the
+# marker-fire path (see the tests above).
 
 
 def test_parse_trailing_json_reads_a_pretty_printed_indent2_payload():
@@ -833,10 +853,11 @@ def test_window_end_to_end_a_verified_roll_is_never_reported_as_failed(
 ):
     """#2187 acceptance arm 1: a propagate that exits 0 and records
     `verified` produces a clean window-history entry and a clean exit —
-    through the REAL `_run_propagate`, not a stub of it."""
+    through the REAL `_run_propagate`, not a stub of it. Exercised via the
+    #2587 "marker already pending for this target" fire path — the only
+    path that ever calls `_run_propagate` at all."""
     _stub_verify(monkeypatch, daemon_version="0.5.49")
-    _stub_systemctl(monkeypatch)
-    _stub_drain(monkeypatch, drained=True)
+    dq_cmd.write_roll_pending(_pending(target_version="0.5.50"))
     _fake_propagate_subprocess(monkeypatch, state_dir, status=rp.STATUS_VERIFIED,
                                exit_code=0, target_version="0.5.50")
 
@@ -857,6 +878,7 @@ def test_window_end_to_end_a_verified_roll_is_never_reported_as_failed(
     assert record["propagate_started_at"] > 0
     assert not record["error"]
     assert not escalations
+    assert dq_cmd.read_roll_pending() is None
 
 
 def test_window_end_to_end_a_genuine_failure_is_still_reported_failed(
@@ -866,8 +888,7 @@ def test_window_end_to_end_a_genuine_failure_is_still_reported_failed(
     produces `propagate-failed` and a non-zero exit — the fix must not turn
     every outcome green."""
     _stub_verify(monkeypatch, daemon_version="0.5.49")
-    _stub_systemctl(monkeypatch)
-    _stub_drain(monkeypatch, drained=True)
+    dq_cmd.write_roll_pending(_pending(target_version="0.5.50"))
     _fake_propagate_subprocess(monkeypatch, state_dir, status=rp.STATUS_FAILED,
                                exit_code=1, target_version="0.5.50")
 
@@ -882,6 +903,7 @@ def test_window_end_to_end_a_genuine_failure_is_still_reported_failed(
     assert record["status"] not in rw.OK_STATUSES
     assert record["propagate_status"] == rp.STATUS_FAILED
     assert len(escalations) == 1
+    assert dq_cmd.read_roll_pending() is not None  # survives for the tick to retry
 
 
 def test_window_end_to_end_an_unconfirmable_exit_0_names_the_missing_evidence(
@@ -893,8 +915,7 @@ def test_window_end_to_end_an_unconfirmable_exit_0_names_the_missing_evidence(
     import subprocess as _subprocess
 
     _stub_verify(monkeypatch, daemon_version="0.5.49")
-    _stub_systemctl(monkeypatch)
-    _stub_drain(monkeypatch, drained=True)
+    dq_cmd.write_roll_pending(_pending(target_version="0.5.50"))
 
     def _fake_run(argv, **kwargs):
         return _subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
@@ -937,8 +958,7 @@ def test_window_end_to_end_an_advisory_only_gate_is_still_a_success(
         "0.5.49 — outside propagation's reach, fix by hand"
     )
     _stub_verify(monkeypatch, daemon_version="0.5.49")
-    _stub_systemctl(monkeypatch)
-    _stub_drain(monkeypatch, drained=True)
+    dq_cmd.write_roll_pending(_pending(target_version="0.5.50"))
     _fake_propagate_subprocess(monkeypatch, state_dir, status=rp.STATUS_VERIFIED,
                                exit_code=0, target_version="0.5.50", stderr=advisory_line)
 
@@ -974,8 +994,7 @@ def test_window_never_prints_a_zero_exit_code_next_to_a_failure_assertion(
     import subprocess as _subprocess
 
     _stub_verify(monkeypatch, daemon_version="0.5.49")
-    _stub_systemctl(monkeypatch)
-    _stub_drain(monkeypatch, drained=True)
+    dq_cmd.write_roll_pending(_pending(target_version="0.5.50"))
 
     def _fake_run(argv, **kwargs):
         return _subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
@@ -994,7 +1013,7 @@ def test_window_never_prints_a_zero_exit_code_next_to_a_failure_assertion(
     # The only sanctioned way for "exit 0" and a failed status to appear
     # together: naming the exact missing evidence, never asserting the roll
     # itself didn't happen.
-    assert "exited 0, but its outcome could not be confirmed" in error
+    assert "outcome could not be confirmed" in error
     assert "did not verify a roll" not in error
     for line in (result.output or "").splitlines():
         if "exit 0" in line or "exit=0" in line:

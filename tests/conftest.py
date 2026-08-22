@@ -422,6 +422,27 @@ def _no_real_notifier_state(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_roll_pending_store(monkeypatch, tmp_path):
+    """#2587: never let a test write the OPERATOR'S real
+    ``~/.coord/roll_pending.json``.
+
+    Same hazard as ``_no_real_pause_store`` (#2101) and
+    ``_no_real_notifier_state`` (#1632), one file over — this one gates
+    whether the daemon host's drive-queue tick launches anything at all, so a
+    leaked test write would either wedge a real fleet's queue (a marker that
+    was never supposed to exist) or mask one (clearing/overwriting a real
+    pending roll).
+    ``coord.commands.drive_queue.roll_pending_path`` reads
+    ``$COORD_ROLL_PENDING_STATE`` first for exactly this redirect — the same
+    env-var seam ``_no_real_notifier_state`` uses, not a monkeypatched
+    private function.
+    """
+    monkeypatch.setenv(
+        "COORD_ROLL_PENDING_STATE", str(tmp_path / "roll-pending-state.json")
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_dispatch_target_validation(monkeypatch):
     """#2087: default the dispatch-target gate (`record_dispatched` /
     `record_dispatched_assignment` refusing an assignment whose repo/machine

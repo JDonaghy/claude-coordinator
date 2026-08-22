@@ -3991,6 +3991,44 @@ def _run_drain_locked(config: Config) -> DrainResult:
     )
 
 
+def _roll_pending_blocks_new_dispatch(*, now: float | None = None) -> bool:
+    """#2587: is a fleet roll pending right now, in a way that should stop
+    `run()` from dispatching any NEW leg this pass?
+
+    Reads the SAME marker `coord.commands.drive_queue.drive_queue_tick`
+    watches (`coord.commands.drive_queue.read_roll_pending`) — one marker,
+    one meaning, read by both callers, per this codebase's "quiescence is
+    the drive queue's, not a second opinion" rule
+    (`coord/release_propagate.py`'s module docstring states the same
+    principle for `assess_quiescence`).
+
+    Deliberately READ-ONLY: an EXPIRED marker (`RollPending.expired`) still
+    reads as blocking here rather than being cleared on the spot. Only the
+    drive-queue tick clears a marker (loudly, via its own escalation) —
+    letting `coord notify` also mutate it would be two independent processes
+    racing to own the same piece of state, exactly the #1440 "two
+    overseers" hazard this codebase's design notes warn against elsewhere.
+    The tick's own cadence (`coord-drive-queue.timer`, ~3 minutes in
+    production) bounds how long a truly-expired marker can keep blocking
+    dispatch here before the tick catches up and clears it — nowhere near
+    the unbounded 2026-08-22 incident this issue exists to end.
+
+    Fail-soft on a read that cannot make sense of the marker file — see
+    `coord.commands.drive_queue.read_roll_pending`'s own docstring; the same
+    "an unreadable/corrupt marker reads as no marker" posture applies here,
+    so `coord notify` degrades to ITS pre-#2587 behaviour rather than a
+    corrupt file silently blocking every future notify pass.
+    """
+    import time as _time  # noqa: PLC0415
+
+    from coord.commands.drive_queue import read_roll_pending  # noqa: PLC0415
+
+    pending = read_roll_pending()
+    if pending is None:
+        return False
+    return not pending.expired(_time.time() if now is None else now)
+
+
 def run(
     config: Config,
 ) -> tuple[
@@ -4034,6 +4072,20 @@ def run(
     from coord.confirm_test import begin_confirmation_pass  # noqa: PLC0415
 
     begin_confirmation_pass()
+
+    # #2587: while a fleet roll is pending (`coord release propagate`/
+    # `nightly-window` armed the marker, waiting for the drive-queue tick's
+    # next inter-drive gap), this pass must dispatch no NEW legs — smoke,
+    # review, an auto-loop fix/re-review, or a stalled-pipeline action. This
+    # is the exact gap the 2026-08-22 incident hit: a review for #2540 and a
+    # work dispatch for #2541 both landed within the drain's first minute,
+    # because nothing had ever told `coord notify` a drain was in progress.
+    # Detecting/posting completion, stuck, needs-attention, and liveness
+    # signals below is UNAFFECTED — those advance legs already in flight and
+    # are exactly what lets the queue keep draining toward the gap the tick
+    # is waiting for; see `_roll_pending_blocks_new_dispatch`'s docstring for
+    # why this reads the marker but never writes it.
+    _roll_pending = _roll_pending_blocks_new_dispatch()
 
     # #522: one terminal-state cache shared across every gh-hitting check in
     # this notify run (the auto-loop review/fix dispatches below, and the
@@ -4124,16 +4176,21 @@ def run(
     # bearing here: dispatch_pending_reviews already holds review dispatch
     # until test_state is passed/skipped regardless of which runs first in
     # a given pass.
-    try:
-        _dispatch_board_pending_smoke(config)
-    except Exception:  # noqa: BLE001
-        pass
+    #
+    # #2587: both this and the review dispatch just below are NEW-leg
+    # dispatch — skipped while `_roll_pending` is true, same posture the
+    # drive-queue tick takes under a pending roll.
+    if not _roll_pending:
+        try:
+            _dispatch_board_pending_smoke(config)
+        except Exception:  # noqa: BLE001
+            pass
 
-    # Dispatch pending reviews from the saved board (best-effort, non-fatal).
-    try:
-        _dispatch_board_pending_reviews(config)
-    except Exception:  # noqa: BLE001
-        pass
+        # Dispatch pending reviews from the saved board (best-effort, non-fatal).
+        try:
+            _dispatch_board_pending_reviews(config)
+        except Exception:  # noqa: BLE001
+            pass
 
     # Post findings for done-review assignments that were never processed
     # (e.g. agent reported 'cancelled', user manually marked done, or notify
@@ -4146,7 +4203,10 @@ def run(
     # Auto-loop: for each completed review, optionally dispatch a fix worker.
     # Runs after notify posts the completion comment so GitHub has the full
     # review body before any fix briefing references "previous findings".
-    if review_completions:
+    # #2587: a fix worker is a NEW leg — skipped while `_roll_pending` is
+    # true. The review completion itself was still posted above (unaffected
+    # — that's advancing an existing leg, not starting one).
+    if review_completions and not _roll_pending:
         try:
             from coord.auto_loop import run_for_review_transition  # noqa: PLC0415
             for transition, record, entry in review_completions:
@@ -4172,7 +4232,9 @@ def run(
     # the review → fix → re-review cycle closes without manual coord pr invocations.
     # Runs after review_completions so a simultaneous review + fix completion
     # in the same notify run is handled review-first.
-    if fix_completions:
+    # #2587: a fresh review is a NEW leg — skipped while `_roll_pending` is
+    # true, same reasoning as the review-completion block above.
+    if fix_completions and not _roll_pending:
         try:
             from coord.auto_loop import run_for_fix_transition  # noqa: PLC0415
             for transition, _record in fix_completions:
@@ -4204,11 +4266,19 @@ def run(
     # Best-effort, non-fatal — mirrors the #846 needs-attention block above;
     # the crucial difference from `reconcile()`-only sweepers (see
     # docs/OPERATING_GOTCHAS.md §7) is that this runs from `coord notify`.
+    # #2587: `_sweep_stalled_pipeline` can itself dispatch (a fresh
+    # review/fix/conflict-fix — `config.pipeline.auto_dispatch_stalled`),
+    # not just report, so the whole sweep is skipped while `_roll_pending`
+    # is true rather than threading the flag through its own dispatch
+    # decision. The cost is one pass of stalled-pipeline diagnostics not
+    # posted; bounded by the marker's own TTL (`RollPending.expired`), same
+    # as every other #2587 deferral.
     stalled_posted: list[StalledDetection] = []
-    try:
-        stalled_posted = _sweep_stalled_pipeline(config, terminal_cache=terminal_cache)
-    except Exception:  # noqa: BLE001
-        log.exception("detect_stalled_pipeline: unexpected error")
+    if not _roll_pending:
+        try:
+            stalled_posted = _sweep_stalled_pipeline(config, terminal_cache=terminal_cache)
+        except Exception:  # noqa: BLE001
+            log.exception("detect_stalled_pipeline: unexpected error")
 
     # #2048: cheap per-turn liveness auditor. Best-effort, non-fatal —
     # mirrors the #846 needs-attention block above. Entirely a no-op
