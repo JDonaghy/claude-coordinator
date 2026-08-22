@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from coord.agent import _slugify
-from coord.config import AcceptanceConfig, AcceptanceDriverConfig, Config
+from coord.config import AcceptanceConfig, AcceptanceDriverConfig, Config, ModelsConfig
 from coord.dispatch import DispatchRefused
 from coord.milestone_dispatch import MilestoneContext, MilestoneDispatchError
 from coord.milestone_order import WorkOrder, WorkOrderNode
@@ -48,6 +48,7 @@ def _config(
     repo_name: str = "coord-tui",
     driver: AcceptanceDriverConfig | None = None,
     worker_permissions: WorkerPermissionsConfig | None = None,
+    models: ModelsConfig | None = None,
 ) -> Config:
     repo = Repo(
         name=repo_name,
@@ -55,7 +56,10 @@ def _config(
         worker_permissions=worker_permissions,
     )
     acceptance = AcceptanceConfig(drivers={repo_name: driver} if driver else {})
-    return Config(repos=[repo], machines=machines, acceptance=acceptance)
+    return Config(
+        repos=[repo], machines=machines, acceptance=acceptance,
+        models=models or ModelsConfig(),
+    )
 
 
 WORK_ORDER = WorkOrder(nodes=(WorkOrderNode(101), WorkOrderNode(102)))
@@ -406,6 +410,12 @@ class TestDispatchTestAuthor:
             assert cmd in payload["deny_commands"]
         record_mock.assert_called_once()
 
+        # #2549: the headless dispatch must send a non-empty "model" (it
+        # used to send none at all, so the agent's `claude -p` silently fell
+        # back to the CLI's own default — Opus — instead of
+        # `config.models.default`) and record it on the Assignment row.
+        assert payload["model"] == "sonnet"
+
         # #1171: milestone mode keeps the single shared-branch behavior —
         # no target_branch override, and the recorded Assignment.branch is
         # the tracking-issue-keyed derivation (mirrors AgentServer's
@@ -414,6 +424,34 @@ class TestDispatchTestAuthor:
         assert "target_branch" not in payload
         recorded = record_mock.call_args.kwargs["assignment"]
         assert recorded.branch == "issue-947-test-author-ms-25-acceptance-suite"
+        assert recorded.model == "sonnet"
+
+    def test_model_honors_configured_default_not_cli_fallback(self) -> None:
+        """#2549 regression: `dispatch_test_author` was the only dispatcher
+        that never sent "model" on the wire — omitting it entirely instead
+        of falling back to CLI default made every headless test-author
+        slice silently run on Opus regardless of `models.default`. Assert
+        the payload tracks a NON-default `models.default` (not just that it
+        happens to match the field's own default value of "sonnet"), so a
+        future dispatcher copy-pasted from this one can't reintroduce the
+        omission and still pass by coincidence."""
+        cfg = _config(
+            [_machine("laptop", ["coord-tui"])], driver=self._driver(),
+            models=ModelsConfig(default="opus"),
+        )
+        fake_client = MagicMock()
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"id": "model-1"}
+        fake_client.post.return_value = fake_resp
+
+        with patch("coord.test_author.fetch_milestone_context", return_value=self._ctx()), \
+             patch("coord.state.record_dispatched_assignment") as record_mock:
+            dispatch_test_author("coord-tui", 947, cfg, http_client=fake_client)
+
+        payload = fake_client.post.call_args.kwargs["json"]
+        assert payload["model"] == "opus"
+        recorded = record_mock.call_args.kwargs["assignment"]
+        assert recorded.model == "opus"
 
     def test_happy_path_jit_mode_fetches_issue(self) -> None:
         cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
