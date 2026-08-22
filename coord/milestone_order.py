@@ -111,6 +111,7 @@ __all__ = [
     "remove_sub_issues_section",
     "milestone_work_order_membership",
     "validate_milestone_membership",
+    "validate_no_shared_oracle_group",
     "FrontierEntry",
     "BlockedNode",
     "Frontier",
@@ -568,6 +569,66 @@ def validate_milestone_membership(
             raise WorkOrderError(
                 f"work order: #{n.issue_number} is not an issue under this "
                 "milestone"
+            )
+
+
+def validate_no_shared_oracle_group(
+    work_order: WorkOrder,
+    *,
+    oracle_loop: bool,
+) -> None:
+    """Refuse two `## Work order` nodes sharing a `{group: ...}` cohort when
+    the milestone is under oracle-loop control (#2542).
+
+    A ``group`` annotation declares its members safe to dispatch — and
+    therefore author their JIT acceptance slices (``coord acceptance
+    author``, docs/ORACLE_LOOP.md) — CONCURRENTLY. Every slice for one
+    milestone additively appends to the SAME file,
+    ``tests/acceptance/ms-N/manifest.yml`` (``coord.test_author``'s "later
+    slices MERGE into this file" convention), so two issues in the same
+    group race on that write regardless of whether their actual feature
+    work overlaps at all — the coupling is mechanical, not semantic, and
+    so invisible to ``coord.overlap_predict`` (#2247), which only reasons
+    about declared/real *diffs*. coord-portal#122 hit exactly this: #128
+    and #132 shared ``{group: A}`` because they looked feature-independent
+    (a schema change vs. a status override) and both authored slices into
+    ms-N's manifest at once.
+
+    ``oracle_loop`` is the caller's already-resolved
+    ``config.acceptance.has_driver(repo_name)`` — this stays a pure
+    function, no config/GitHub reach-out of its own. A no-op when
+    ``oracle_loop`` is False (repos outside the oracle loop keep declaring
+    parallel groups exactly as before this check existed) or when no group
+    holds more than one node.
+
+    This is deliberately only the cheap, early check for the EXPLICIT-group
+    case — ``coord milestone write-order`` validates it before a word order
+    is ever written. It cannot catch two issues that share no declared
+    group but still end up concurrently eligible via the drive-queue's
+    per-repo concurrency cap (coord-portal#122's SECOND collision, #130 vs.
+    #132, filed as this issue's correction) — that hazard is closed
+    separately, by serializing the whole milestone's drive-queue ``after=``
+    chain (:func:`coord.milestone_dispatch.plan_queue`'s ``oracle_loop=``
+    parameter). Neither check alone is sufficient; see #2542.
+    """
+    if not oracle_loop:
+        return
+    by_group: dict[str, list[int]] = {}
+    for n in work_order.nodes:
+        if n.group:
+            by_group.setdefault(n.group, []).append(n.issue_number)
+    for group, numbers in by_group.items():
+        if len(numbers) > 1:
+            joined = ", ".join(f"#{i}" for i in numbers)
+            raise WorkOrderError(
+                f"work order: {joined} share group {group!r}, but this "
+                "milestone is under oracle-loop control (Gate A contract / "
+                "JIT test-author slices apply) — every issue's slice "
+                "additively appends to the SAME "
+                "tests/acceptance/ms-N/manifest.yml, so authoring them "
+                "concurrently races on that file regardless of whether the "
+                "issues' actual feature work overlaps (#2542). Sequence "
+                "them with `after:` instead of sharing a `group`."
             )
 
 

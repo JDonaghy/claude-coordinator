@@ -48,6 +48,7 @@ from coord.milestone_order import (
     replace_sub_issues_section,
     replace_work_order_section,
     validate_milestone_membership,
+    validate_no_shared_oracle_group,
 )
 
 
@@ -1088,7 +1089,15 @@ def milestone_dispatch_cmd(
     # issue as its pre-reqs land; that also makes `register_milestone_drain`
     # redundant here (the queue IS the durable drain, and registering would
     # have the daemon's direct-dispatch drain racing it).
-    queue_plan = plan_queue(ctx.work_order, ctx.terminal_issues, repo_entry.name)
+    # #2542: under oracle-loop control (Gate A already checked above), chain
+    # the whole milestone's drive-queue entries so the tick can never launch
+    # two of them at once — see plan_queue's own docstring for why.
+    queue_plan = plan_queue(
+        ctx.work_order,
+        ctx.terminal_issues,
+        repo_entry.name,
+        oracle_loop=cfg.acceptance.has_driver(repo_entry.name),
+    )
 
     if not queue_plan:
         click.echo("Nothing to queue — every work-order node is already closed.")
@@ -1444,6 +1453,22 @@ def milestone_write_order_cmd(
 
     try:
         validate_milestone_membership(work_order, milestone_issue_numbers)
+    except WorkOrderError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(1)
+
+    # #2542: refuse a proposed work order that puts two issues in the same
+    # `{group: ...}` cohort when this milestone is under oracle-loop control
+    # — every group member's JIT acceptance slice would additively append to
+    # the SAME tests/acceptance/ms-N/manifest.yml, a manifest race that
+    # exists regardless of whether the issues' actual feature work overlaps
+    # (coord-portal#122). Cheap/early check for the explicit-group case only
+    # — see validate_no_shared_oracle_group's docstring for what it can't
+    # catch.
+    try:
+        validate_no_shared_oracle_group(
+            work_order, oracle_loop=cfg.acceptance.has_driver(repo_entry.name)
+        )
     except WorkOrderError as e:
         click.echo(f"error: {e}", err=True)
         sys.exit(1)
