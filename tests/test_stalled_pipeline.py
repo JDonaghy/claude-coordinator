@@ -1485,6 +1485,61 @@ class TestMergeConflictSealedConfinement:
         assert action.kind == "conflict_fix_dispatched"
         conflict_fix_stub.assert_called_once()
 
+    def test_dispatches_sealed_conflict_fix_when_branch_also_authored_a_spec_file(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """#2555 review fix: the REALISTIC shape for a test-author/mock-author
+        slice is that its own branch diff contains its `manifest.yml` edit
+        PLUS the new spec/test file it authored alongside it (`#132`'s
+        conflict was exactly `manifest.yml` plus one new spec file) — the
+        three-dot compare (`get_compare_files`) reports the WHOLE branch
+        diff, not just what's actually in git-merge conflict, so this
+        mixed-but-still-sealed list is the common case, not an edge case.
+        Requiring every file in that superset to be a manifest.yml
+        (the pre-fix `sealed_conflict_is_manifest_only` gate) rejected this
+        shape outright and fell to `skipped_sealed_conflict`, defeating the
+        whole point of #2555 for exactly the scenario it was filed for.
+        Gating on "a manifest.yml appears somewhere in the list" instead
+        must dispatch here, trusting the sealed-aware worker's own runtime
+        restriction to do the precise per-file filtering."""
+        config.pipeline.auto_dispatch_stalled = True
+        config = self._sealed_config(config)
+        board = _board(
+            _mock_author_work("ma-work-1c", test_state="passed"),
+            _review("ma-work-1c", aid="ma-review-1c", review_verdict="approve"),
+        )
+        queued = [QueuedMerge(
+            assignment_id="ma-work-1c", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="ms-65-gate-a", target_branch="main", issue_number=602,
+            issue_title="t", state=CONFLICT, error="could not be rebased onto main",
+        )]
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )[0]
+        assert detection.reason == "merge_conflict_unresolved"
+        assert work.type == "mock-author"
+
+        fix_assignment = Assignment(
+            machine_name="mac-mini", repo_name="vimcode", issue_number=602,
+            issue_title="[sealed-conflict-fix] t", assignment_id="cf-sealed-1c",
+            status="pending", type="conflict-fix",
+        )
+        conflict_fix_stub = MagicMock(return_value=fix_assignment)
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", conflict_fix_stub)
+        monkeypatch.setattr("coord.merge_queue.load_queue", lambda: queued)
+        monkeypatch.setattr(
+            "coord.github_ops.get_compare_files",
+            lambda repo, base, head: [
+                "tests/acceptance/ms-4/manifest.yml",
+                "tests/acceptance/ms-4/new_spec.rs",
+            ],
+        )
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "conflict_fix_dispatched"
+        conflict_fix_stub.assert_called_once()
+
     def test_skips_dispatch_when_conflict_touches_sealed_path_outside_manifest(
         self, config: Config, monkeypatch
     ) -> None:
