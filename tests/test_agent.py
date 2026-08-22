@@ -3938,6 +3938,99 @@ def test_reap_review_type_gets_no_stash_diagnostic(tmp_path: Path) -> None:
     server.shutdown()
 
 
+def _init_repo_with_remote(path: Path) -> Path:
+    """Like `_init_repo`, but with a real (local, bare) `origin` configured
+    and `main` already pushed.
+
+    #2552's post-cleanup recheck (`AgentServer._pushed_commits_ahead`)
+    deliberately reads the REMOTE-tracking ref (`origin/<branch>`), not the
+    local branch — a rescue commit that never reached origin must not flip
+    status. `_init_repo` (no remote) can't exercise that path at all, since
+    `origin/<branch>` never exists there.
+    """
+    remote = path.parent / f"{path.name}-remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "main", str(remote)],
+        check=True, capture_output=True,
+    )
+    _init_repo(path)
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(remote)],
+        cwd=str(path), check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "push", "-u", "origin", "main"],
+        cwd=str(path), check=True, capture_output=True,
+    )
+    return path
+
+
+def test_reap_status_reflects_post_rescue_branch_state(tmp_path: Path) -> None:
+    """#2552: a rescued WIP commit that reaches origin must correct the
+    pre-cleanup zero-commit verdict instead of leaving it standing.
+
+    Reported bug: `_reap` measures "0 commits ahead of main" (true at that
+    instant, since the worker left a tracked-file edit uncommitted) and sets
+    ADVISORY with `zero_commit_reason` — BEFORE `_cleanup_worktree` runs.
+    Cleanup then rescues the dirty worktree into a `WIP [coord-rescue]`
+    commit and pushes it (`_rescue_uncommitted_work`), landing a real commit
+    on the very branch the ADVISORY verdict was judged empty one step
+    earlier. Nothing ever revisited the verdict, so a successful #1394
+    rescue was always scored as "nothing was authored".
+
+    Drives the real `_reap` path end to end (`assign()`/`wait_for()`,
+    exactly like the neighboring stash-diagnostic tests above) rather than
+    re-implementing the ordering inline, so a regression in the actual
+    `_reap`/`_cleanup_worktree` sequence is what this test would catch.
+    """
+    repo = _init_repo_with_remote(tmp_path / "repo")
+    server = _server(
+        tmp_path,
+        argv=["/bin/sh", "-c", "echo dirty >> README; exit 0"],
+        repo_path=repo,
+    )
+
+    a = server.assign(_spec(repo))
+    final = server.wait_for(a.id, timeout=15)
+
+    assert final.status == DONE
+    assert final.dirty_worktree_reason is not None
+    assert "coord-rescue" in final.dirty_worktree_reason
+    assert "UNVERIFIED" in final.dirty_worktree_reason
+    server.shutdown()
+
+
+def test_reap_stays_advisory_when_rescue_commit_never_reaches_origin(
+    tmp_path: Path,
+) -> None:
+    """#2552 control: a rescue commit that stays LOCAL ONLY must NOT flip
+    status to done.
+
+    Same dirty-worktree shape as the test above, but the repo has no
+    `origin` at all — the WIP-rescue push has nothing to push to, so the
+    commit only ever exists on this one agent. Test/Review/Merge all operate
+    against GitHub; a branch nobody but this agent can see is not "ready for
+    the pipeline", so the post-cleanup recheck must leave the pre-existing
+    ADVISORY verdict alone (the `dirty_worktree_reason` still records that
+    real work exists — see `_record_dirty_worktree` — just not that it is
+    live anywhere the pipeline can consume it).
+    """
+    repo = _init_repo(tmp_path / "repo")  # no `origin` remote configured
+    server = _server(
+        tmp_path,
+        argv=["/bin/sh", "-c", "echo dirty >> README; exit 0"],
+        repo_path=repo,
+    )
+
+    a = server.assign(_spec(repo))
+    final = server.wait_for(a.id, timeout=15)
+
+    assert final.status == ADVISORY
+    assert final.dirty_worktree_reason is not None
+    assert "coord-rescue" in final.dirty_worktree_reason
+    server.shutdown()
+
+
 def test_sanitize_branch_replaces_slashes(tmp_path: Path) -> None:
     """_sanitize_branch should replace slashes with dashes."""
     from coord.agent import _sanitize_branch

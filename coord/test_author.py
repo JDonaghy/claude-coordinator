@@ -579,6 +579,36 @@ def dispatch_test_author(
                 "work, open a fresh branch by hand — do not retry as-is."
             )
 
+    # #2552: a retried JIT dispatch re-derives this SAME branch for the same
+    # (tracking_issue, issue_number) pair, and `_setup_worktree` already
+    # resumes from `origin/<branch>` at the git level whenever it exists —
+    # the #389/#460 continuation-branch logic checks out the remote tip
+    # instead of branching fresh. So a retried worker's worktree is NOT
+    # empty when the branch already carries real commits (e.g. a #1394
+    # WIP-rescue commit left behind by a killed prior attempt) — but the
+    # briefing built above reads identically whether the branch is fresh or
+    # already has content, so nothing told the worker to check what's
+    # already there before writing more, and a worker that doesn't think to
+    # `git log` first can end up re-authoring over its own prior output.
+    # `branch_commits_ahead` asks GitHub directly (no local checkout
+    # required — the coordinator dispatching this may not have one); `None`
+    # (lookup failed) is left silent rather than asserted either way, same
+    # fail-quiet posture as every other best-effort GitHub read in this
+    # function.
+    _resume_ahead = github_ops.branch_commits_ahead(
+        repo_cfg.github, repo_cfg.default_branch or "main", branch
+    )
+    if _resume_ahead:
+        briefing += (
+            "\n\n---\nRESUMING: this branch already has "
+            f"{_resume_ahead} commit(s) on it ahead of "
+            f"{repo_cfg.default_branch or 'main'} — likely unfinished or "
+            "unverified work from an interrupted prior session (possibly a "
+            "coordinator WIP-rescue commit — see #1394). Run `git log` and "
+            "read what's already there FIRST. Continue/complete/verify it "
+            "rather than re-authoring from scratch (#2552)."
+        )
+
     deny_commands = test_author_deny_commands(config, repo_name)
 
     # #2549: this was the only dispatcher on the fleet that never sent

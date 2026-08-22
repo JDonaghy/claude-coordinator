@@ -77,6 +77,20 @@ def _pr_not_merged(monkeypatch):
     monkeypatch.setattr("coord.test_author.github_ops.pr_is_merged", lambda *a, **k: False)
 
 
+@pytest.fixture(autouse=True)
+def _no_resume_ahead(monkeypatch):
+    """#2552: default the resume-detection GitHub read (does the target
+    branch already carry commits from a prior/interrupted attempt?) to "0
+    commits ahead" so the existing happy-path tests below — which don't
+    care about this check — don't shell out to a real ``gh`` subprocess via
+    ``coord.github_ops.branch_commits_ahead``. Tests exercising the resume
+    note itself re-patch it to opt in, same convention as ``_pr_not_merged``
+    above."""
+    monkeypatch.setattr(
+        "coord.test_author.github_ops.branch_commits_ahead", lambda *a, **k: 0
+    )
+
+
 # ── pick_test_author_machine ────────────────────────────────────────────────
 
 
@@ -675,6 +689,60 @@ class TestDispatchTestAuthor:
         assert assignment_id == "abc123"
         fake_client.post.assert_called_once()
         record_mock.assert_called_once()
+
+    def test_branch_with_prior_commits_gets_resume_note_in_briefing(self) -> None:
+        """#2552: a retry/continuation dispatch for a slice branch that
+        already carries commits (e.g. a #1394 WIP-rescue commit left by a
+        killed prior attempt) must tell the worker to look before writing —
+        `_setup_worktree` already resumes the worktree from that branch at
+        the git level, but nothing said so in the briefing text itself."""
+        cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
+        fake_client = MagicMock()
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"id": "abc123"}
+        fake_client.post.return_value = fake_resp
+
+        with patch("coord.test_author.fetch_milestone_context", return_value=self._ctx()), \
+             patch(
+                 "coord.test_author.github_ops.get_issue",
+                 return_value={"title": "Add foo", "body": "Body text"},
+             ), \
+             patch(
+                 "coord.test_author.github_ops.branch_commits_ahead", return_value=3,
+             ) as ahead_mock, \
+             patch("coord.state.record_dispatched_assignment"):
+            dispatch_test_author(
+                "coord-tui", 947, cfg, issue_number=101, http_client=fake_client,
+            )
+
+        payload = fake_client.post.call_args.kwargs["json"]
+        assert "RESUMING" in payload["briefing"]
+        assert "3 commit(s)" in payload["briefing"]
+        assert "#1394" in payload["briefing"]
+        target_branch = payload["target_branch"]
+        ahead_mock.assert_called_once_with("acme/coord-tui", "main", target_branch)
+
+    def test_fresh_branch_gets_no_resume_note_in_briefing(self) -> None:
+        """The common case (a genuinely fresh slice branch, 0 commits ahead)
+        must NOT get the resume note — it would be actively misleading."""
+        cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
+        fake_client = MagicMock()
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"id": "abc123"}
+        fake_client.post.return_value = fake_resp
+
+        with patch("coord.test_author.fetch_milestone_context", return_value=self._ctx()), \
+             patch(
+                 "coord.test_author.github_ops.get_issue",
+                 return_value={"title": "Add foo", "body": "Body text"},
+             ), \
+             patch("coord.state.record_dispatched_assignment"):
+            dispatch_test_author(
+                "coord-tui", 947, cfg, issue_number=101, http_client=fake_client,
+            )
+
+        payload = fake_client.post.call_args.kwargs["json"]
+        assert "RESUMING" not in payload["briefing"]
 
     def test_repo_deny_commands_merged(self) -> None:
         cfg = _config(

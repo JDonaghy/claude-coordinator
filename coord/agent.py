@@ -1076,6 +1076,37 @@ def _commits_ahead(wt_path: Path, base: str) -> int | None:
     return None
 
 
+def _pushed_commits_ahead(repo_path: Path, base: str, branch: str) -> int | None:
+    """Commits ``origin/<branch>`` is ahead of *base*, checked from *repo_path*.
+
+    #2552: used by ``_reap``'s post-cleanup recheck, run AFTER
+    ``_cleanup_worktree`` has possibly already torn the worktree down — so,
+    unlike :func:`_commits_ahead`, this never touches the (possibly gone)
+    worktree directory. It reads from *repo_path* instead, which stays valid
+    for the whole reap: branch refs (including ``refs/remotes/origin/*``)
+    live in the shared ``.git`` directory, not per-worktree.
+
+    Deliberately compares against the REMOTE-tracking ref ``origin/<branch>``
+    rather than the local branch ref. A commit that only exists locally on
+    this one agent (the push in ``_rescue_uncommitted_work`` can fail, same
+    as any push) isn't yet something Test/Review/Merge — which all operate
+    against GitHub — can act on, so it must not flip a status that implies
+    "ready for the pipeline". Returns ``None`` when the remote ref can't be
+    resolved at all (no ``origin`` configured, or the push never landed) —
+    callers should treat that exactly like :func:`_commits_ahead`'s ``None``:
+    unknown, don't act on it.
+    """
+    for base_ref in (f"origin/{base}", base):
+        try:
+            raw = _git(
+                repo_path, "rev-list", "--count", f"{base_ref}..origin/{branch}"
+            )
+            return int(raw.strip())
+        except (_GitError, ValueError):
+            continue
+    return None
+
+
 _ISSUE_REF_RE = re.compile(r"#(\d+)")
 
 
@@ -8902,6 +8933,52 @@ class AgentServer:
         # Clean up worktree AFTER updating status
         if assignment is not None:
             self._cleanup_worktree(assignment)
+
+        # #2552: `_cleanup_worktree` above may have just rescued a dirty
+        # worktree into a WIP commit and pushed it (`_rescue_uncommitted_
+        # work`) — AFTER the "0 commits ahead" status decision earlier in
+        # this method already ran. That decision (ADVISORY's `zero_commit_
+        # reason`, or REFUSED_POLICY's `policy_refusal_reason`) was computed
+        # from a branch that was genuinely empty at the moment of judgement;
+        # a rescue that landed a real, pushed commit on it makes the verdict
+        # stale by construction — reporting "nothing was authored" about a
+        # branch that, four log lines later, carries the worker's actual
+        # output. Recompute from `repo_path` (not the worktree, which may
+        # already be gone) whether the rescue's push actually reached
+        # origin, and correct the status when it did. Only ADVISORY/
+        # REFUSED_POLICY are ever reachable here (both are set exclusively
+        # in the `_ahead == 0` branch above, itself gated on `spec.type in
+        # _ZERO_COMMIT_TYPES`) — DONE, FAILED-for-other-reasons, CANCELLED
+        # etc. are untouched.
+        if (
+            assignment is not None
+            and assignment.status in (ADVISORY, REFUSED_POLICY)
+            and assignment.dirty_worktree_reason is not None
+        ):
+            _rescue_branch = assignment.branch or assignment.spec.target_branch
+            if _rescue_branch:
+                _rescue_repo_path = Path(assignment.spec.repo_path).expanduser()
+                _rescue_base = assignment.spec.branch or "main"
+                _post_ahead = _pushed_commits_ahead(
+                    _rescue_repo_path, _rescue_base, _rescue_branch
+                )
+                if _post_ahead is not None and _post_ahead > 0:
+                    _prior_status = assignment.status
+                    with self._lock:
+                        _live = self._assignments.get(assignment_id)
+                        if _live is not None and _live.status == _prior_status:
+                            _live.status = DONE
+                        if assignment is not _live:
+                            assignment.status = DONE
+                    self._persist()
+                    self._log_line(
+                        assignment,
+                        "# reap: post-cleanup recheck — "
+                        f"{_post_ahead} commit(s) pushed to origin/"
+                        f"{_rescue_branch} ahead of {_rescue_base} after "
+                        f"rescue (was {_prior_status!r}); status corrected "
+                        "to done (#2552)",
+                    )
 
     def _prune_completed_history(self) -> None:
         """Drop oldest terminal assignments over _COMPLETED_HISTORY_CAP (#452).
