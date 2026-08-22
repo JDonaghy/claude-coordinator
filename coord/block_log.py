@@ -35,6 +35,28 @@ cause later agreed with how the episode actually resolved
 one that abstains, which is why ``unknown`` is counted separately from
 ``disagreed`` and never folded into it.
 
+**#2540 fills the column that neither Phase counts: operator effort that never
+touched the queue's own command surface.**  ``human_acted`` was, until #2540,
+true only for the narrow set of releases the queue itself can attribute to a
+person — an operator's ``remove``, a Gate-A sign-off.  Real recovery routinely
+happens elsewhere entirely: a manual git rebase and force-with-lease push, a
+direct ``coord test``/``coord merge --only``/``coord pr``/``coord fix``
+against the assignment underneath an entry, a ``systemctl``/``coord agent
+update``/``coord diagnose --reset`` on the machine running it.  None of that
+is visible to a tick, so none of it was ever counted — a night of real manual
+recovery could read as ``0 needed a human``, which is the exact failure this
+module exists to prevent, just relocated one layer down.  This module cannot
+detect that kind of intervention after the fact (recording must not probe live
+state — see above), so :func:`intervention_event` gives an operator a place to
+say so, in real time or shortly after: ``coord drive-queue log-intervention``
+appends a record that :func:`episodes` folds onto whichever episode was open
+for that key, or — if it had already resolved by the time the operator got to
+logging it — the most recently closed one.  It flips ``human_acted`` to
+``True`` the same as an ``operator_resolution_event`` does, and is kept
+separately visible (``intervention_categories``) so the report can still say
+*how* it knows, rather than asserting a single flat "a human acted" with no
+paper trail behind it.
+
 **Recording must never change a decision.**  Every public entry point here is
 best-effort and swallows its own exceptions (:func:`record`), for the same
 reason :mod:`coord.audit` does: the tick's merge/dispatch/attempt accounting
@@ -95,7 +117,9 @@ __all__ = [
     "BY_DESIGN_CAUSES",
     "EVENT_DIAGNOSIS",
     "EVENT_ENTER",
+    "EVENT_INTERVENTION",
     "EVENT_RESOLVE",
+    "INTERVENTION_CATEGORIES",
     "OUTCOME_BUCKETS",
     "RESCUE_SOURCES",
     "STALL_STATES",
@@ -107,6 +131,7 @@ __all__ = [
     "episode_bucket",
     "episode_category",
     "episodes",
+    "intervention_event",
     "is_by_design",
     "log_location",
     "merge_only_event",
@@ -133,6 +158,11 @@ EVENT_RESOLVE = "resolve"
 #: no read-modify-write race, and a later diagnosis that contradicts an earlier
 #: one stays visible instead of overwriting it.
 EVENT_DIAGNOSIS = "diagnosis"
+#: #2540.  An operator saying, out of band, "I acted on this key" — the
+#: durable record for intervention that never touches the drive-queue command
+#: surface (`remove`/`resume`) and so was invisible to `human_acted` before
+#: this. See `intervention_event` and the module docstring's #2540 section.
+EVENT_INTERVENTION = "intervention"
 
 # Rotate at 4 MiB — comfortably more than two weeks at this fleet's rate
 # (single-digit stalls a night, ~400 bytes a record), and small enough that
@@ -615,6 +645,71 @@ def operator_resolution_event(
     return record
 
 
+#: Documented common buckets for `coord drive-queue log-intervention
+#: --category`.  Deliberately NOT a closed enum enforced anywhere — same
+#: reasoning as `episode_category`'s open vocabulary: a kind of intervention
+#: this build has never named must still be recordable as itself, not
+#: coerced into "other" and lost.  This tuple exists purely so the CLI help
+#: text and this module agree on the suggested starting set from #2540's own
+#: evidence (a manual git rebase/conflict-resolution/force-push, a direct
+#: `coord test`/`coord merge --only`/`coord pr`/`coord fix` against the
+#: assignment, and infra-level recovery like `systemctl`/`coord agent
+#: update`/`coord diagnose --reset`).
+INTERVENTION_CATEGORIES: tuple[str, ...] = (
+    "git-recovery",
+    "cli-recheck",
+    "infra",
+    "other",
+)
+
+
+def intervention_event(
+    *,
+    key: str,
+    category: str,
+    note: str = "",
+    host: str = "",
+    now: float | None = None,
+) -> dict[str, Any]:
+    """A #2540 record: a human acted on *key* outside the queue's own commands.
+
+    The other half of #2235's metric that :func:`operator_resolution_event`
+    cannot reach.  That function fires only from inside a command
+    (``remove``) that IS the resolution — a board mutation this process just
+    performed.  A manual git rebase, a direct ``coord test``/``coord merge
+    --only``/``coord pr``/``coord fix``, or a ``systemctl``/``coord agent
+    update`` on the host underneath an entry are real operator effort that
+    touches none of this process's own write paths, so nothing here can see
+    them happen.  What it CAN do is give the operator a place to say so —
+    this is that place, called from ``coord drive-queue log-intervention``.
+
+    Deliberately not a ``resolve``: unlike an operator's ``remove``, logging
+    an intervention does not by itself mean the stall is over — the entry may
+    still be blocked, may have already resolved by the time the operator gets
+    around to typing the command, or may resolve later still by an ordinary
+    auto mechanism.  :func:`episodes` folds this onto whichever episode was
+    open for *key* at the time, or, failing that, the most recently closed
+    one — never inventing an episode, and never guessing at *why* the entry
+    was stalled, the same restraint :func:`operator_resolution_event` already
+    keeps.
+
+    *category* is free text, not validated against
+    :data:`INTERVENTION_CATEGORIES` — the same "open vocabulary, never
+    coerced" contract :func:`episode_category` documents. An empty string
+    normalises to ``"other"`` so the report always has something to show
+    rather than a blank category column.
+    """
+    return {
+        "event": EVENT_INTERVENTION,
+        "ts": time.time() if now is None else now,
+        "key": key,
+        "category": str(category or "other"),
+        "note": note,
+        "host": host,
+        "source": "operator",
+    }
+
+
 # ── #2276 Phase 1: the diagnosis record, and scoring it ──────────────────────
 
 
@@ -806,6 +901,60 @@ def read_events(
 # ── reading (pairing + summary) ──────────────────────────────────────────────
 
 
+def _fold_intervention(
+    open_by_key: dict[str, dict[str, Any]],
+    out: list[dict[str, Any]],
+    key: str,
+    event: Mapping[str, Any],
+) -> None:
+    """Attach one #2540 ``intervention`` record to the episode it happened
+    during — mutating the episode dict in place, exactly like the
+    ``EVENT_DIAGNOSIS`` branch of :func:`episodes` does for ``true_cause``.
+
+    Preferred target is the OPEN episode for *key* — the common case, an
+    operator logging what they are doing while the entry is still stalled.
+    Failing that, the most recently CLOSED episode for *key* in *out*:
+    ``coord drive-queue log-intervention`` very often runs minutes AFTER the
+    fix already landed (the operator ran ``coord merge --only``, it worked,
+    then they typed the log line), and by then :func:`episodes` has already
+    popped that episode out of ``open_by_key``.  Searched from the end of
+    ``out`` because that list is built in the same time order *events* is
+    iterated in, so the last match for *key* is the most recent past episode
+    — never an older one a later re-block would make ambiguous.
+
+    A *key* with no episode at all yet (logged before this host ever recorded
+    a stall for it) is dropped, the same convention an orphan ``resolve`` or
+    ``diagnosis`` already follows: there is nothing here to attach evidence
+    to, and it is better to say so (`coord drive-queue log-intervention`
+    warns) than to silently fabricate one.
+    """
+    episode = open_by_key.get(key)
+    if episode is None:
+        for candidate in reversed(out):
+            if candidate.get("key") == key:
+                episode = candidate
+                break
+    if episode is None:
+        return
+    category = str(event.get("category") or "other")
+    episode.setdefault("interventions", []).append(
+        {
+            "ts": float(event.get("ts") or 0.0),
+            "category": category,
+            "note": str(event.get("note") or ""),
+            "host": str(event.get("host") or ""),
+        }
+    )
+    categories = episode.setdefault("intervention_categories", [])
+    if category not in categories:
+        categories.append(category)
+    # The whole point: this is the signal `human_acted` was blind to before
+    # #2540. Set unconditionally, whether the episode is still open (the
+    # eventual `resolve` branch above ORs it back in rather than clobbering
+    # it) or already closed (there is no later write to clobber it).
+    episode["human_acted"] = True
+
+
 def episodes(events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Pair ``enter`` records with the ``resolve`` that closed them.
 
@@ -828,6 +977,16 @@ def episodes(events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     resolution's own account of what happened and the derived one is kept
     beside it as ``diagnosed_cause``, so ``agreement`` scores two independent
     claims rather than one claim against itself.
+
+    An ``intervention`` (#2540) folds onto an episode the same way — see
+    :func:`_fold_intervention` — except it targets a CLOSED episode too, not
+    only an open one: unlike a diagnosis, an operator very often logs an
+    intervention after the fact, once the fix they made by hand has already
+    let the entry auto-resolve. It sets ``human_acted`` true and appends to
+    ``intervention_categories``/``interventions`` without touching
+    ``true_cause`` — what mechanically flipped the state is still whatever
+    the resolution said; #2540 only means the record also captures that a
+    human was in the loop, in a way the pre-#2540 log could not see at all.
     """
     open_by_key: dict[str, dict[str, Any]] = {}
     out: list[dict[str, Any]] = []
@@ -866,7 +1025,13 @@ def episodes(events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
                 "diagnosis_evidence": [],
                 "diagnosis_contradicts_stated": False,
                 "agreement": "",
+                # #2540.  Populated only by `intervention_event` records
+                # folded on below — a fresh episode has neither.
+                "interventions": [],
+                "intervention_categories": [],
             }
+        elif kind == EVENT_INTERVENTION:
+            _fold_intervention(open_by_key, out, key, event)
         elif kind == EVENT_DIAGNOSIS:
             episode = open_by_key.get(key)
             if episode is None:
@@ -897,7 +1062,14 @@ def episodes(events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
                     "resolved": True,
                     "resolution": event.get("resolution", ""),
                     "true_cause": resolution_cause,
-                    "human_acted": bool(event.get("human_acted")),
+                    # #2540: OR in whatever an earlier `intervention_event`
+                    # already set. Without the `or`, an ordinary auto
+                    # resolution's own `human_acted=False` would blindly
+                    # overwrite the `True` a logged intervention just
+                    # earned — exactly the undercount this issue is about,
+                    # relocated one line down instead of fixed.
+                    "human_acted": bool(event.get("human_acted"))
+                    or bool(episode.get("human_acted")),
                     "resolved_at": resolved_at,
                     "stalled_seconds": max(0.0, resolved_at - episode["entered_at"]),
                     "source": event.get("source", ""),
@@ -937,11 +1109,27 @@ def summarize(items: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     counts the episodes where the live evidence positively ruled the queue's
     stated reason out — the five-of-seven number, finally measured instead of
     reconstructed by hand.
+
+    ``human_acted_logged`` (#2540) is the subset of ``human_acted`` this build
+    can actually SHOW ITS WORK for: episodes carrying at least one
+    ``coord drive-queue log-intervention`` record.  The rest of ``human_acted``
+    still comes from the pre-#2540 queue-command surface (an operator's
+    ``remove``, a Gate-A sign-off) — real, but with no evidence trail beyond
+    "the resolve record said so".  Neither of those two is a claim that
+    *nothing else* happened: a night with ``human_acted_logged == 0`` means
+    no intervention was LOGGED, not that none occurred — this module still
+    cannot see a git rebase or a direct ``coord test`` call that nobody typed
+    the one extra command for.  That is the honest limit of what an
+    append-only log fed only by this process's own choke points can claim,
+    and it is why the CLI help for ``log-intervention`` asks operators to run
+    it as a matter of habit rather than treating the count as automatically
+    complete.
     """
     by_state: dict[str, int] = {}
     by_cause: dict[str, int] = {}
     seen_pairs: dict[tuple[str, str], int] = {}
     human = 0
+    human_logged = 0
     auto = 0
     still_open = 0
     diagnosed = 0
@@ -961,6 +1149,8 @@ def summarize(items: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             still_open += 1
         elif item.get("human_acted"):
             human += 1
+            if item.get("intervention_categories"):
+                human_logged += 1
         else:
             auto += 1
         cause = episode_category(item)
@@ -986,6 +1176,7 @@ def summarize(items: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "by_state": by_state,
         "by_cause": by_cause,
         "human_acted": human,
+        "human_acted_logged": human_logged,
         "auto_released": auto,
         "open": still_open,
         "repeat_causes": repeats,

@@ -38,7 +38,7 @@ from typing import Any, Mapping
 
 import click
 
-from coord.block_log import STALL_STATES
+from coord.block_log import INTERVENTION_CATEGORIES, STALL_STATES
 from coord.commands._common import _CONFIG_OPTION
 from coord.drive_state import WORK_LIKE
 from coord.drive_queue import (
@@ -852,6 +852,79 @@ def _record_operator_release(row: Mapping[str, Any] | None, *, resolution: str) 
     )
 
 
+# ── log-intervention (#2540) ─────────────────────────────────────────────────
+
+
+@drive_queue_group.command("log-intervention")
+@click.argument("repo")
+@click.argument("issue", type=int)
+@click.option(
+    "--category",
+    default="other",
+    show_default=True,
+    help=(
+        "What kind of intervention this was. Free text, not a closed set — "
+        "the documented starting buckets are: "
+        + ", ".join(INTERVENTION_CATEGORIES)
+        + "."
+    ),
+)
+@click.option(
+    "--note",
+    default="",
+    help="Optional free-text detail — what you actually did.",
+)
+@_CONFIG_OPTION
+def drive_queue_log_intervention(
+    repo: str, issue: int, category: str, note: str, config_path: Path
+) -> None:
+    """Record that a human acted on REPO ISSUE, outside the queue's own commands (#2540).
+
+    `human_acted` in `coord drive-queue block-log` only ever recognised
+    `remove`/`resume` and a Gate-A sign-off — the drive-queue command surface.
+    Real recovery routinely happens elsewhere entirely: a manual git rebase /
+    conflict resolution / `git push --force-with-lease`, a direct `coord
+    test`/`coord merge --only`/`coord pr`/`coord fix` against the assignment
+    underneath this entry, a `systemctl`/`coord agent update`/`coord diagnose
+    --reset` on the machine running it. None of that touches this process's
+    own write paths, so none of it was ever counted — a night of real manual
+    recovery could read as `0 needed a human`.
+
+    This command does not try to detect that after the fact (block-log
+    recording never probes live state — see `coord/block_log.py`). It gives
+    you a place to say so. Run it once per intervention, whenever you do one
+    — during the recovery or shortly after, either is fine — and `block-log`
+    folds it onto whichever episode was open for this key at the time, or, if
+    it had already resolved by the time you got to logging it, the most
+    recently closed one. It never guesses at *why* the entry was stalled or
+    what specifically you fixed — `--note` is where that goes, verbatim.
+
+    A REPO ISSUE this host has never recorded a stall for has nothing to
+    attach this to — the record is still written (append-only, never lost),
+    but this warns rather than pretending it landed somewhere.
+    """
+    from coord.block_log import episodes, intervention_event, read_events  # noqa: PLC0415
+
+    key = entry_key(repo, issue)
+    _record_block_log(
+        [
+            intervention_event(
+                key=key, category=category, note=note, host=_local_host_id()
+            )
+        ]
+    )
+    matches = [ep for ep in episodes(read_events()) if ep.get("key") == key]
+    if not matches:
+        click.echo(
+            f"logged, but {key} has no recorded stall on this host's block "
+            "log yet — it will not attach to an episode until one exists "
+            "(see `coord drive-queue block-log`)",
+            err=True,
+        )
+        return
+    click.echo(f"logged a {category!r} intervention against {key}")
+
+
 # ── remove / move ────────────────────────────────────────────────────────────
 
 
@@ -999,8 +1072,15 @@ def _episode_line(item: Mapping[str, Any]) -> str:
     stated = " ".join(str(item.get("stated_reason") or "(none)").split())
     if len(stated) > 90:
         stated = stated[:87] + "..."
+    # #2540: whatever `coord drive-queue log-intervention` has recorded
+    # against this episode, open or resolved — rendered the same way in
+    # both branches below so an operator sees it whether the entry is still
+    # stalled (they logged it live) or already closed (they logged it after).
+    intervened = ", ".join(str(c) for c in (item.get("intervention_categories") or []))
     if not item.get("resolved"):
         line = f"{key:<28} {state:<8} STILL STALLED  stated: {stated}"
+        if intervened:
+            line += f"\n{'':<28} {'':<8}               intervened: {intervened}"
         # #2276 Phase 1.  An open episode used to have nothing in the `cause`
         # column at all — `summarize` bucketed it as `(unresolved)`. When the
         # diagnostician has been round, it does, and the CONTRADICTS marker is
@@ -1024,10 +1104,16 @@ def _episode_line(item: Mapping[str, Any]) -> str:
     held = item.get("stalled_seconds")
     age = _age_str(float(held)) if held is not None else "?"
     cause = " ".join(str(item.get("true_cause") or "").split())
-    return (
+    line = (
         f"{key:<28} {state:<8} {mark} {age:>6}  stated: {stated}\n"
         f"{'':<28} {'':<8}              cause:  {cause}"
     )
+    if intervened:
+        # `cause` is still the auto mechanism's own account of what flipped
+        # the state (#2540 never rewrites it) — this line is the separate,
+        # explicit claim that a human was ALSO in the loop.
+        line += f"\n{'':<28} {'':<8}              logged: {intervened}"
+    return line
 
 
 @drive_queue_group.command("block-log")
@@ -1068,6 +1154,14 @@ def drive_queue_block_log(output_json: bool, days: float, config_path: Path) -> 
     everything stalled forever shows up as `open` climbing, not as success.
     `repeats` is the tripwire — the same repo stalling on the same stated
     reason twice is a bug report, not a rescue.
+
+    `human_acted` folds in both how it always could tell (an operator's
+    `remove`, a Gate-A sign-off) and #2540's `coord drive-queue
+    log-intervention` records — the ones logged are called out separately in
+    the summary line, because that count is the only one with an actual paper
+    trail behind it (see `human_acted_logged` / `_episode_line`'s `logged:`
+    row). It is still not a ceiling: an intervention nobody ran
+    `log-intervention` for is invisible to this command by construction.
     """
     from coord.block_log import block_log_path, episodes, read_events, summarize  # noqa: PLC0415
 
@@ -1098,9 +1192,15 @@ def drive_queue_block_log(output_json: bool, days: float, config_path: Path) -> 
     for item in items:
         click.echo(_episode_line(item))
     click.echo("")
+    # #2540: call out how many of `human_acted` are backed by an actual
+    # `log-intervention` record, but only when there is one to show — the
+    # base sentence stays exactly what it always was otherwise, so a fleet
+    # that has never run the new command reads no different than before.
+    logged = stats.get("human_acted_logged") or 0
+    human_note = f" ({logged} logged)" if logged else ""
     click.echo(
         f"{stats['episodes']} stall(s) in {days:g}d — "
-        f"{stats['human_acted']} needed a human · "
+        f"{stats['human_acted']} needed a human{human_note} · "
         f"{stats['auto_released']} released themselves · "
         f"{stats['open']} still stalled"
     )

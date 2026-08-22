@@ -37,6 +37,8 @@ from coord.drive_queue import (
     PARK_STALE_SECONDS,
     QUEUE_ALERT_ISSUE,
     QUEUE_ALERT_REPO,
+    STATE_BLOCKED,
+    QueueEntry,
 )
 
 REPO = "claude-coordinator"
@@ -211,7 +213,7 @@ def test_drive_queue_is_registered_with_every_verb():
     assert "drive-queue" in main.commands
     assert set(main.commands["drive-queue"].commands) == {
         "add", "list", "remove", "move", "status", "tick", "resume",
-        "overlap-report", "block-log", "diagnose",
+        "overlap-report", "block-log", "diagnose", "log-intervention",
     }
 
 
@@ -3429,6 +3431,135 @@ def test_block_log_on_an_empty_log_says_so_rather_than_printing_nothing(
     result = cli("block-log")
     assert result.exit_code == 0, result.output
     assert "no stalls recorded" in result.output
+
+
+# ── #2540: `log-intervention` — the human-acted count's blind spot ──────────
+#
+# #2235's `human_acted` only ever recognised the drive-queue command surface
+# itself (`remove`, a Gate-A sign-off). Real recovery routinely happens
+# outside it entirely — a manual git rebase, a direct `coord test`/`coord
+# merge --only`/`coord pr`/`coord fix`, a `systemctl`/`coord agent update` —
+# none of which this process ever sees. These tests drive the explicit,
+# lightweight logging command #2540 added for exactly that gap, through the
+# real CLI end to end.
+
+
+def _seed_enter(repo: str, issue: int, *, reason: str) -> None:
+    """Write a bare #2235 `enter` record directly — the tick's own write path
+    this suite otherwise exercises through a full `tick` run, skipped here
+    because these tests are about `log-intervention`'s folding logic, not
+    about how an entry comes to be blocked in the first place."""
+    from coord import block_log as bl
+
+    bl.record(
+        [
+            bl.enter_event(
+                QueueEntry(repo=repo, issue=issue, state=STATE_BLOCKED),
+                state=STATE_BLOCKED,
+                reason=reason,
+            )
+        ]
+    )
+
+
+def test_log_intervention_warns_when_the_key_has_no_recorded_stall(cli, block_log):
+    result = cli("log-intervention", REPO, "1762", "--category", "git-recovery")
+    assert result.exit_code == 0, result.output
+    assert "no recorded stall" in result.output
+    # Still written — append-only, never silently dropped — just unattached.
+    records = block_log_records(block_log)
+    assert [r["event"] for r in records] == ["intervention"]
+    assert records[0]["category"] == "git-recovery"
+
+
+def test_log_intervention_flips_a_still_open_episode_to_human_acted(
+    cli, block_log
+):
+    _seed_enter(REPO, 1762, reason="stale test verdict")
+
+    result = cli(
+        "log-intervention", REPO, "1762",
+        "--category", "cli-recheck", "--note", "ran coord merge --only by hand",
+    )
+    assert result.exit_code == 0, result.output
+    assert "cli-recheck" in result.output
+
+    payload = json.loads(cli("block-log", "--json").output)
+    (episode,) = payload["episodes"]
+    assert episode["resolved"] is False
+    assert episode["human_acted"] is True
+    assert episode["intervention_categories"] == ["cli-recheck"]
+
+    rendered = cli("block-log").output
+    assert "STILL STALLED" in rendered
+    assert "intervened: cli-recheck" in rendered
+
+
+def test_log_intervention_survives_the_episode_auto_resolving_afterward(
+    cli, block_log
+):
+    """The #2540 repro: an operator's manual fix lets the entry auto-release
+    (a `2230`-style gate re-clear, say) — the mechanism the resolve record
+    names must not blank out the human's own contribution."""
+    from coord import block_log as bl
+
+    _seed_enter(REPO, 1762, reason="checks_failed")
+    cli(
+        "log-intervention", REPO, "1762",
+        "--category", "git-recovery", "--note", "resolved conflict, force-pushed",
+    )
+    bl.record(
+        [
+            bl.merge_only_fallback_event(
+                QueueEntry(repo=REPO, issue=1762, state=STATE_BLOCKED),
+                reason="(#2230) gate cleared",
+            )
+        ]
+    )
+
+    payload = json.loads(cli("block-log", "--json").output)
+    (episode,) = payload["episodes"]
+    assert episode["resolved"] is True
+    assert episode["human_acted"] is True
+    assert episode["intervention_categories"] == ["git-recovery"]
+    # The mechanism's own account is untouched — #2540 adds a claim, it does
+    # not overwrite the one the auto resolution already made.
+    assert episode["true_cause"].startswith("gate-cleared-after-giveup")
+
+    stats = payload["summary"]
+    assert stats["human_acted"] == 1
+    assert stats["human_acted_logged"] == 1
+
+    rendered = cli("block-log").output
+    assert "HUMAN" in rendered
+    assert "logged: git-recovery" in rendered
+
+
+def test_log_intervention_attaches_to_the_most_recent_episode_when_already_closed(
+    cli, block_log
+):
+    """Logged minutes after the fix already landed — the common real-world
+    order from #2540's own repro (fix by hand, THEN type the log line)."""
+    from coord import block_log as bl
+
+    _seed_enter(REPO, 1762, reason="checks_failed")
+    bl.record(
+        [
+            bl.merge_only_fallback_event(
+                QueueEntry(repo=REPO, issue=1762, state=STATE_BLOCKED),
+                reason="(#2230) gate cleared",
+            )
+        ]
+    )
+    result = cli("log-intervention", REPO, "1762", "--category", "infra")
+    assert result.exit_code == 0, result.output
+    assert "no recorded stall" not in result.output
+
+    payload = json.loads(cli("block-log", "--json").output)
+    (episode,) = payload["episodes"]
+    assert episode["resolved"] is True
+    assert episode["human_acted"] is True
+    assert episode["intervention_categories"] == ["infra"]
 
 
 # ── #2276 Phase 1: the read-only diagnostician, end to end ───────────────────
