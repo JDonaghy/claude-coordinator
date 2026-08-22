@@ -5724,7 +5724,21 @@ def test_notify_is_off_by_default(driver_factory, monkeypatch):
     assert called == []
 
 
-def test_notify_nudges_coord_notify_under_the_shared_lock(driver_factory, tmp_path):
+def test_notify_nudges_coord_notify_under_the_shared_lock(
+    driver_factory, tmp_path, monkeypatch
+):
+    # #2170-class isolation: `run_notify()` takes a REAL flock on
+    # `notify_lock_path()` — i.e. `Path.home()/".coord"/"notify.lock"`,
+    # resolved at call time. Without redirecting $HOME this test contends
+    # with whatever else on the host legitimately holds that lock (a live
+    # `coord notify` / `run_drain` on a daemon host, or simply another
+    # pytest worker running the sibling drain tests), then burns the full
+    # 5-minute `timeout=300` before failing with an empty `seen`. That makes
+    # the result depend on the machine rather than on the code, which is
+    # exactly the class `tests/test_ambient_home_isolation.py` and the
+    # `populated-home` CI job exist to keep out. `tmp_path` was already a
+    # parameter here and simply went unused — this is what it was for.
+    monkeypatch.setenv("HOME", str(tmp_path))
     driver = driver_factory(
         [board(status="merged")], opts=DriveOptions(machine="precision", notify=True)
     )
@@ -5732,6 +5746,8 @@ def test_notify_nudges_coord_notify_under_the_shared_lock(driver_factory, tmp_pa
     driver.run_coord = lambda args, **kw: seen.append(args) or 0  # type: ignore[assignment]
     driver.run_notify()
     assert seen == [("notify",)]
+    # The lock really was taken under the redirected $HOME, not the host's.
+    assert (tmp_path / ".coord" / "notify.lock").exists()
 
 
 def test_stalled_stage_gets_re_nudged_on_every_stall_window(driver_factory, capsys):
