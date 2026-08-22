@@ -10,9 +10,10 @@
 //!
 //! **No fetch of its own.** Like Queue, rows ride the existing `/board`
 //! poll (`BoardData::approved_submissions`, server-computed by
-//! `coord/serve_app.py` — `repos` is already resolved via #2531's
-//! project↔repo mapping, so this module never reads `coordinator.yml`
-//! directly). See `SidebarView::Approved`'s doc comment for why the #2336
+//! `coord/approved_work.py` and injected into the projection by
+//! `coord/serve_app.py`'s board builder — `repos` is resolved there from
+//! `portal.project_repos` in `coordinator.yml`, so this module never reads
+//! config directly). See `SidebarView::Approved`'s doc comment for why the #2336
 //! daemon-host guard that gates `coord portal outbox/events` does not apply
 //! here: this panel only ever talks to `/board` over HTTP, same as every
 //! other panel in this app.

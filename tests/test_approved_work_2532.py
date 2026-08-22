@@ -1,0 +1,395 @@
+"""#2532 (ms-67 contract §2/§5): the "Approved work items" panel's DATA SOURCE.
+
+The TUI half of #2532 (the panel itself) is covered by the sealed ms-67
+acceptance slice, which seeds a synthetic `/board` JSON fixture — so by
+construction it cannot tell whether a real `coord serve` daemon ever emits
+that key. That is exactly the gap these tests close, black-box, through the
+same `GET /board` endpoint a thin client uses:
+
+1. `portal.project_repos` parses + validates at LOAD (contract §2), and
+   `repos_for_project` never raises on an unmapped project.
+2. "approved" is the LATEST sign-off verdict, not "was ever approved".
+3. `GET /board` actually carries `approved_submissions`, oldest-first, with
+   every non-defaulted wire field `ApprovedSubmission` (tui/src/app/types.rs)
+   requires, `repos` resolved server-side, and an unmapped project rendered
+   as `[]` rather than dropped.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+import pytest
+from starlette.testclient import TestClient
+
+from coord.config import (
+    ConfigError,
+    PortalConfig,
+    PortalProjectRepo,
+    _parse_portal,
+    load as load_config,
+)
+from coord.dao import SqliteStore
+from coord.db import _ensure_schema
+from coord.serve_app import build_app
+
+CONFIG_YAML = """\
+repos:
+  - name: api
+    github: acme/api
+  - name: shared
+    github: acme/shared
+
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    capabilities: [python]
+    repos: [api, shared]
+
+portal:
+  project_repos:
+    - project_id: proj_9f2a
+      repos: [api, shared]
+"""
+
+
+# ── 1. contract §2 — the project↔repo mapping ────────────────────────────────
+
+
+class TestProjectReposConfig:
+    def test_absent_block_maps_nothing_and_never_raises(self) -> None:
+        cfg = _parse_portal(None)
+        assert cfg.project_repos == []
+        assert cfg.repos_for_project("proj_9f2a") == []
+
+    def test_a_mapping_parses_and_resolves(self) -> None:
+        cfg = _parse_portal(
+            {"project_repos": [{"project_id": "proj_9f2a", "repos": ["api"]}]},
+            {"api", "shared"},
+        )
+        assert cfg.project_repos == [
+            PortalProjectRepo(project_id="proj_9f2a", repos=["api"])
+        ]
+        assert cfg.repos_for_project("proj_9f2a") == ["api"]
+
+    def test_an_unmapped_project_is_not_an_error(self) -> None:
+        """A brand-new portal project the operator has not routed yet is a
+        valid, common state — the panel renders "no mapping", it does not
+        fail."""
+        cfg = _parse_portal(
+            {"project_repos": [{"project_id": "proj_9f2a", "repos": ["api"]}]},
+            {"api"},
+        )
+        assert cfg.repos_for_project("proj_nope") == []
+        assert cfg.repos_for_project("") == []
+
+    def test_returned_list_cannot_mutate_the_config(self) -> None:
+        cfg = _parse_portal(
+            {"project_repos": [{"project_id": "p", "repos": ["api"]}]}, {"api"}
+        )
+        cfg.repos_for_project("p").append("shared")
+        assert cfg.repos_for_project("p") == ["api"]
+
+    def test_duplicate_project_id_is_refused_at_load(self) -> None:
+        with pytest.raises(ConfigError, match="duplicate project_id"):
+            _parse_portal(
+                {
+                    "project_repos": [
+                        {"project_id": "p", "repos": ["api"]},
+                        {"project_id": "p", "repos": ["shared"]},
+                    ]
+                },
+                {"api", "shared"},
+            )
+
+    def test_unknown_repo_name_is_refused_at_load(self) -> None:
+        with pytest.raises(ConfigError, match="unknown repos"):
+            _parse_portal(
+                {"project_repos": [{"project_id": "p", "repos": ["nope"]}]},
+                {"api"},
+            )
+
+    def test_empty_repos_list_is_refused(self) -> None:
+        with pytest.raises(ConfigError, match="non-empty list of repo names"):
+            _parse_portal({"project_repos": [{"project_id": "p", "repos": []}]}, {"api"})
+
+    def test_blank_project_id_is_refused(self) -> None:
+        with pytest.raises(ConfigError, match="non-empty string"):
+            _parse_portal(
+                {"project_repos": [{"project_id": "  ", "repos": ["api"]}]}, {"api"}
+            )
+
+    def test_unknown_key_inside_an_entry_is_refused(self) -> None:
+        with pytest.raises(ConfigError, match="unknown portal.project_repos"):
+            _parse_portal(
+                {"project_repos": [{"project_id": "p", "repos": ["api"], "rpeos": []}]},
+                {"api"},
+            )
+
+    def test_not_a_list_is_refused(self) -> None:
+        with pytest.raises(ConfigError, match="must be a list of mappings"):
+            _parse_portal({"project_repos": {"project_id": "p"}}, {"api"})
+
+    def test_project_repos_is_a_known_portal_option(self) -> None:
+        """Regression guard: `_parse_portal`'s unknown-option check derives
+        its allowlist from `fields(PortalConfig)`, so a mapping declared in a
+        real coordinator.yml must not trip it."""
+        cfg = _parse_portal({"project_repos": []}, set())
+        assert cfg == PortalConfig()
+
+
+# ── 2. "approved" is the LATEST verdict ──────────────────────────────────────
+
+
+def _signoff(event_id: str, submission_id: str, verdict: str) -> dict:
+    """A sign-off event in the `type`-suffix shape the portal is observed to
+    send (`coord.portal_sync._signoff_verdict` accepts two shapes; the nested
+    one is exercised below)."""
+    return {
+        "id": event_id,
+        "submission_id": submission_id,
+        "type": f"signoff.{verdict}",
+    }
+
+
+class TestApprovedSubmissionIds:
+    def test_an_approved_signoff_lists_the_submission(self, coord_db) -> None:
+        from coord import portal_store
+        from coord.approved_work import approved_submission_ids
+
+        portal_store.record_events([_signoff("e1", "sub_a", "approved")], now=100.0)
+        assert approved_submission_ids() == {"sub_a"}
+
+    def test_the_nested_verdict_shape_is_read_too(self, coord_db) -> None:
+        from coord import portal_store
+        from coord.approved_work import approved_submission_ids
+
+        portal_store.record_events(
+            [
+                {
+                    "id": "e1",
+                    "submission_id": "sub_a",
+                    "type": "signoff",
+                    "data": {"verdict": "approved"},
+                }
+            ],
+            now=100.0,
+        )
+        assert approved_submission_ids() == {"sub_a"}
+
+    def test_changes_requested_is_not_approved(self, coord_db) -> None:
+        from coord import portal_store
+        from coord.approved_work import approved_submission_ids
+
+        portal_store.record_events(
+            [_signoff("e1", "sub_a", "changes_requested")], now=100.0
+        )
+        assert approved_submission_ids() == set()
+
+    def test_a_walked_back_approval_drops_off_the_list(self, coord_db) -> None:
+        """The whole point of folding oldest-first: a client who approved and
+        then changed their mind must not still read as ready to pull."""
+        from coord import portal_store
+        from coord.approved_work import approved_submission_ids
+
+        portal_store.record_events([_signoff("e1", "sub_a", "approved")], now=100.0)
+        portal_store.record_events(
+            [_signoff("e2", "sub_a", "changes_requested")], now=200.0
+        )
+        assert approved_submission_ids() == set()
+
+    def test_a_re_approval_after_changes_requested_counts(self, coord_db) -> None:
+        from coord import portal_store
+        from coord.approved_work import approved_submission_ids
+
+        portal_store.record_events(
+            [_signoff("e1", "sub_a", "changes_requested")], now=100.0
+        )
+        portal_store.record_events([_signoff("e2", "sub_a", "approved")], now=200.0)
+        assert approved_submission_ids() == {"sub_a"}
+
+    def test_non_signoff_events_are_ignored(self, coord_db) -> None:
+        from coord import portal_store
+        from coord.approved_work import approved_submission_ids
+
+        portal_store.record_events(
+            [{"id": "e1", "submission_id": "sub_a", "type": "submission.created"}],
+            now=100.0,
+        )
+        assert approved_submission_ids() == set()
+
+
+# ── 3. the wire shape, black-box through GET /board ──────────────────────────
+
+
+@pytest.fixture
+def rw_db(tmp_path: Path):
+    """Thread-safe file-backed coord.db override for TestClient tests
+    (mirrors tests/test_fleet_health_snapshot.py's fixture of the same name —
+    the autouse `coord_db` fixture's thread-bound :memory: conn is unusable
+    from the ASGI worker thread TestClient runs handlers on)."""
+    import coord.db as db_mod
+
+    conn = sqlite3.connect(str(tmp_path / "rw.db"), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    db_mod.override_connection(conn)
+    yield conn
+    db_mod.close()
+
+
+@pytest.fixture
+def detail_db(tmp_path: Path) -> Path:
+    p = tmp_path / "coord.db"
+    conn = sqlite3.connect(str(p))
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    conn.execute(
+        "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', '0')"
+    )
+    conn.commit()
+    conn.close()
+    return p
+
+
+@pytest.fixture
+def portal_config_path(tmp_path: Path) -> Path:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(CONFIG_YAML)
+    return p
+
+
+def _seed_submission(
+    submission_id: str, *, project_id: str, first_seen_at: float, **facts
+) -> None:
+    from coord import portal_store
+
+    portal_store.mirror_customer_facts(
+        submission_id, {"project_id": project_id, **facts}, now=first_seen_at
+    )
+    portal_store.record_events(
+        [_signoff(f"ev-{submission_id}", submission_id, "approved")],
+        now=first_seen_at,
+    )
+
+
+def _board(detail_db: Path, config_path: Path) -> dict:
+    app = build_app(SqliteStore(detail_db), load_config(config_path))
+    with TestClient(app) as cli:
+        return cli.get("/board").json()
+
+
+class TestBoardWiring:
+    def test_board_carries_the_key_even_with_nothing_approved(
+        self, detail_db, portal_config_path, rw_db
+    ) -> None:
+        """The key is always present, so a client can tell "daemon knows
+        about this and there is nothing" from "daemon predates #2532"."""
+        assert _board(detail_db, portal_config_path)["approved_submissions"] == []
+
+    def test_an_approved_submission_reaches_the_board_with_resolved_repos(
+        self, detail_db, portal_config_path, rw_db
+    ) -> None:
+        _seed_submission(
+            "sub_2f6a1c",
+            project_id="proj_9f2a",
+            first_seen_at=1755500040.0,
+            client="Heuron Technologies",
+            project_label="Portal redesign",
+            outcome="Customers can self-serve a billing address change.",
+            audience="Existing subscription customers",
+            done_definition="Customer edits and saves a new billing address.",
+            constraints="Must reuse the existing Stripe customer object.",
+        )
+
+        (row,) = _board(detail_db, portal_config_path)["approved_submissions"]
+
+        assert row["submission_id"] == "sub_2f6a1c"
+        assert row["client"] == "Heuron Technologies"
+        assert row["project_id"] == "proj_9f2a"
+        assert row["project_label"] == "Portal redesign"
+        assert row["outcome"].startswith("Customers can self-serve")
+        assert row["audience"] == "Existing subscription customers"
+        assert row["done_definition"].startswith("Customer edits and saves")
+        assert row["constraints"].startswith("Must reuse the existing Stripe")
+        # Resolved server-side from portal.project_repos — the TUI never
+        # reads coordinator.yml.
+        assert row["repos"] == ["api", "shared"]
+        # ISO-8601 Z, the shape tui/src/app/data.rs parses.
+        assert row["received_at"] == "2025-08-18T06:54:00Z"
+
+    def test_every_non_defaulted_wire_field_is_always_present(
+        self, detail_db, portal_config_path, rw_db
+    ) -> None:
+        """`ApprovedSubmission` (tui/src/app/types.rs) deserializes these
+        WITHOUT `#[serde(default)]`, so a missing key is a hard serde error
+        that blanks the whole board — not a blank cell."""
+        _seed_submission("sub_bare", project_id="proj_9f2a", first_seen_at=1.0)
+
+        (row,) = _board(detail_db, portal_config_path)["approved_submissions"]
+        for key in (
+            "submission_id",
+            "client",
+            "project_id",
+            "project_label",
+            "outcome",
+            "audience",
+            "done_definition",
+            "constraints",
+            "repos",
+            "received_at",
+        ):
+            assert key in row, key
+        assert row["client"] == ""
+        assert row["outcome"] == ""
+
+    def test_an_unmapped_project_is_listed_with_no_repos(
+        self, detail_db, portal_config_path, rw_db
+    ) -> None:
+        """Never suppressed: an operator who cannot see the unmapped
+        submission cannot know to map it (contract §3c's "— no mapping —")."""
+        _seed_submission("sub_unmapped", project_id="proj_new", first_seen_at=1.0)
+
+        (row,) = _board(detail_db, portal_config_path)["approved_submissions"]
+        assert row["submission_id"] == "sub_unmapped"
+        assert row["repos"] == []
+
+    def test_rows_are_oldest_first(
+        self, detail_db, portal_config_path, rw_db
+    ) -> None:
+        _seed_submission("sub_new", project_id="proj_9f2a", first_seen_at=2000.0)
+        _seed_submission("sub_old", project_id="proj_9f2a", first_seen_at=1000.0)
+
+        rows = _board(detail_db, portal_config_path)["approved_submissions"]
+        assert [r["submission_id"] for r in rows] == ["sub_old", "sub_new"]
+
+    def test_a_submission_without_an_approved_signoff_is_absent(
+        self, detail_db, portal_config_path, rw_db
+    ) -> None:
+        from coord import portal_store
+
+        portal_store.mirror_customer_facts(
+            "sub_pending", {"project_id": "proj_9f2a"}, now=1.0
+        )
+        portal_store.record_events(
+            [_signoff("e1", "sub_pending", "changes_requested")], now=1.0
+        )
+        assert _board(detail_db, portal_config_path)["approved_submissions"] == []
+
+    def test_a_broken_portal_read_never_blanks_the_board(
+        self, detail_db, portal_config_path, rw_db, monkeypatch
+    ) -> None:
+        """Fail-open, same posture as `merge_plan`/`merge_staging`: this is an
+        advisory panel and must never 503 the board every other panel rides
+        on."""
+        import coord.approved_work as aw
+
+        monkeypatch.setattr(
+            aw,
+            "approved_submission_ids",
+            lambda: (_ for _ in ()).throw(RuntimeError("portal DB is on fire")),
+        )
+        board = _board(detail_db, portal_config_path)
+        assert board["approved_submissions"] == []
+        assert "issues" in board  # the rest of the board is intact

@@ -206,6 +206,34 @@ def unhandled_events(limit: int = 100) -> list[PortalEvent]:
     return [_event_from_row(r) for r in rows]
 
 
+def signoff_events() -> list[PortalEvent]:
+    """Every sign-off event in the inbox, **oldest first** (#2532).
+
+    Deliberately unfiltered by ``handled_at``: an ``approved`` verdict is
+    never marked handled by anything today (see :func:`coord.portal_sync.
+    _consume_verdicts` — it advances its own watermark past one without
+    claiming it), so a ``handled_at IS NULL`` filter would be a no-op that
+    silently becomes wrong the day #2509 decides to consume them.
+
+    Oldest-first is what makes "the LATEST verdict wins" a plain
+    last-write-wins fold in the caller: a submission approved and then
+    walked back with ``changes_requested`` must not still read as approved.
+
+    Matching is on ``kind`` alone (``signoff`` / ``signoff.*``) — the same
+    prefix test :func:`coord.portal_sync._signoff_verdict` applies before it
+    looks at the payload — so this stays a cheap indexed-ish scan and the
+    verdict-shape guesswork lives in exactly one place.
+    """
+    rows = _conn().execute(
+        """
+        SELECT * FROM portal_events
+         WHERE kind = 'signoff' OR kind LIKE 'signoff.%'
+         ORDER BY received_at ASC, rowid ASC
+        """
+    ).fetchall()
+    return [_event_from_row(r) for r in rows]
+
+
 def events_after_verdict_watermark(
     received_at: float, rowid: int, *, limit: int = 100
 ) -> list[tuple[int, PortalEvent]]:
