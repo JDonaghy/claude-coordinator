@@ -338,7 +338,12 @@ impl CoordApp {
             // #1866: Queue's verbs are all row-scoped (J/K reorder, x/u/r,
             // right-click menu) — a panel-level toolbar button would have no
             // row to bind to, exactly as for Reports above.
-            | SidebarView::Queue => return None,
+            | SidebarView::Queue
+            // #2532 (ms-67 contract §3a): Approved work items' one verb
+            // (#2533's "Pull into decomposition session") is row-scoped
+            // (right-click menu) — no panel-wide toolbar button to bind,
+            // same reasoning as Queue immediately above.
+            | SidebarView::Approved => return None,
         };
 
         Some(Toolbar {

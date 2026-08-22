@@ -256,6 +256,15 @@ pub(crate) enum SidebarView {
     /// Adding one would be a second source of truth for data already in
     /// memory. See `app/drive_queue.rs`'s "Queue panel" section.
     Queue,
+    /// #2532 (PB-2, ms-67 contract §3): Approved work items panel — a plain
+    /// aligned-column list of portal submissions ready for decomposition
+    /// into coordinator work (`signoff.approved` today; the operator
+    /// "start work" override, `coord-portal`#132, once it lands). Modeled
+    /// on the Audit panel's own list (not a `DataTable` grid, no sortable
+    /// numeric columns and no drag-reorder verb) — see `app/approved.rs`.
+    /// **No fetch of its own**: like Queue, rows ride the existing `/board`
+    /// poll (`BoardData::approved_submissions`), not a view-gated fetch.
+    Approved,
 }
 
 impl SidebarView {
@@ -274,6 +283,7 @@ impl SidebarView {
             SidebarView::Audit => "Audit",
             SidebarView::Reports => "Reports",
             SidebarView::Queue => "Queue",
+            SidebarView::Approved => "Approved work items",
         }
     }
 
@@ -302,6 +312,7 @@ impl SidebarView {
             SidebarView::Audit => Some(WidgetId::new("panel:audit")),
             SidebarView::Reports => Some(WidgetId::new("panel:reports")),
             SidebarView::Queue => Some(WidgetId::new("panel:queue")),
+            SidebarView::Approved => Some(WidgetId::new("panel:approved")),
             SidebarView::MilestoneDag => None,
         }
     }
@@ -812,6 +823,43 @@ pub(crate) struct BoardPayload {
     /// and on daemons older than #1753, which never emit this key.
     #[serde(default)]
     pub(crate) drive_queue: Vec<BoardDriveQueueEntry>,
+    /// #2532 (ms-67 contract §5): portal submissions ready for
+    /// decomposition into coordinator work — `signoff.approved` today.
+    /// Server-computed (`coord/serve_app.py`), including the `repos` field
+    /// resolved from #2531's project↔repo mapping — the TUI never reads
+    /// `coordinator.yml` directly. Empty on daemons that predate #2532.
+    #[serde(default)]
+    pub(crate) approved_submissions: Vec<ApprovedSubmission>,
+}
+
+/// #2532 (ms-67 contract §5): one portal submission ready to pull into a
+/// briefed decomposition session — the wire shape of `/board`'s
+/// `approved_submissions` entries. Field names are the contract's own
+/// proposal (§6.9), not read off coord-portal's real schema (a separate
+/// repo) — confirm against `coord/portal_bridge.py`'s existing pull path
+/// before treating them as final.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub(crate) struct ApprovedSubmission {
+    pub(crate) submission_id: String,
+    pub(crate) client: String,
+    pub(crate) project_id: String,
+    pub(crate) project_label: String,
+    pub(crate) outcome: String,
+    pub(crate) audience: String,
+    pub(crate) done_definition: String,
+    pub(crate) constraints: String,
+    /// Server-resolved repo(s) this submission's project maps to (#2531's
+    /// `repos_for_project`). Empty means "no mapping" — contract §3c's
+    /// literal `"— no mapping —"` placeholder, never a blank cell.
+    #[serde(default)]
+    pub(crate) repos: Vec<String>,
+    /// ISO-8601 timestamp (`YYYY-MM-DDTHH:MM:SSZ`), mirrors
+    /// `coord.portal_store.SubmissionRecord.first_seen_at`. Parsed with
+    /// `data::parse_iso8601_to_epoch` for the detail pane's "Xd ago"
+    /// rendering; kept as the raw wire string so a parse failure never
+    /// blanks the whole row.
+    #[serde(default)]
+    pub(crate) received_at: String,
 }
 
 /// #1631 (H-4): one already-rendered health-check row — the wire shape of
@@ -2549,6 +2597,11 @@ pub struct BoardData {
     /// overlay and Pipeline-row menu items. Empty on the local-SQLite-mode
     /// read path and on daemons older than #1753.
     pub(crate) drive_queue: Vec<BoardDriveQueueEntry>,
+    /// #2532: mirrors `BoardPayload::approved_submissions` — portal
+    /// submissions ready for decomposition. Empty on the local-SQLite-mode
+    /// read path (no daemon to compute the server-resolved `repos`) and on
+    /// daemons older than #2532.
+    pub(crate) approved_submissions: Vec<ApprovedSubmission>,
 }
 
 /// Parsed plan data, mirroring `coord.plan_parser.WorkerPlan.to_dict()`.
