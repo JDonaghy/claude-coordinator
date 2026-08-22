@@ -1787,6 +1787,21 @@ class NotificationsConfig:
     cold_ceiling_mins: dict[str, float] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class PortalProjectRepo:
+    """One portal-project → coord-repo(s) mapping (ms-67 contract §2).
+
+    ``project_id`` is the portal's own opaque identifier: coord never mints
+    one and never validates its *shape*, only that it is non-empty and
+    declared at most once. ``repos`` must each name a configured
+    ``repos[].name`` — the same cross-reference posture
+    :func:`_validate_dependencies` already applies to ``depends_on``.
+    """
+
+    project_id: str
+    repos: list[str]
+
+
 @dataclass
 class PortalConfig:
     """The outbound client to coord-portal's sync bridge (#2179, ``docs/CUSTOMER_PORTAL.md``).
@@ -1820,6 +1835,28 @@ class PortalConfig:
     # coord.portal_bridge.PortalBridgeClient. A 401 never retries: a bad
     # credential does not become a good one on attempt two.
     max_retries: int = 2
+    # ms-67 contract §2: portal project ↔ coord repo(s). Absent == nothing
+    # mapped == every lookup returns [], which the "Approved work items"
+    # panel renders as its literal "— no mapping —" placeholder rather than
+    # a blank cell. Mapping is *operator* knowledge (which repo a client's
+    # project lands in), so it lives here and not in the portal's schema.
+    project_repos: list[PortalProjectRepo] = field(default_factory=list)
+
+    def repos_for_project(self, project_id: str) -> list[str]:
+        """The coord repo name(s) *project_id* maps to — ``[]`` if unmapped.
+
+        **Never raises.** An unmapped project is a valid, common state (a
+        brand-new portal project the operator has not routed yet), not an
+        error: the caller renders "no mapping", it does not fail. Returns a
+        fresh list so a caller cannot mutate the parsed config.
+        """
+        wanted = (project_id or "").strip()
+        if not wanted:
+            return []
+        for entry in self.project_repos:
+            if entry.project_id == wanted:
+                return list(entry.repos)
+        return []
 
 
 @dataclass
@@ -1920,7 +1957,7 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
     pricing = _parse_pricing(raw.get("pricing"))
     health = _parse_health(raw.get("health"))
     notifications = _parse_notifications(raw.get("notifications"))
-    portal = _parse_portal(raw.get("portal"))
+    portal = _parse_portal(raw.get("portal"), {r.name for r in repos})
 
     return Config(
         repos=repos,
@@ -3498,12 +3535,18 @@ _PORTAL_PLAIN_STR_FIELDS = ("base_url",)
 _PORTAL_SECRET_STR_FIELDS = ("bridge_client_id", "bridge_client_secret")
 
 
-def _parse_portal(raw: Any) -> PortalConfig:
+def _parse_portal(raw: Any, repo_names: set[str] | None = None) -> PortalConfig:
     """Parse the optional ``portal:`` block from coordinator.yml (#2179).
 
     An absent block returns a **disabled** :class:`PortalConfig` — unchanged
     behaviour for every existing deployment, and the correct default until
     ``BRIDGE_CLIENT_ID``/``BRIDGE_CLIENT_SECRET`` exist in production.
+
+    *repo_names* (ms-67 contract §2) is the set of configured ``repos[].name``
+    that ``project_repos[*].repos`` entries are cross-checked against, the
+    same way ``reviews.repo_overrides`` already is. ``None`` skips that one
+    check (for callers that parse the block in isolation); every other
+    validation still applies.
     """
     if raw is None:
         return PortalConfig()
@@ -3561,6 +3604,9 @@ def _parse_portal(raw: Any) -> PortalConfig:
             raise ConfigError("portal.max_retries must be a non-negative integer")
         cfg.max_retries = value
 
+    if "project_repos" in raw:
+        cfg.project_repos = _parse_portal_project_repos(raw["project_repos"], repo_names)
+
     if cfg.enabled and not (cfg.base_url and cfg.bridge_client_id and cfg.bridge_client_secret):
         # Half a credential is not a credential — coord-portal's
         # isBridgeAuthorized takes the identical position and fails closed on
@@ -3571,6 +3617,64 @@ def _parse_portal(raw: Any) -> PortalConfig:
         )
 
     return cfg
+
+
+def _parse_portal_project_repos(
+    raw: Any, repo_names: set[str] | None
+) -> list[PortalProjectRepo]:
+    """Parse ``portal.project_repos`` (ms-67 contract §2).
+
+    Rejects at LOAD, never at use — the same posture every other
+    ``portal.*`` field takes, and the reason
+    :meth:`PortalConfig.repos_for_project` can promise never to raise.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ConfigError("portal.project_repos must be a list of mappings")
+
+    parsed: list[PortalProjectRepo] = []
+    seen: set[str] = set()
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ConfigError(f"portal.project_repos[{i}] must be a mapping")
+        unknown = sorted(set(entry) - {"project_id", "repos"})
+        if unknown:
+            raise ConfigError(
+                f"unknown portal.project_repos[{i}] option(s): {', '.join(unknown)} "
+                "(valid: project_id, repos)"
+            )
+        project_id = entry.get("project_id")
+        if not isinstance(project_id, str) or not project_id.strip():
+            raise ConfigError(
+                f"portal.project_repos[{i}].project_id must be a non-empty string"
+            )
+        project_id = project_id.strip()
+        if project_id in seen:
+            raise ConfigError(
+                f"portal.project_repos has duplicate project_id {project_id!r}"
+            )
+        seen.add(project_id)
+
+        repos_raw = entry.get("repos")
+        if (
+            not isinstance(repos_raw, list)
+            or not repos_raw
+            or not all(isinstance(r, str) and r.strip() for r in repos_raw)
+        ):
+            raise ConfigError(
+                f"portal.project_repos[{i}].repos must be a non-empty list of repo names"
+            )
+        repos = [r.strip() for r in repos_raw]
+        if repo_names is not None:
+            unknown_repos = [r for r in repos if r not in repo_names]
+            if unknown_repos:
+                raise ConfigError(
+                    f"portal.project_repos[{i}] ({project_id}) references unknown "
+                    f"repos: {unknown_repos}"
+                )
+        parsed.append(PortalProjectRepo(project_id=project_id, repos=repos))
+    return parsed
 
 
 def _parse_providers(raw: Any) -> ProvidersConfig:

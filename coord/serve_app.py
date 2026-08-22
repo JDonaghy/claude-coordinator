@@ -4100,6 +4100,23 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             # key is structurally unreachable from any of them — see
             # tests/test_health_advisory_only.py.
             projection["fleet_health"] = _fleet_health_refresher.snapshot().to_dict()
+            # #2532 (ms-67 contract §5): portal submissions the client has
+            # signed off on and that are waiting to be decomposed into
+            # coordinator work.  Computed HERE, on the daemon host, because
+            # the portal bridge's SQLite tables are canonical only here
+            # (coord/portal_store.py's module doc) and the `repos` column is
+            # resolved from `coordinator.yml` (#2531's project↔repo map),
+            # which a thin client never reads (#2336).  Same fail-open,
+            # sibling-key posture as `fleet_health` above: an empty list is a
+            # legitimate answer ("nothing approved yet"), so no error here
+            # may 503 the board or blank an otherwise-good projection.
+            try:
+                from coord.approved_work import (  # noqa: PLC0415
+                    approved_submissions as _approved_submissions,
+                )
+                projection["approved_submissions"] = _approved_submissions(_cfg)
+            except Exception:  # noqa: BLE001 — advisory panel, never fatal
+                projection["approved_submissions"] = []
             try:
                 from coord import merge_queue as _mq  # noqa: PLC0415
                 from coord.state import build_board as _build_board  # noqa: PLC0415

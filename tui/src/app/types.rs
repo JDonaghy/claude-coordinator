@@ -825,9 +825,12 @@ pub(crate) struct BoardPayload {
     pub(crate) drive_queue: Vec<BoardDriveQueueEntry>,
     /// #2532 (ms-67 contract §5): portal submissions ready for
     /// decomposition into coordinator work — `signoff.approved` today.
-    /// Server-computed (`coord/serve_app.py`), including the `repos` field
-    /// resolved from #2531's project↔repo mapping — the TUI never reads
-    /// `coordinator.yml` directly. Empty on daemons that predate #2532.
+    /// Server-computed (`coord/approved_work.py`, injected by
+    /// `coord/serve_app.py`'s board builder), including the `repos` field
+    /// resolved from `portal.project_repos` in `coordinator.yml` — the TUI
+    /// never reads config or the portal DB directly. Empty on daemons that
+    /// predate #2532, and on any daemon whose portal bridge has no
+    /// approved sign-off yet.
     #[serde(default)]
     pub(crate) approved_submissions: Vec<ApprovedSubmission>,
 }
@@ -836,8 +839,10 @@ pub(crate) struct BoardPayload {
 /// briefed decomposition session — the wire shape of `/board`'s
 /// `approved_submissions` entries. Field names are the contract's own
 /// proposal (§6.9), not read off coord-portal's real schema (a separate
-/// repo) — confirm against `coord/portal_bridge.py`'s existing pull path
-/// before treating them as final.
+/// repo) — `coord/approved_work.py` reads them out of the read-only
+/// customer mirror under these spellings (plus a camelCase alias), so if
+/// the portal's real spelling differs, that alias table is the one place to
+/// correct it and this struct does not change.
 #[derive(Clone, Debug, serde::Deserialize)]
 pub(crate) struct ApprovedSubmission {
     pub(crate) submission_id: String,
@@ -848,9 +853,10 @@ pub(crate) struct ApprovedSubmission {
     pub(crate) audience: String,
     pub(crate) done_definition: String,
     pub(crate) constraints: String,
-    /// Server-resolved repo(s) this submission's project maps to (#2531's
-    /// `repos_for_project`). Empty means "no mapping" — contract §3c's
-    /// literal `"— no mapping —"` placeholder, never a blank cell.
+    /// Server-resolved repo(s) this submission's project maps to
+    /// (`PortalConfig.repos_for_project` in `coord/config.py`). Empty means
+    /// "no mapping" — contract §3c's literal `"— no mapping —"`
+    /// placeholder, never a blank cell.
     #[serde(default)]
     pub(crate) repos: Vec<String>,
     /// ISO-8601 timestamp (`YYYY-MM-DDTHH:MM:SSZ`), mirrors
