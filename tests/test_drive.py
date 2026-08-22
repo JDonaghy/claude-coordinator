@@ -2557,6 +2557,12 @@ def test_a_dead_end_exit_code_reaches_the_drive_exited_audit_row(
     monkeypatch.setattr(
         "coord.drive.Driver._post_escalation_comment", lambda *a, **kw: None
     )
+    # Pin `coord_argv()`'s prefix to a single element so the `c[1:3]` slice
+    # below is decided by the code under test, not by whether `coord` is on
+    # the *host's* $PATH (#2564) — off-PATH, `coord_argv()`'s documented
+    # fallback is `[sys.executable, "-m", "coord.cli"]`, three elements, which
+    # shifts every recorded argv's ["escalate", "record"] out of [1:3].
+    monkeypatch.setenv("COORD_DRIVE_COORD_BIN", "coord")
     payload = board(status="done", test_state="passed")
     payload["assignments"].append({
         "repo_name": REPO,
