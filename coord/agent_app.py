@@ -1231,11 +1231,41 @@ def build_app(
     async def logs(request: Request) -> Response:
         assignment_id = request.path_params["id"]
         assignment = server.get(assignment_id)
-        if assignment is None or assignment.log_path is None:
-            return JSONResponse(
-                {"error": f"unknown assignment {assignment_id}"}, status_code=404
-            )
-        log_path = Path(assignment.log_path)
+        status = assignment.status if assignment is not None else "unknown"
+        if assignment is not None and assignment.log_path is not None:
+            log_path = Path(assignment.log_path)
+        else:
+            # #2541: the human-attended ssh+tmux interactive launcher
+            # (`coord assign --interactive ...`) never goes through this
+            # agent's `/assign` — it SSHes in directly from the
+            # coordinator and drives `claude` inside a tmux session, so
+            # `server.get()` has no record of it. Those sessions still
+            # persist a best-effort pane-capture snapshot at the SAME
+            # conventional per-assignment path
+            # (`coord.interactive._persist_interactive_pane_log`) so a
+            # launch failure is diagnosable via `coord log <id>` without a
+            # manual SSH repro. Fall back to that path directly rather
+            # than 404ing just because this agent never tracked the
+            # assignment in memory.
+            # assignment_id is attacker-controllable (raw path param) and,
+            # unlike `assignment.log_path` above, is interpolated directly
+            # into a filesystem path here — reject anything that isn't the
+            # plain `[a-zA-Z0-9_-]+` shape every assignment_id generator in
+            # this codebase actually produces, so a `../` can't escape
+            # `logs/`.
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", assignment_id):
+                return JSONResponse(
+                    {"error": f"invalid assignment id {assignment_id!r}"},
+                    status_code=400,
+                )
+
+            # `server.log_dir` (not the module-level `DEFAULT_STATE_DIR`
+            # default) so this honours a non-default `state_dir` exactly
+            # like every other lookup in this handler would if the
+            # assignment WERE tracked — production agents never override
+            # it, but this keeps the fallback truthful to what this
+            # specific server instance is actually configured with.
+            log_path = server.log_dir / f"{assignment_id}.log"
         if not log_path.exists():
             return JSONResponse(
                 {"error": f"no log file for assignment {assignment_id}"}, status_code=404
@@ -1255,7 +1285,7 @@ def build_app(
         total_size = log_path.stat().st_size
         headers = {
             "X-Coord-Log-Total": str(total_size),
-            "X-Coord-Log-Status": assignment.status,
+            "X-Coord-Log-Status": status,
         }
         return PlainTextResponse(body.decode("utf-8", errors="replace"), headers=headers)
 
