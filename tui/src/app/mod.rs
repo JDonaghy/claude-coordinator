@@ -2546,6 +2546,14 @@ pub struct CoordApp {
     /// §3c's oldest-first order). Clamped to bounds on navigation, same
     /// pattern as `audit_sel`.
     approved_sel: usize,
+    /// Vertical scroll offset (in *submission* rows, header excluded) into
+    /// the main-panel list. Kept in step with `approved_sel` by
+    /// `fix_approved_scroll` at every keyboard-nav site in `events.rs` —
+    /// without it `j`/`End` would walk the selection past the first
+    /// screenful and the row would simply never be painted, which is the
+    /// exact defect `audit_scroll`/`fix_audit_scroll` were added for in
+    /// #1094.
+    approved_scroll: usize,
     /// `true` when the inline submission-detail pane (Enter on a selected
     /// row) is open. `Esc` closes it back to the list-only view (contract
     /// §3e), same pattern as `audit_detail_open`.
@@ -3923,6 +3931,7 @@ impl CoordApp {
             pending_drive_queue_after: None,
             pending_gate_a_changes_note: None,
             approved_sel: 0,
+            approved_scroll: 0,
             approved_detail_open: false,
             queue_sel: 0,
             queue_scroll: 0,

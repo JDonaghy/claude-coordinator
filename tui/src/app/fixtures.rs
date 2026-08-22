@@ -156,6 +156,7 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         pending_drive_queue_after: None,
         pending_gate_a_changes_note: None,
         approved_sel: 0,
+        approved_scroll: 0,
         approved_detail_open: false,
         queue_sel: 0,
         queue_scroll: 0,

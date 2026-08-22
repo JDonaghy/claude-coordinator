@@ -2964,6 +2964,10 @@ impl CoordApp {
                         if n > 0 {
                             self.approved_sel = (self.approved_sel + 1).min(n - 1);
                         }
+                        // Without this the selection walks past the first
+                        // screenful and the newly-selected row is never
+                        // painted (the #1094 defect, same fix shape).
+                        self.fix_approved_scroll(content_visible_rows(ctx.main_bounds(), lh));
                         needs_redraw = true;
                     }
                     Key::Char('k') | Key::Named(NamedKey::Up)
@@ -2971,6 +2975,7 @@ impl CoordApp {
                             && !self.approved_detail_open =>
                     {
                         self.approved_sel = self.approved_sel.saturating_sub(1);
+                        self.fix_approved_scroll(content_visible_rows(ctx.main_bounds(), lh));
                         needs_redraw = true;
                     }
                     Key::Named(NamedKey::Enter)
@@ -3975,9 +3980,11 @@ impl CoordApp {
                                 self.queue_set_sel(0);
                                 self.queue_scroll = 0;
                             }
-                            // #2532: Approved — Home jumps to the first row.
+                            // #2532: Approved — Home jumps to the first row
+                            // (and rewinds the scroll window with it).
                             SidebarView::Approved => {
                                 self.approved_sel = 0;
+                                self.approved_scroll = 0;
                             }
                         }
                         needs_redraw = true;
@@ -4083,12 +4090,17 @@ impl CoordApp {
                                     lh,
                                 ));
                             }
-                            // #2532: Approved — End jumps to the last row.
+                            // #2532: Approved — End jumps to the last row
+                            // (scrolling it into view).
                             SidebarView::Approved => {
                                 let n = self.approved_submissions().len();
                                 if n > 0 {
                                     self.approved_sel = n - 1;
                                 }
+                                self.fix_approved_scroll(content_visible_rows(
+                                    ctx.main_bounds(),
+                                    lh,
+                                ));
                             }
                         }
                         needs_redraw = true;
