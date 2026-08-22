@@ -101,6 +101,34 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 KillMode=process
+# #2532: WITHOUT this line the tick inherits the systemd *user manager's*
+# PATH (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:
+# /usr/games:/usr/local/games:/snap/bin`), which does NOT contain
+# `~/.cargo/bin` — and rustup installs `cargo` nowhere else. That matters
+# because this tick launches `coord drive`, which runs the oracle-loop trust
+# gate `coord acceptance record` IN-PROCESS on this host, which shells out to
+# the repo's acceptance driver command. For claude-coordinator's `tui/**`
+# route (and quadraui's, and every future cargo-based sealed suite) that
+# command starts with `cargo`, so it exited 127 `cargo: not found` with EMPTY
+# stdout. `coord.acceptance_drivers.run_driver` folds a non-zero exit into
+# its result rather than raising, so zero parsed verdicts became
+# `total=0/passed=0/green=false` and the board recorded a *false red* trust
+# gate with an empty reason string — indistinguishable, from every operator
+# surface, from the worker's code genuinely failing the sealed suite. It cost
+# #2532 a full fix-round dispatch against a branch whose 22 acceptance tests
+# were green the whole time.
+#
+# Ordering mirrors the sibling units on this same host that already got this
+# right (deploy/coord-serve.service, deploy/coord-agent.service,
+# deploy/coord-web-dist-build.service): the pinned `~/.coord-venv/bin` first
+# so nothing can shadow the release that is driving the fleet, then
+# `~/.cargo/bin`, then `~/.local/bin`. NO `.venv/bin` entry appears at all —
+# the #1831 `unit_drift` health check flags any unit whose PATH puts an
+# editable repo checkout ahead of `~/.local/bin` / `~/.coord-venv/bin`.
+# Everything the user manager's default PATH carried (tmux, git, gh, and
+# /snap/bin) is preserved below, so this is a strict superset of what the
+# tick could reach before — nothing it currently finds can go missing.
+Environment=PATH=%h/.coord-venv/bin:%h/.cargo/bin:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 # --max-parallel 4 (#2012, raised from 3 in #2057) — the global ceiling,
 # ONE SLOT PER REPO IN THE FLEET: claude-coordinator, quadraui, vimcode,
 # coord-portal. It was 3 because the fleet had three repos when #2012 set
