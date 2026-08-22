@@ -34,7 +34,9 @@ from coord.block_log import (
     BUCKET_SUCCEEDED,
     BY_DESIGN_CAUSES,
     EVENT_ENTER,
+    EVENT_INTERVENTION,
     EVENT_RESOLVE,
+    INTERVENTION_CATEGORIES,
     MAX_LOG_BYTES,
     RESCUE_SOURCES,
     UNCLASSIFIED_CATEGORY,
@@ -43,6 +45,7 @@ from coord.block_log import (
     episode_bucket,
     episode_category,
     episodes,
+    intervention_event,
     is_by_design,
     log_location,
     merge_only_event,
@@ -374,6 +377,115 @@ def test_a_merge_only_race_is_recorded_as_an_ordinary_resume_not_a_new_cause():
     assert event["release_reason"] == reason
 
 
+# ── #2540: `intervention` records — human_acted's blind spot ────────────────
+
+
+def test_an_intervention_event_carries_the_category_and_note_verbatim():
+    event = intervention_event(
+        key=f"{REPO}#2501",
+        category="git-recovery",
+        note="resolved conflict by hand, force-pushed",
+        host="dellserver",
+        now=NOW,
+    )
+    assert event["event"] == EVENT_INTERVENTION
+    assert event["key"] == f"{REPO}#2501"
+    assert event["category"] == "git-recovery"
+    assert event["note"] == "resolved conflict by hand, force-pushed"
+    assert event["source"] == "operator"
+
+
+def test_an_intervention_with_no_category_normalises_to_other():
+    event = intervention_event(key=f"{REPO}#2501", category="", now=NOW)
+    assert event["category"] == "other"
+
+
+def test_the_documented_categories_cover_2540s_own_evidence():
+    # Not enforced anywhere (open vocabulary, like `episode_category`), but
+    # pinned so the CLI help text can't silently drift from what this module
+    # actually ships.
+    assert set(INTERVENTION_CATEGORIES) >= {"git-recovery", "cli-recheck", "infra"}
+
+
+def test_an_intervention_logged_while_still_open_flips_human_acted_without_resolving():
+    events = [
+        {"event": EVENT_ENTER, "ts": NOW, "key": f"{REPO}#2501",
+         "state": STATE_BLOCKED, "stated_reason": "merge attempted 3 times without landing"},
+        intervention_event(
+            key=f"{REPO}#2501", category="cli-recheck",
+            note="ran coord merge --only by hand", now=NOW + 30,
+        ),
+    ]
+    (episode,) = episodes(events)
+    assert episode["resolved"] is False
+    assert episode["human_acted"] is True
+    assert episode["intervention_categories"] == ["cli-recheck"]
+    assert episode["interventions"][0]["note"] == "ran coord merge --only by hand"
+
+
+def test_an_intervention_survives_the_auto_resolve_that_follows_it():
+    """The exact #2540 repro shape: a human fixes it by hand, the queue's own
+    mechanism is what technically flips the state a moment later, and the
+    resolve record's OWN `human_acted=False` must not erase the intervention
+    that came first."""
+    events = [
+        {"event": EVENT_ENTER, "ts": NOW, "key": f"{REPO}#2501",
+         "state": STATE_BLOCKED, "stated_reason": "merge attempted 3 times without landing"},
+        intervention_event(
+            key=f"{REPO}#2501", category="git-recovery", now=NOW + 30,
+        ),
+        {"event": EVENT_RESOLVE, "ts": NOW + 60, "key": f"{REPO}#2501",
+         "resolution": "auto_resumed", "true_cause": "auto-released — x",
+         "human_acted": False},
+    ]
+    (episode,) = episodes(events)
+    assert episode["resolved"] is True
+    assert episode["human_acted"] is True
+    assert episode["intervention_categories"] == ["git-recovery"]
+    # The mechanism's own account is untouched by the intervention.
+    assert episode["true_cause"].startswith("auto-released")
+
+
+def test_an_intervention_logged_after_the_fact_attaches_to_the_closed_episode():
+    """The other real-world order: the fix already landed, and the operator
+    only gets around to `log-intervention` afterward."""
+    events = [
+        {"event": EVENT_ENTER, "ts": NOW, "key": f"{REPO}#2501",
+         "state": STATE_BLOCKED, "stated_reason": "merge attempted 3 times without landing"},
+        {"event": EVENT_RESOLVE, "ts": NOW + 60, "key": f"{REPO}#2501",
+         "resolution": "auto_resumed", "true_cause": "auto-released — x",
+         "human_acted": False},
+        intervention_event(
+            key=f"{REPO}#2501", category="infra", now=NOW + 120,
+        ),
+    ]
+    (episode,) = episodes(events)
+    assert episode["resolved"] is True
+    assert episode["human_acted"] is True
+    assert episode["intervention_categories"] == ["infra"]
+
+
+def test_an_intervention_for_a_key_with_no_episode_at_all_is_dropped():
+    """Logged before this host ever recorded a stall for the key — nothing to
+    attach to, so it is silently absent from `episodes()` (the CLI's own
+    warning is what tells the operator, not a fabricated episode)."""
+    assert episodes(
+        [intervention_event(key=f"{REPO}#2501", category="infra", now=NOW)]
+    ) == []
+
+
+def test_the_summary_splits_human_acted_into_the_logged_subset():
+    stats = summarize([
+        {"key": f"{REPO}#1", "state": STATE_BLOCKED, "resolved": True,
+         "human_acted": True, "true_cause": "operator-intervened — x"},
+        {"key": f"{REPO}#2", "state": STATE_BLOCKED, "resolved": True,
+         "human_acted": True, "true_cause": "auto-released — x",
+         "intervention_categories": ["git-recovery"]},
+    ])
+    assert stats["human_acted"] == 2
+    assert stats["human_acted_logged"] == 1
+
+
 # ── persistence ──────────────────────────────────────────────────────────────
 
 
@@ -513,6 +625,7 @@ def test_the_summary_reports_human_and_open_counts_together():
             "(unresolved)": 1,
         },
         "human_acted": 1,
+        "human_acted_logged": 0,
         "auto_released": 1,
         "open": 1,
         "repeat_causes": {},

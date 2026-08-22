@@ -881,6 +881,35 @@ the queue. Full runbook, including the enqueue commands, the `QUEUE: STALLED`
 vs `QUEUE: BLOCKED` status-bar reading, the pinned-CLI upgrade trap, and the
 `#1715` "don't queue more than ~2" caveat: [`docs/DRIVE_QUEUE.md`](DRIVE_QUEUE.md).
 
+### Recording manual recovery (`coord drive-queue log-intervention`, #2540)
+
+`coord drive-queue block-log`'s `human_acted` count only ever recognizes the
+queue's own command surface — `remove`/`resume`, a Gate-A sign-off. It has no
+way to see a manual git rebase / conflict resolution / `git push
+--force-with-lease`, a direct `coord test`/`coord merge --only`/`coord
+pr`/`coord fix` run against a specific assignment, or infra-level recovery
+(`systemctl`, `coord agent update`, `coord diagnose --reset`) — none of that
+touches this process's own write paths. Left unlogged, a night of exactly
+that kind of manual recovery reads back as `0 needed a human`, which is the
+opposite of what the log is for.
+
+**Make it a habit**: whenever you do one of those by hand against a
+`blocked`/`parked` drive-queue entry, log it —
+
+```bash
+coord drive-queue log-intervention <repo> <issue> --category git-recovery \
+    --note "resolved conflict by hand, force-pushed"
+```
+
+`--category` is free text (not a closed enum — see
+`INTERVENTION_CATEGORIES` in `coord/block_log.py`), but the documented
+starting set is `git-recovery`, `cli-recheck` (a direct `coord test`/`coord
+merge --only`/`coord pr`/`coord fix`), and `infra`. It is safe to run at any
+point relative to the actual fix landing — mid-recovery or afterward —
+`block-log` folds the record onto whichever episode was open at the time, or
+the most recently closed one otherwise. Skipping it breaks nothing
+mechanically, but it is exactly how real operator effort goes uncounted.
+
 ## Daemon-host unit inventory — what dellserver runs
 
 **If the daemon host is lost, this is the list you rebuild from.** Which units
