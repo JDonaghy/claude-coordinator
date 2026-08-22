@@ -2011,7 +2011,7 @@ def _run_pass_confirmation(transition: Transition, entry: dict):
 
 
 def _confirmed_pass_verdict(
-    transition: Transition, entry: dict, *, claim_reason: str,
+    transition: Transition, entry: dict, parent_id: str, *, claim_reason: str,
 ) -> tuple[str, str]:
     """#2464: the ``(test_state, test_reason)`` to record for a *claimed* pass.
 
@@ -2033,7 +2033,19 @@ def _confirmed_pass_verdict(
       #2464, with ``UNCONFIRMED`` in the reason so the row says plainly that
       nobody checked. See :mod:`coord.confirm_test` on why a missing toolchain,
       a missing checkout or a timeout must never read as a failing branch.
+
+    #2563: whatever output the run captured — failing node ids, the
+    assertion, tracebacks — is also persisted to *parent_id*'s
+    ``test_output/<id>.txt`` (:func:`coord.confirm_test.write_confirmation_output`)
+    before this returns, so the escalated fix worker's briefing
+    (`coord/commands/plan_followup.py`, which already reads that file ahead of
+    every other evidence source) quotes the real failure instead of the
+    one-line *reason* alone. ``test_reason`` on the row stays exactly that
+    one-line summary — #1337 deliberately keeps unbounded free text out of the
+    board upsert, and this does not undo that; the file is the long form.
     """
+    from coord.confirm_test import write_confirmation_output  # noqa: PLC0415
+
     result = _run_pass_confirmation(transition, entry)
 
     if result is None:
@@ -2042,6 +2054,24 @@ def _confirmed_pass_verdict(
             f"{claim_reason} — UNCONFIRMED: no independent re-run was possible "
             "on this machine, so this verdict rests on the worker's own report "
             "(#2464).",
+        )
+
+    # Best-effort and unconditional on *kind*: REFUTED/BASELINE-RED/TIMEOUT/
+    # INFRA/SIGNAL all carry a captured tail (`ConfirmationResult.output`) worth
+    # keeping around; CONFIRMED and setup-stage inconclusives carry none, so
+    # this is simply a no-op for them (`write_confirmation_output` checks
+    # `.output` itself, and swallows `OSError`). Wrapped again here — this
+    # runs inside the reap loop, and this whole module's standing rule is that
+    # nothing in it may abandon a transition; a write failure must degrade to
+    # "no file", never to a dropped verdict.
+    try:
+        write_confirmation_output(parent_id, result)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "smoke %s: could not persist confirmation output for parent %s "
+            "(%s) — the fix briefing will fall back to the one-line reason "
+            "(#2563).",
+            transition.assignment_id, parent_id, exc,
         )
 
     if result.refuted:
@@ -2153,7 +2183,7 @@ def _record_smoke_verdict(
             # claim would leave no trace it ever happened — including on the
             # next reap of the same already-passed parent.
             state, reason = _confirmed_pass_verdict(
-                transition, entry,
+                transition, entry, parent_id,
                 claim_reason="worker self-recorded via `coord test` (#2217)",
             )
             record_test_verdict(
@@ -2228,7 +2258,8 @@ def _record_smoke_verdict(
         # never finished polling (#2272/#2301). Confirm it against a real run
         # before it becomes a merge-gate-satisfying verdict.
         state, reason = _confirmed_pass_verdict(
-            transition, entry, claim_reason="headless smoke reported SMOKE: pass",
+            transition, entry, parent_id,
+            claim_reason="headless smoke reported SMOKE: pass",
         )
         record_test_verdict(
             assignment_id=parent_id,

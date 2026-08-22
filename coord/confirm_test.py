@@ -333,6 +333,45 @@ class ConfirmationResult:
         return self.kind in INCONCLUSIVE_KINDS
 
 
+def write_confirmation_output(assignment_id: str, result: ConfirmationResult) -> Path | None:
+    """Persist a confirmation run's captured output tail for the fix briefing (#2563).
+
+    ``coord fix`` (:mod:`coord.commands.plan_followup`) already prefers
+    ``COORD_DIR/test_output/<assignment_id>.txt`` over every other evidence
+    source when it composes an escalated fix worker's briefing — `coord test
+    --fail --output` (:mod:`coord.commands.test_gate`) has written it there
+    since #1337. Before this function existed, a #2464 refutation captured
+    ``result.output`` (already bounded to a tail by :func:`_tail` in
+    :func:`_classify_failure` / :func:`_timeout_output`) and then only ever
+    handed it to ``log.warning`` — the fix worker got a one-line reason and no
+    failing test names, no tracebacks, and had to re-derive the diagnosis the
+    daemon already held in memory.
+
+    *assignment_id* is the parent **work** row's id (the one the fix leg is
+    spawned from), not the confirming smoke transition's id — same key
+    :func:`coord.commands.plan_followup.fix` reads back by.
+
+    A no-op, returning ``None``, when there is nothing to write (``KIND_OK``
+    and ``KIND_SETUP`` both carry an empty ``.output`` — the former because
+    nothing failed, the latter because no command ever ran) or when the write
+    itself fails (a read-only ``COORD_DIR``, a full disk, ...); this must
+    never break verdict recording, which is why the caller in
+    :mod:`coord.notify` treats it as best-effort.
+    """
+    if not result.output:
+        return None
+    from coord.state import COORD_DIR  # noqa: PLC0415
+
+    try:
+        test_output_dir = COORD_DIR / "test_output"
+        test_output_dir.mkdir(parents=True, exist_ok=True)
+        stored = test_output_dir / f"{assignment_id}.txt"
+        stored.write_text(result.output)
+    except OSError:
+        return None
+    return stored
+
+
 def confirmation_enabled(config=None) -> bool:
     """Whether Test-stage PASS claims get independently confirmed.
 
@@ -486,6 +525,29 @@ def unmet_confirmation_capabilities(
 
     have = set(getattr(here, "capabilities", None) or [])
     return [cap for cap in match_rules(touched, rules) if cap not in have]
+
+
+def _timeout_output(exc: subprocess.TimeoutExpired) -> str:
+    """Partial stdout/stderr captured before a confirmation command timed out.
+
+    ``subprocess.run(..., capture_output=True, timeout=...)`` fills ``.stdout``
+    / ``.stderr`` in on `TimeoutExpired` — the child had already written
+    *something* by the deadline — but the two `except subprocess.TimeoutExpired`
+    arms in :func:`confirm_branch` discarded it entirely, so a TIMEOUT verdict
+    carried strictly less evidence than BASELINE_RED/SIGNAL did even though the
+    same partial output was sitting right there on the exception (#2563).
+    Guards for ``None``/bytes since a test's stand-in *runner* seam may raise a
+    bare ``TimeoutExpired(cmd, timeout)`` with neither attribute set.
+    """
+    out = getattr(exc, "stdout", None) or ""
+    err = getattr(exc, "stderr", None) or ""
+    if isinstance(out, bytes):
+        out = out.decode("utf-8", errors="replace")
+    if isinstance(err, bytes):
+        err = err.decode("utf-8", errors="replace")
+    if not out and not err:
+        return ""
+    return _tail(out + "\n" + err)
 
 
 def _classify_failure(
@@ -741,7 +803,7 @@ def confirm_branch(
             echo(f"    confirming build: {build_command}")
             try:
                 built = run_cmd(build_command, wt_path, _left())
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as exc:
                 return ConfirmationResult(
                     kind=KIND_TIMEOUT,
                     reason=(
@@ -749,6 +811,7 @@ def confirm_branch(
                         "suite that did not finish says nothing about the "
                         "branch"
                     ),
+                    output=_timeout_output(exc),
                     command=build_command,
                     worktree=wt_path,
                 )
@@ -780,13 +843,14 @@ def confirm_branch(
         echo(f"    confirming tests: {test_command}")
         try:
             tested = run_cmd(test_command, wt_path, _left())
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
             return ConfirmationResult(
                 kind=KIND_TIMEOUT,
                 reason=(
                     f"confirmation suite timed out after {timeout}s — a "
                     "suite that did not finish says nothing about the branch"
                 ),
+                output=_timeout_output(exc),
                 command=test_command,
                 worktree=wt_path,
             )
@@ -835,4 +899,5 @@ __all__ = [
     "notify_client_timeout_seconds",
     "spend_confirmation_budget",
     "unmet_confirmation_capabilities",
+    "write_confirmation_output",
 ]
