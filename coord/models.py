@@ -292,14 +292,24 @@ WORK_LIKE_TYPES: frozenset[str] = frozenset({"work", "mock-author", "test-author
 # needs to be added in one place.
 SEALED_PATH_AUTHOR_TYPES: frozenset[str] = frozenset({"test-author", "mock-author"})
 
-# #2555: filename of the one sealed-acceptance file a `type="conflict-fix"`
-# dispatch is ever authorized to edit for a SEALED_PATH_AUTHOR_TYPES branch —
-# every milestone's `tests/acceptance/ms-NN/manifest.yml`, which every slice
-# under that milestone additively appends its own issue block to (see e.g.
-# `tests/acceptance/ms-33/manifest.yml`'s own header comment: "Merged (never
-# clobbered) across issues"). `coord.conflict_fix`'s sealed-author dispatch
-# branch and `coord.notify`'s stalled-pipeline confinement check both key off
-# this exact name, kept here as a single shared constant so they can't drift.
+# #2555: filename of the shared sealed-acceptance manifest a
+# `type="conflict-fix"` dispatch is authorized to edit additively for a
+# SEALED_PATH_AUTHOR_TYPES branch — every milestone's
+# `tests/acceptance/ms-NN/manifest.yml`. `coord.conflict_fix`'s sealed-author
+# dispatch branch and `coord.notify`'s stalled-pipeline confinement check
+# both key off this exact name, kept here as a single shared constant so they
+# can't drift.
+#
+# #2543: as of the per-issue manifest-fragment restructure, this file no
+# longer carries the routine per-issue `issues:`/`expected_red:` traffic
+# that used to make it a two-slice collision point — that now lives in
+# `tests/acceptance/ms-NN/manifest.d/<issue>.(yml|json)`, one file per issue,
+# which two different issues' slices can never textually conflict on (see
+# `coord.acceptance.MANIFEST_FRAGMENTS_DIRNAME`). This file is left as a
+# single shared manifest by choice, not oversight — it now holds only rare,
+# milestone-level, usually-hand-edited blocks (`gate_a:`, `exempt:`).
+# `coord.conflict_fix._is_sealed_manifest_path` recognizes fragment paths
+# too, for the legacy shape and the same-issue-retry edge case.
 SEALED_MANIFEST_FILENAME = "manifest.yml"
 
 # #1077: subset of WORK_LIKE_TYPES whose ``issue_number`` is the issue the PR

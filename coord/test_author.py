@@ -118,21 +118,29 @@ ADD that line. Do not rewrite, reorder, or delete anything already in the \
 file, and register nothing beyond your own new slice files. If the briefing \
 says the driver has no entry point, it discovers tests by directory and \
 there is nothing to wire.
-3. Update `tests/acceptance/ms-NN/manifest.(yml|json)` mapping every test id \
-you added/kept to its issue number, in either accepted shape:
+3. Write `tests/acceptance/ms-NN/manifest.d/<issue-number>.yml` — YOUR issue's \
+OWN manifest fragment file (#2543), mapping every test id you added/kept to \
+that issue number, in either accepted shape:
      tests: {<test-id>: <issue-number>, ...}
    or
      issues: {<issue-number>: [<test-id>, ...], ...}
-   Merge with the existing manifest rather than clobbering it — other \
-issues' slices may already be authored.
+   This file belongs to your issue and NO OTHER slice ever writes to it — \
+create it fresh, or overwrite it wholesale if it already exists from a prior \
+dispatch on this same branch, per the RESUMING guidance below if present. Do \
+NOT write to the shared `manifest.yml` in this directory (if one exists, it \
+carries only milestone-level `gate_a:`/`exempt:` declarations, not test/issue \
+data) and do NOT touch any OTHER issue's `manifest.d/<other-issue>.yml` — \
+each issue's fragment is its own file precisely so two slices writing at the \
+same time, or against stale bases, can never collide on one shared file.
 4. Your tests MUST be RED right now (the implementation doesn't exist yet). \
 Run the driver's run command yourself and confirm the new/changed tests \
 fail (not error out from a missing framework hookup) — a red suite that \
 doesn't even execute is not useful to the worker who inherits it. If the \
 run reports ZERO tests for your ids, your slice is not wired in (see 2b) — \
 that is a failure, not a pass.
-4b. Record `expected_red` in the manifest from what you JUST OBSERVED in \
-step 4 — not from what you intended to write. Add/merge, per issue:
+4b. Record `expected_red` in YOUR issue's own manifest fragment \
+(`manifest.d/<issue-number>.yml`, step 3) from what you JUST OBSERVED in \
+step 4 — not from what you intended to write:
      expected_red:
        <issue-number>:
          - <test-id that FAILED in your step-4 run>
@@ -293,7 +301,18 @@ def build_test_author_briefing(
     step 1c).
     """
     contract_path = f"{ACCEPTANCE_DIRNAME}/{ms_dir}/contract.md"
-    manifest_glob = f"{ACCEPTANCE_DIRNAME}/{ms_dir}/manifest.(yml|json)"
+    # #2543: per-issue manifest fragments — each issue writes ONLY its own
+    # `manifest.d/<issue>.yml`, never the shared `manifest.yml` (which now
+    # carries just milestone-level `gate_a:`/`exempt:` declarations, if any).
+    # In JIT mode the issue number is known, so name the exact file; in
+    # milestone mode point at the pattern, since one fragment per work-order
+    # issue is expected.
+    manifest_glob = (
+        f"{ACCEPTANCE_DIRNAME}/{ms_dir}/manifest.d/{issue_number}.(yml|json)"
+        if issue_number is not None
+        else f"{ACCEPTANCE_DIRNAME}/{ms_dir}/manifest.d/<issue-number>.(yml|json)"
+        " (one fragment file PER issue in the work-order list below)"
+    )
     mocks_glob = f"{ACCEPTANCE_DIRNAME}/{ms_dir}/mocks/{driver_mock}" if driver_mock else (
         f"{ACCEPTANCE_DIRNAME}/{ms_dir}/mocks/ (glob not declared)"
     )
@@ -344,15 +363,20 @@ def build_test_author_briefing(
             "MODE: full milestone authoring (Gate A). Author the initial red "
             f"acceptance suite under `{ACCEPTANCE_DIRNAME}/{ms_dir}/` covering "
             "the whole black-box surface in the contract, with at least one "
-            "test per issue in the work-order list above, and write the "
-            "manifest mapping every test id to its issue number."
+            "test per issue in the work-order list above, and write ONE "
+            "manifest fragment PER issue "
+            f"(`{ACCEPTANCE_DIRNAME}/{ms_dir}/manifest.d/<issue-number>.yml`, "
+            "#2543) mapping that issue's own test ids — never a single "
+            "manifest.yml covering all of them."
         )
     else:
         parts.append(
             f"MODE: just-in-time slice extension for issue #{issue_number}. "
             "Extend the existing suite with tests covering ONLY this issue's "
-            "slice of the black-box surface — leave other issues' tests as "
-            "they are, and merge (don't clobber) the manifest."
+            "slice of the black-box surface — leave other issues' tests, and "
+            "their manifest fragments, alone. Your manifest data goes ONLY in "
+            f"YOUR OWN `{ACCEPTANCE_DIRNAME}/{ms_dir}/manifest.d/"
+            f"{issue_number}.yml` (#2543)."
         )
         parts.append("")
         parts.append(f"ISSUE #{issue_number}: {issue_title or '(no title)'}")
@@ -368,19 +392,20 @@ def build_test_author_briefing(
             "the worktree mid-merge). This branch may already carry commits "
             "from a prior dispatch (see any note above about resuming "
             "unfinished work), and a sibling slice's PR may have merged "
-            f"into `{default_branch}` since this one was authored. If it "
-            "merges clean, proceed to commit/push as normal. If it "
-            "conflicts:\n"
+            f"into `{default_branch}` since this one was authored. Since "
+            "#2543, a sibling slice's manifest entries live in ITS OWN "
+            f"`manifest.d/<other-issue>.yml` — a different file from yours — "
+            "so that specific collision (two slices' manifest edits landing "
+            "in the same file) can no longer happen at all. If it merges "
+            "clean, proceed to commit/push as normal. If it conflicts:\n"
             f"  - Confined to `{ACCEPTANCE_DIRNAME}/{ms_dir}/**` (the sealed "
             "suite YOU already have authoring rights over) AND a clean "
-            "additive collision — the common case is two slices each "
-            "appending their own block to the shared "
-            "`manifest.(yml|json)` (that file documents its own "
-            "convention: later slices MERGE into it) — resolve it "
-            f"yourself: rebase onto `origin/{default_branch}` and keep BOTH "
-            "sides' additions, never dropping the other slice's entries to "
-            "make yours resolve. Re-run step 4's red-check afterward — a "
-            "rebase can shift what the tests see underneath them.\n"
+            "additive collision (e.g. an entry-point registration line "
+            "alongside a sibling's own) — resolve it yourself: rebase onto "
+            f"`origin/{default_branch}` and keep BOTH sides' additions, "
+            "never dropping the other slice's entries to make yours "
+            "resolve. Re-run step 4's red-check afterward — a rebase can "
+            "shift what the tests see underneath them.\n"
             "  - Anything else — a conflict that reaches outside "
             f"`{ACCEPTANCE_DIRNAME}/{ms_dir}/**`, or isn't a clean additive "
             "collision — do NOT guess a resolution. Abort the merge/rebase, "

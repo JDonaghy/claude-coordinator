@@ -162,6 +162,26 @@ class TestBuildBriefing:
         assert "Add foo" in briefing
         assert "Body text" in briefing
 
+    # ── #2543: per-issue manifest fragments ─────────────────────────────
+
+    def test_jit_mode_manifest_line_names_the_issues_own_fragment(self) -> None:
+        briefing = build_test_author_briefing(**self._kwargs(
+            issue_number=101, issue_title="Add foo", issue_body="Body text",
+        ))
+        assert "MANIFEST: tests/acceptance/ms-25/manifest.d/101.(yml|json)" in briefing
+        # Never points the author at the shared single-file manifest.
+        assert "MANIFEST: tests/acceptance/ms-25/manifest.(yml|json)" not in briefing
+
+    def test_milestone_mode_manifest_line_is_a_per_issue_pattern(self) -> None:
+        briefing = build_test_author_briefing(**self._kwargs())
+        assert "manifest.d/<issue-number>.(yml|json)" in briefing
+        assert "one fragment file PER issue" in briefing
+
+    def test_jit_mode_system_prompt_step_names_the_fragment_file(self) -> None:
+        assert "manifest.d/<issue-number>.yml" in TEST_AUTHOR_SYSTEM_PROMPT
+        assert "NO OTHER slice ever writes to it" in TEST_AUTHOR_SYSTEM_PROMPT
+        assert "Merge with the existing manifest" not in TEST_AUTHOR_SYSTEM_PROMPT
+
     # ── #2539: mergeability check + sealed-path conflict resolution ────────
 
     def test_jit_mode_includes_mergeability_check_against_default_branch(self) -> None:
@@ -184,16 +204,27 @@ class TestBuildBriefing:
         assert "git fetch origin main" in briefing
 
     def test_jit_mode_mergeability_instructs_sealed_path_resolution(self) -> None:
-        """The common case — two slices additively appending to the shared
-        manifest — is a mechanical rebase + keep-both, and must be spelled
-        out as something the author resolves itself, not escalates."""
+        """A clean additive collision confined to the sealed suite is a
+        mechanical rebase + keep-both, spelled out as something the author
+        resolves itself, not escalates."""
         briefing = build_test_author_briefing(**self._kwargs(
             issue_number=101, issue_title="Add foo", issue_body="Body text",
         ))
         assert "tests/acceptance/ms-25/**" in briefing
-        assert "manifest.(yml|json)" in briefing
         assert "keep BOTH" in briefing
         assert "rebase onto `origin/main`" in briefing
+
+    def test_jit_mode_mergeability_notes_fragments_eliminate_manifest_collisions(
+        self,
+    ) -> None:
+        """#2543: the JIT briefing tells the author WHY a sibling slice's
+        manifest edit can no longer collide with its own — each issue now
+        writes its own manifest.d/<issue>.yml fragment."""
+        briefing = build_test_author_briefing(**self._kwargs(
+            issue_number=101, issue_title="Add foo", issue_body="Body text",
+        ))
+        assert "#2543" in briefing
+        assert "manifest.d/<other-issue>.yml" in briefing
 
     def test_jit_mode_mergeability_refuses_conflicts_outside_sealed_scope(self) -> None:
         """A conflict reaching outside tests/acceptance/** (or one that isn't
