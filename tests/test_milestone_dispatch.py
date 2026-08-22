@@ -457,6 +457,66 @@ class TestIssueOracleReady:
         assert readiness.unsupported_kinds == ()
         assert readiness.reason is None
 
+    def test_ok_when_slice_authored_only_as_fragment(self) -> None:
+        """#2543 review: a JIT slice authored under the new per-issue-
+        fragment convention (`coord.test_author`'s briefing) writes ONLY
+        `manifest.d/<issue>.yml`, never the shared `manifest.yml`. Before
+        this fix `_fetch_manifest_data` only ever fetched the legacy
+        single-file manifest, so this exact fixture would read
+        `has_slice=False` forever and the #1138 hard gate would refuse Work
+        dispatch even though the slice is fully authored and merged."""
+        cfg = _oracle_cfg(kind="cli-pytest")
+        repo = cfg.repo("api")
+        fetch = _manifest_fetch({
+            "tests/acceptance/ms-37/manifest.d/1118.yml": "tests:\n  ms37::a: 1118\n",
+        })
+        readiness = issue_oracle_ready(
+            repo, cfg, 37, 1118,
+            file_exists=lambda *a: True, fetch_manifest=fetch,
+            fetch_gate_a_approval=_approval(),
+        )
+        assert readiness.applies is True
+        assert readiness.has_slice is True
+        assert readiness.unsupported_kinds == ()
+        assert readiness.reason is None
+
+    def test_fragment_for_another_issue_does_not_leak_has_slice(self) -> None:
+        """A sibling issue's fragment (a different, differently-keyed file)
+        must never make THIS issue read as having a slice — the whole
+        point of #2543 is that fragments can never collide OR leak into
+        each other."""
+        cfg = _oracle_cfg()
+        repo = cfg.repo("api")
+        fetch = _manifest_fetch({
+            "tests/acceptance/ms-37/manifest.d/999.yml": "tests:\n  ms37::a: 999\n",
+        })
+        readiness = issue_oracle_ready(
+            repo, cfg, 37, 1118,
+            file_exists=lambda *a: True, fetch_manifest=fetch,
+            fetch_gate_a_approval=_approval(),
+        )
+        assert readiness.has_slice is False
+        assert readiness.reason is not None
+
+    def test_slice_merges_legacy_manifest_and_fragment(self) -> None:
+        """A milestone-level `exempt:` block still lives in the shared
+        `manifest.yml` (#2543 keeps it there by choice) while THIS issue's
+        slice lives in its own fragment — both must be visible together."""
+        cfg = _oracle_cfg()
+        repo = cfg.repo("api")
+        fetch = _manifest_fetch({
+            "tests/acceptance/ms-37/manifest.yml": "exempt: [999]\n",
+            "tests/acceptance/ms-37/manifest.d/1118.yml": "tests:\n  ms37::a: 1118\n",
+        })
+        readiness = issue_oracle_ready(
+            repo, cfg, 37, 1118,
+            file_exists=lambda *a: True, fetch_manifest=fetch,
+            fetch_gate_a_approval=_approval(),
+        )
+        assert readiness.has_slice is True
+        assert readiness.exempt is False
+        assert readiness.reason is None
+
     def test_slice_mapped_to_different_issue_is_no_slice(self) -> None:
         cfg = _oracle_cfg()
         repo = cfg.repo("api")
@@ -569,12 +629,16 @@ class TestIssueOracleReady:
             file_exists=lambda *a: True, fetch_manifest=_fetch,
             fetch_gate_a_approval=_approval(),
         )
-        # The manifest probe order is unchanged; the contract read (#2063)
-        # rides the same fetch seam and lands after it.
+        # The legacy manifest probe order is unchanged; #2543 adds the
+        # per-issue fragment probe (same yml/yaml/json order) right after
+        # it, and the contract read (#2063) rides the same fetch seam.
         assert [c for c in calls if "manifest" in c] == [
             "tests/acceptance/ms-37/manifest.yml",
             "tests/acceptance/ms-37/manifest.yaml",
             "tests/acceptance/ms-37/manifest.json",
+            "tests/acceptance/ms-37/manifest.d/1118.yml",
+            "tests/acceptance/ms-37/manifest.d/1118.yaml",
+            "tests/acceptance/ms-37/manifest.d/1118.json",
         ]
         assert "tests/acceptance/ms-37/contract.md" in calls
         assert readiness.has_slice is True

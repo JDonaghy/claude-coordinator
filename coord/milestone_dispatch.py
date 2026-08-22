@@ -253,30 +253,73 @@ def _default_fetch_repo_file(repo_github: str, path: str, branch: str) -> str | 
 
 
 def _fetch_manifest_data(
-    repo_github: str, milestone_number: int, branch: str, fetch: ManifestFetch,
+    repo_github: str,
+    milestone_number: int,
+    branch: str,
+    fetch: ManifestFetch,
+    *,
+    issue_number: int | None = None,
 ):
+    """*milestone_number*'s manifest data via *fetch* (a raw-content GitHub
+    fetch, no local checkout, no directory listing) — the legacy single-file
+    ``manifest.(yml|yaml|json)`` (milestone-level ``gate_a:``/``exempt:``
+    blocks live here by choice, #2543), merged with *issue_number*'s own
+    ``manifest.d/<issue_number>.(yml|yaml|json)`` fragment
+    (:data:`coord.acceptance.MANIFEST_FRAGMENTS_DIRNAME`) when *issue_number*
+    is given.
+
+    #2543 review: before this, only the legacy file was ever fetched here,
+    so an issue whose JIT slice was authored under the new per-issue-
+    fragment convention (``coord.test_author``'s briefing writes ONLY to
+    the fragment, never the shared file) would read back
+    ``test_ids_for_issue(...) == set()`` forever — the #1138 hard gate
+    (:func:`issue_oracle_ready`) would refuse Work dispatch with "no
+    acceptance slice yet" even after the slice landed, and
+    :func:`coord.drive.AcceptanceGateChecker.has_authored_slice` (which
+    reads the same ``OracleReadiness.has_slice``) would keep believing no
+    slice was ever authored, re-dispatching a redundant ``test-author``
+    session — precisely the concurrent-JIT-authoring collision #2543 exists
+    to prevent, triggered by the fix itself. Fetching + merging the
+    fragment closes that gap. Callers that only need the milestone-level
+    blocks (:func:`gate_a_signoff_status`, which has no single issue in
+    scope) pass no *issue_number* and get exactly the legacy-only reads
+    this always did.
+    """
     from coord.acceptance import (  # noqa: PLC0415
         ACCEPTANCE_DIRNAME,
+        MANIFEST_FRAGMENTS_DIRNAME,
         ManifestData,
         ManifestError,
+        merge_manifest_data,
         ms_dirname,
         parse_manifest_text,
     )
 
+    def _fetch_one(dir_path: str, filename_stem: str) -> "ManifestData":
+        for ext in (".yml", ".yaml", ".json"):
+            path = f"{dir_path}/{filename_stem}{ext}"
+            content = fetch(repo_github, path, branch)
+            if content is None:
+                continue
+            try:
+                return parse_manifest_text(content, source=path)
+            except ManifestError:
+                # Malformed manifest degrades to "no slice authored" rather
+                # than crashing dispatch — same fail-soft posture as
+                # oracle_loop_contract_block (#945).
+                return ManifestData()
+        return ManifestData()
+
     ms_dir = ms_dirname(milestone_number)
-    for ext in (".yml", ".yaml", ".json"):
-        path = f"{ACCEPTANCE_DIRNAME}/{ms_dir}/manifest{ext}"
-        content = fetch(repo_github, path, branch)
-        if content is None:
-            continue
-        try:
-            return parse_manifest_text(content, source=path)
-        except ManifestError:
-            # Malformed manifest degrades to "no slice authored" rather
-            # than crashing dispatch — same fail-soft posture as
-            # oracle_loop_contract_block (#945).
-            return ManifestData()
-    return ManifestData()
+    legacy = _fetch_one(f"{ACCEPTANCE_DIRNAME}/{ms_dir}", "manifest")
+    if issue_number is None:
+        return legacy
+
+    fragment = _fetch_one(
+        f"{ACCEPTANCE_DIRNAME}/{ms_dir}/{MANIFEST_FRAGMENTS_DIRNAME}",
+        str(issue_number),
+    )
+    return merge_manifest_data(legacy, fragment)
 
 
 def _unsupported_driver_kinds(entry: "AcceptanceDriverConfig") -> tuple[str, ...]:
@@ -516,6 +559,7 @@ def issue_oracle_ready(
 
     manifest = _fetch_manifest_data(
         repo_cfg.github, milestone_number, repo_cfg.default_branch, fetch,
+        issue_number=issue_number,
     )
     has_slice = bool(test_ids_for_issue(manifest.tests, issue_number))
     exempt = issue_number in manifest.exempt or "oracle:exempt" in set(issue_labels)
