@@ -3180,18 +3180,33 @@ def plan_tick(
     the #2158 ceiling included — see
     :func:`coord.commands.drive_queue._fetch_live_ci_gate` for the shell
     side, which computes this ONLY for the bounded set of entries currently
-    `parked` on a CI reason, never the whole queue.
+    `parked` on a CI reason, never the whole queue. `True` is NOT simply
+    "stay parked" any more (#2556): it means the fresh read isn't
+    ``PLAN_READY``, which is true both while checks are still genuinely in
+    flight (or mid one of their own bounded self-refreshing windows —
+    :func:`~coord.merge_queue.is_ci_pending_reason`/`is_ci_infra_reason`/
+    `is_ci_flaky_reason`/`is_ci_unreadable_reason`, stay parked) AND once
+    they have reported a TERMINAL verdict against the code (a plain "CI
+    failed: ..." reading with none of those prefixes — resume instead, so a
+    completed, failing run can never be indistinguishable from a slow one).
+    See *live_ci_gate_reason* just below, which is what makes that
+    distinction possible.
 
-    *live_ci_gate_reason* (#2347) is *live_ci_gate*'s companion: the reason
-    text the SAME fresh `entry_gate_status` call returned, for entries whose
-    reading is STILL blocked. Never used to decide whether to resume (that
-    remains `live_ci_gate`'s job) — only to rewrite a still-parked entry's
-    `last_reason` when the fresh reading is `CI_UNREADABLE_PREFIX`-shaped and
-    differs from what is currently stored, so `coord drive-queue list`/
-    `status` shows "GitHub could not be reached" the moment that becomes the
-    real cause, instead of silently keeping whatever reason the entry
-    happened to park on originally (which #1891/#1892/#2252's "still shut ⇒
-    no reconcile, no write" rule would otherwise leave frozen indefinitely —
+    *live_ci_gate_reason* (#2347, extended by #2556) is *live_ci_gate*'s
+    companion: the reason text the SAME fresh `entry_gate_status` call
+    returned, for entries whose reading is STILL not `PLAN_READY`. #2556
+    gives it a first, decisive job: when this text carries none of the
+    self-refreshing prefixes (`is_ci_pending_reason`/`is_ci_infra_reason`/
+    `is_ci_flaky_reason`/`is_ci_unreadable_reason`), `live_ci_gate`'s `True`
+    is overridden into a resume — see `plan_tick`'s body. When it DOES carry
+    one of those prefixes, this reason is used the pre-#2556 way: only to
+    rewrite a still-parked entry's `last_reason` when the fresh reading is
+    `CI_UNREADABLE_PREFIX`-shaped and differs from what is currently stored,
+    so `coord drive-queue list`/`status` shows "GitHub could not be reached"
+    the moment that becomes the real cause, instead of silently keeping
+    whatever reason the entry happened to park on originally (which
+    #1891/#1892/#2252's "still shut ⇒ no reconcile, no write" rule would
+    otherwise leave frozen indefinitely —
     see the issue for the observed incident: a stale "CI running: ..."
     reason surviving a run of transient GitHub API 503s for most of
     `PARK_STALE_SECONDS` with no operator-visible signal of the real cause).
@@ -3524,6 +3539,65 @@ def plan_tick(
         live_override = (live_ci_gate or {}).get(entry.key)
         if live_override is not None:
             if live_override:
+                live_reason = (live_ci_gate_reason or {}).get(entry.key)
+                # #2556: `live_override=True` only means the FRESH read
+                # taken THIS tick isn't PLAN_READY — but "not ready" folds
+                # together two very different facts. One is "checks are
+                # genuinely still in flight" (`is_ci_pending_reason`), or one
+                # of the other self-refreshing, no-verdict-yet classes
+                # (`is_ci_infra_reason`'s verdictless failure mid its own
+                # bounded auto-rerun, `is_ci_flaky_reason`'s one-shot re-run
+                # to rule out a flake, `is_ci_unreadable_reason`'s bare
+                # GitHub-unreachable read, handled specially just below) —
+                # for all of these, "still shut ⇒ stay parked" (#1891/#2182)
+                # is exactly right, because there is no fresh verdict to act
+                # on yet. The other is "checks already reported a TERMINAL
+                # verdict against the code" — a plain "CI failed: ..."
+                # reading carrying none of those prefixes. This entry's own
+                # park message promises "the queue resumes it automatically
+                # once they do [report]" — a completed, failing run
+                # satisfies that in every ordinary reading, so staying
+                # parked on it forever (as every prior tick did — the #2158
+                # staleness ceiling never even runs, because it only applies
+                # when `live_override` is absent) is the bug: a red CI on a
+                # parked row was indistinguishable from a slow CI on one,
+                # unboundedly. Resume here exactly like the "reads READY"
+                # branch below (no attempt spent — a fresh GitHub read is
+                # not a failed launch attempt) so this falls straight into
+                # the SAME `waiting` walk, on the SAME tick; whatever
+                # relaunches `coord drive` finds the terminal CI reading and
+                # routes it through `_decide_merge`'s existing checks_failed
+                # handling (dispatch a fix, or block with a real reason) —
+                # exactly the path any other red-CI entry already takes.
+                if live_reason and not (
+                    is_ci_pending_reason(live_reason)
+                    or is_ci_infra_reason(live_reason)
+                    or is_ci_flaky_reason(live_reason)
+                    or is_ci_unreadable_reason(live_reason)
+                ):
+                    reason = (
+                        f"live re-check of {entry.key}'s gate this tick "
+                        f"reads a terminal, non-pending result ({live_reason}) "
+                        "— resuming from parked without spending an attempt "
+                        "so the normal checks_failed handling can take over "
+                        "(#2556)"
+                    )
+                    reconciles.append(
+                        Reconcile(
+                            entry.key,
+                            "resumed",
+                            reason,
+                            occupies=False,
+                            updates={
+                                "state": STATE_WAITING,
+                                "attempts": 0,
+                                "last_reason": reason,
+                            },
+                        )
+                    )
+                    states[entry.key] = STATE_WAITING
+                    effective_attempts[entry.key] = 0
+                    continue
                 # #2347: CONFIRMED still blocked — but if the FRESH reading
                 # taken THIS tick says the real cause is "GitHub could not
                 # be reached" (not a real CI verdict) and that differs from
@@ -3535,7 +3609,6 @@ def plan_tick(
                 # rule does for every other still-blocked reading. State
                 # stays `parked`, no attempt spent — this changes only what
                 # the operator is told, never the decision.
-                live_reason = (live_ci_gate_reason or {}).get(entry.key)
                 if (
                     live_reason
                     and is_ci_unreadable_reason(live_reason)

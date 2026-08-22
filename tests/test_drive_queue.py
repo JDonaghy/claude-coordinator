@@ -2323,6 +2323,96 @@ def test_plan_tick_does_not_rewrite_a_still_pending_reason_as_unreadable():
     assert not any(r.key == entry_key(REPO, 2347) for r in plan.reconciles)
 
 
+# ── #2556: a terminal (not just pending) live CI reading must resume a
+# `parked` entry, and must do so even at capacity ──────────────────────────
+#
+# The gap #2347 left behind: `live_ci_gate[key] = True` means only "the fresh
+# read isn't PLAN_READY" — true both while checks are still genuinely running
+# AND once they've reported a confirmed FAILURE. Before this, both shapes hit
+# the same "still shut ⇒ stay parked" branch, and only the narrower
+# `CI_UNREADABLE_PREFIX` shape got its `last_reason` rewritten. A completed,
+# failing run was therefore indistinguishable from a slow one — coord-portal
+# #131 sat parked 1h40m past its watched check reporting FAILURE, with the
+# `last_reason` still reading "CI running: ..." the whole time.
+
+
+def test_a_parked_entry_resumes_on_a_confirmed_ci_failure():
+    """The core regression: a fresh, terminal ("CI failed: ...") live reading
+    must resume the entry from `parked`, not re-confirm the park — so it
+    falls into the normal `waiting`/launch path and a relaunched `coord
+    drive` can route it through the existing checks_failed handling."""
+    entries = [
+        entry(
+            2556, position=3, state="parked", attempts=0,
+            last_reason="CI running: e2e smoke (playwright), launched 2789s ago",
+        )
+    ]
+    live_reason = "CI failed: e2e smoke (playwright) (FAILURE)"
+    plan = plan_tick(
+        entries, board(), capacity=1, now=NOW,
+        live_ci_gate={entry_key(REPO, 2556): True},
+        live_ci_gate_reason={entry_key(REPO, 2556): live_reason},
+    )
+    resumed = [r for r in plan.reconciles if r.key == entry_key(REPO, 2556)]
+    assert [r.outcome for r in resumed] == ["resumed"]
+    assert resumed[0].updates["state"] == STATE_WAITING
+    # No attempt spent — a fresh GitHub read is not a failed launch attempt.
+    assert resumed[0].updates["attempts"] == 0
+    assert "CI failed" in resumed[0].updates["last_reason"]
+    # Falls straight into this SAME tick's launch selection.
+    assert plan.launch is not None and plan.launch.issue == 2556
+
+
+def test_a_parked_entry_resumes_on_confirmed_ci_failure_even_at_capacity():
+    """Acceptance: this re-evaluation happens even when the fleet is fully
+    occupied — #1891 step 1b runs before the capacity check, not after, so a
+    full fleet must never freeze a parked row that has real evidence to act
+    on."""
+    running = running_since(1762, 5.0)
+    parked = entry(
+        2556, position=3, state="parked", attempts=0,
+        last_reason="CI running: e2e smoke (playwright), launched 2789s ago",
+    )
+    live_reason = "CI failed: e2e smoke (playwright) (FAILURE)"
+    plan = plan_tick(
+        [running, parked],
+        board(sessions=(1762,)),
+        capacity=1,  # the one slot is already occupied by `running`
+        now=NOW,
+        live_ci_gate={entry_key(REPO, 2556): True},
+        live_ci_gate_reason={entry_key(REPO, 2556): live_reason},
+    )
+    assert plan.occupied == 1
+    assert plan.free_slots == 0
+    resumed = [r for r in plan.reconciles if r.key == entry_key(REPO, 2556)]
+    assert [r.outcome for r in resumed] == ["resumed"]
+    assert resumed[0].updates["state"] == STATE_WAITING
+    # No free slot, so nothing launches this tick — but the row itself has
+    # left `parked`, which is the whole point: it no longer wedges silently.
+    assert plan.launch is None
+
+
+def test_a_parked_entry_still_stays_parked_while_genuinely_pending():
+    """Baseline unchanged: a fresh reading that is STILL `CI_PENDING_PREFIX`
+    shaped (checks exist, still running) must not be mistaken for a terminal
+    read — this is the ordinary #1891/#2182 "still shut" case."""
+    entries = [
+        entry(
+            2556, position=3, state="parked", attempts=0,
+            last_reason="CI running: e2e smoke (playwright), launched 2789s ago",
+        )
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=1, now=NOW,
+        live_ci_gate={entry_key(REPO, 2556): True},
+        live_ci_gate_reason={
+            entry_key(REPO, 2556): "CI running: e2e smoke (playwright)"
+        },
+    )
+    assert not any(r.key == entry_key(REPO, 2556) for r in plan.reconciles)
+    assert plan.launch is None
+
+
 # ── #2158: a park that cannot refresh itself must age out ──────────────────
 
 

@@ -1835,6 +1835,15 @@ def _green_check(name: str = "test (3.12)"):
     )
 
 
+def _failed_check(name: str = "test (3.12)"):
+    from coord.ci_store import CheckRun
+
+    return CheckRun(
+        name=name, status="completed", conclusion="failure",
+        url="", run_id="1", started_at=100.0, completed_at=160.0,
+    )
+
+
 def _running_check(name: str = "test (3.12)"):
     from coord.ci_store import CheckRun
 
@@ -1912,6 +1921,45 @@ def test_a_parked_entry_with_ci_still_genuinely_running_stays_parked(
         assert len(launches) == 1, launches  # no second launch, ever
 
     assert "1 parked" in cli_no_gates("status").output
+
+
+def test_a_parked_entry_resumes_once_ci_reports_a_confirmed_failure(
+    cli_no_gates, seed, launches, coord_db, live_ci_backend,
+):
+    """#2556, reproduced rather than injected.
+
+    coord-portal#131 (live, 2026-08-22): a row parked on "CI running: e2e
+    smoke (playwright)" never noticed the check it was watching completed as
+    FAILURE — it stayed `parked`, with `last_reason` still reading "CI
+    running: ..." over an hour after the run finished. The #2182 live
+    re-check correctly asks GitHub again every tick, but collapsed "still
+    running" and "confirmed failed" into the same "stay parked" branch,
+    because both merely fail to read `PLAN_READY`. A completed run — even a
+    red one — satisfies this entry's own park promise ("the queue resumes it
+    automatically once they do [report]"); it must resume and let the normal
+    `waiting`/launch path route the failure through `coord drive`'s existing
+    checks_failed handling, exactly like any other red-CI entry.
+    """
+    _park_with_pr(cli_no_gates, seed, coord_db)
+    assert "CI running" in (queued(2159)["last_reason"] or "")
+
+    live_ci_backend([_failed_check()])
+
+    result = cli_no_gates("tick")
+    assert result.exit_code == 0, result.output
+    # The resume itself is visible in this tick's own reconcile line — the
+    # entry then launches in the SAME tick (like the #2182 green-check case
+    # above), which clears `last_reason` to "" on success, so the CI-failed
+    # reading is only observable in the tick's rendered output, not the
+    # post-launch row.
+    assert "resumed" in result.output
+    assert "CI failed" in result.output
+    entry = queued(2159)
+    assert entry["state"] != "parked", entry  # no longer wedged
+    assert entry["attempts"] == 0  # #1891/#2273: still free — no attempt spent
+    assert len(launches) == 2, launches  # resumed straight into a fresh launch
+
+    assert "parked" not in cli_no_gates("status").output
 
 
 def test_a_parked_entrys_reason_is_corrected_when_github_is_unreachable(
