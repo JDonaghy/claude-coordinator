@@ -1525,6 +1525,41 @@ def is_ci_flaky_reason(reason: str | None) -> bool:
     return (reason or "").startswith(CI_FLAKY_PREFIX)
 
 
+def is_ci_terminal_reason(reason: str | None) -> bool:
+    """True when *reason* is a CONCLUDED CI verdict — a plain "checks
+    failed: ..." (or similarly final) reading carrying none of the four
+    self-refreshing, no-verdict-yet prefixes above (#2556).
+
+    ``not is_ci_terminal_reason(r)`` is exactly "this reading is still
+    genuinely in flight, or mid one of its own bounded self-refreshing
+    windows, and answers nothing yet about whether the code is any good" —
+    :func:`is_ci_pending_reason` (checks exist and are still running),
+    :func:`is_ci_infra_reason` (a check completed but said nothing about the
+    code, mid its own auto-rerun), :func:`is_ci_flaky_reason` (a real
+    verdict, but only observed once, mid its one-shot re-run to rule out a
+    flake), or :func:`is_ci_unreadable_reason` (GitHub could not even be
+    asked the question). Anything else — most commonly a plain "checks
+    failed: ..." with none of those prefixes — is terminal: a concluded
+    result the queue can act on now, never indistinguishable from a slow or
+    still-resolving one.
+
+    The single implementation of this classification. Two call sites used to
+    each spell out the identical four-way disjunction inline — a `parked`
+    entry's "is this still self-refreshing?" gate in this module's own
+    `process()`, and `coord.drive_queue.plan_tick`'s #2556 resume-on-
+    terminal-failure branch — which is exactly the "two independent
+    implementations that agree today are a split-brain waiting to happen"
+    shape this repo's own review checklist warns against. Call this instead
+    of re-deriving the disjunction at a new call site.
+    """
+    return not (
+        is_ci_pending_reason(reason)
+        or is_ci_infra_reason(reason)
+        or is_ci_flaky_reason(reason)
+        or is_ci_unreadable_reason(reason)
+    )
+
+
 # #1892: auto-reruns `process()` will trigger for a single entry's verdictless
 # CI failure (via `CiStore.rerun_for_pr`) before giving up and parking it for
 # a human instead of the queue's own #1891 machinery. A workflow genuinely

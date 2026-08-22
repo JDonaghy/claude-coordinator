@@ -1916,14 +1916,21 @@ def _fetch_live_ci_gate(
     gate ``coord merge --plan`` computes, taken live, right now, this tick
     (#2182).
 
-    The second dict (#2347) carries the reason text
+    The second dict (#2347, extended by #2556) carries the reason text
     :func:`coord.merge_queue.entry_gate_status` returned alongside each
-    still-blocked verdict — used ONLY to let :func:`coord.drive_queue.
-    plan_tick` rewrite a still-``parked`` entry's ``last_reason`` when the
-    fresh reading is specifically "GitHub unreachable"
-    (``is_ci_unreadable_reason``) and differs from what is currently stored;
-    see that function's ``live_ci_gate_reason`` parameter. Never consulted
-    to decide whether to resume — that remains the first dict's job alone.
+    still-blocked verdict, and is handed to :func:`coord.drive_queue.
+    plan_tick` as its ``live_ci_gate_reason`` parameter, which now gives it
+    a first, decisive job (#2556): when this text carries none of the
+    self-refreshing prefixes (``is_ci_pending_reason``/``is_ci_infra_reason``/
+    ``is_ci_flaky_reason``/``is_ci_unreadable_reason``), ``plan_tick``
+    overrides the first dict's still-blocked verdict into a resume — a
+    completed, *failing* CI run must never be indistinguishable from a slow
+    one. When it DOES carry one of those prefixes, this reason is used the
+    pre-#2556 way: only to rewrite a still-``parked`` entry's
+    ``last_reason`` when the fresh reading is specifically "GitHub
+    unreachable" (``is_ci_unreadable_reason``) and differs from what is
+    currently stored. See ``plan_tick``'s own ``live_ci_gate_reason``
+    docstring for the full account.
 
     THE GAP THIS CLOSES. On the daemon host — the only machine that ever
     runs this tick (``docs/AGENT_OPERATIONS.md``) — ``_fetch_board_view``
