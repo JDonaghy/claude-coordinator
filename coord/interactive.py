@@ -732,6 +732,117 @@ def _with_coord_on_path(shell_cmd: str) -> str:
     return f'export PATH="$HOME/.coord-venv/bin:$PATH"; {shell_cmd}'
 
 
+def _capture_pane_history(
+    session_name: str,
+    *,
+    host: TmuxHost = TmuxHost(None),
+    timeout: float = 10.0,
+) -> str | None:
+    """Return *session_name*'s full pane scrollback via ``tmux capture-pane
+    -p -S -`` (``-S -`` starts the capture at the beginning of the pane's
+    history, not just the visible screen), or ``None`` when there is
+    nothing usable to persist (tmux/session gone, subprocess error,
+    non-zero exit, blank pane, or a non-string ``stdout`` — e.g. a test's
+    generic ``subprocess.run`` mock left it as an unconfigured
+    ``MagicMock``). Best-effort — callers must treat ``None`` as "nothing
+    to persist", never as fatal.
+    """
+    try:
+        result = subprocess.run(
+            host.cmd(["capture-pane", "-p", "-t", session_name, "-S", "-"]),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    stdout = result.stdout
+    if not isinstance(stdout, str) or not stdout.strip():
+        return None
+    return stdout
+
+
+def _persist_interactive_pane_log(
+    assignment_id: str,
+    session_name: str,
+    *,
+    host: TmuxHost = TmuxHost(None),
+) -> None:
+    """Best-effort: snapshot *session_name*'s pane scrollback to the
+    conventional per-assignment log path so a launch is diagnosable via
+    ``coord log <assignment_id>`` without a manual SSH repro (#2541).
+
+    Human-attended ssh+tmux interactive sessions (``--merge-of``,
+    ``--fix-of``, ``--rework-of``, ``--review-of``, ``--smoke-of``, …)
+    never went through this agent's ``/assign`` HTTP path — the
+    coordinator SSHes in directly and drives ``claude`` inside a tmux
+    session it manages itself — so no log file existed anywhere for them.
+    A launch that crashed before the operator ever got to attach (the
+    #2541 root cause: an unhandled first-run prompt in a worktree
+    ``claude`` had never seen before) left `coord log` reporting "no log
+    for assignment" with no way to reconstruct what the operator would
+    have seen, short of manually reproducing it by hand.
+
+    Written to the SAME machine ``coord log <id>`` resolves for
+    *assignment_id* (the assignment's recorded ``machine_name``):
+
+    * **Local** (``host.ssh_target is None``): directly under this
+      machine's ``DEFAULT_STATE_DIR/logs/`` — the exact path
+      ``coord/commands/sessions.py::_log_local`` reads.
+    * **Remote**: under ``$HOME/.coord/logs/`` on *that* machine (mirrors
+      the ``$HOME/.coord/worktrees`` convention already used for remote
+      interactive launches elsewhere in this module) — the path
+      ``coord/agent_app.py``'s ``/logs/{id}`` handler falls back to
+      reading directly when the assignment was never registered with
+      that agent's in-memory state.
+
+    A single ssh round-trip captures AND writes entirely on the remote
+    host, rather than relaying the (potentially large) scrollback back to
+    the coordinator only to ship it out again. Never raises — a failure
+    to persist diagnostics must not affect the launch itself, and this is
+    a point-in-time snapshot (taken once, after attach returns), not a
+    live stream.
+    """
+    header = (
+        f"# coord: captured tmux pane for session {session_name!r} "
+        f"(assignment {assignment_id}) -- human-attended interactive "
+        "launch log (#2541); a point-in-time snapshot of the pane's "
+        "scrollback, not a live stream.\n"
+    )
+
+    if host.ssh_target is None:
+        pane_text = _capture_pane_history(session_name, host=host)
+        if pane_text is None:
+            return
+        try:
+            from coord.agent import DEFAULT_STATE_DIR  # noqa: PLC0415
+
+            log_dir = DEFAULT_STATE_DIR / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            (log_dir / f"{assignment_id}.log").write_text(header + pane_text)
+        except OSError:
+            pass
+        return
+
+    sname_q = shlex.quote(session_name)
+    header_q = shlex.quote(header)
+    remote_cmd = (
+        "mkdir -p $HOME/.coord/logs && "
+        f"{{ printf %s {header_q}; tmux capture-pane -p -t {sname_q} -S -; }} "
+        f"> $HOME/.coord/logs/{assignment_id}.log 2>/dev/null"
+    )
+    try:
+        subprocess.run(
+            ["ssh", *_SSH_MUX_OPTS, host.ssh_target, remote_cmd],
+            capture_output=True,
+            timeout=10.0,
+        )
+    except (subprocess.SubprocessError, OSError):
+        pass
+
+
 def _launch_via_tmux(
     argv: Sequence[str],
     briefing: str,
@@ -747,16 +858,20 @@ def _launch_via_tmux(
     *session_name* is provided (#487).  The strategy:
 
     1. If the session does not already exist, create it with
-       ``tmux new-session -d`` running ``argv`` as the session command.
-       The briefing is then injected via
+       ``tmux new-session -d`` running ``argv`` as the session command,
+       then set ``remain-on-exit on`` (#2541) so that if ``argv`` exits
+       (crashes, or is killed) before the operator ever attaches — e.g.
+       ``claude`` choking on a first-run/onboarding prompt in a worktree it
+       has never run in before — the pane's last-rendered screen stays up
+       and inspectable instead of tmux tearing the whole session down
+       instantly (a single-pane session's pane-death is otherwise
+       session-death). The briefing is then injected via
        :func:`_inject_briefing_into_tmux_session`.
     2. If the session already exists (reattach after TUI crash), skip
        creation and injection — the session is already running.
     3. On fresh creation, a ``pane-died`` hook is set on the session
        (#1102) so an unintended pane death (e.g. an accidental kill-pane)
-       has a chance to surface via ``display-message`` rather than the
-       session just silently vanishing — best-effort, since a single-pane
-       session's pane-death and session-death are simultaneous.
+       has a chance to surface via ``display-message``.
     4. Immediately before attaching (both fresh and reuse), print
        :data:`TMUX_ATTACH_WARNING` to the operator's terminal so the
        kill-vs-detach distinction is the last thing they read before tmux
@@ -765,6 +880,12 @@ def _launch_via_tmux(
        ``tmux attach-session -t <session_name>``.  If the TUI process is
        killed (e.g. SIGHUP on TUI crash), only the *attach* subprocess
        dies; the tmux session and ``claude`` inside it keep running.
+    6. Regardless of outcome, persist a snapshot of the pane's scrollback
+       via :func:`_persist_interactive_pane_log` (#2541) to the
+       conventional per-assignment log path, so ``coord log
+       <assignment_id>`` has something to show even for a launch that
+       never made it to a human — before this, these sessions wrote no
+       log at all.
 
     Returns ``tmux attach-session``'s exit code (typically ``0`` for both
     clean exits and user-initiated detach with ``Ctrl-b d``).  Callers
@@ -862,12 +983,39 @@ def _launch_via_tmux(
             # Session creation failed (name collision, tmux daemon error, …).
             return None  # signal caller to fall back to PTY relay
 
+        # #2541: keep the pane (and therefore the session — a coord session
+        # has exactly one pane, so pane-death is normally session-death) up
+        # after ``claude`` exits, instead of tmux tearing the whole session
+        # down the instant the child dies.  Without this, a crash during the
+        # UNATTENDED window between `new-session -d` and the operator's
+        # attach (e.g. claude choking on a first-run/onboarding prompt in a
+        # worktree it has never seen before) destroyed the session before
+        # the human ever got a chance to attach and see what happened — the
+        # attach below would then fail outright ("session not found") with
+        # no way to diagnose it short of a manual SSH repro. With
+        # ``remain-on-exit`` the dead pane's last-rendered screen (the
+        # prompt, a stack trace, whatever) stays inspectable via attach OR
+        # via ``tmux capture-pane`` (see the pane-log persist below), and
+        # ``tmux_pane_dead()`` — already used throughout this module and
+        # ``coord/commands/sessions.py`` to distinguish "still running" from
+        # "claude finished, session is an empty shell" — finally has a real
+        # dead-pane-but-alive-session state to detect instead of never firing
+        # for a single-pane session. Best-effort: a failure to set this
+        # option leaves the pre-#2541 behaviour, it does not fail the launch.
+        try:
+            subprocess.run(
+                host.cmd(["set-option", "-t", session_name, "remain-on-exit", "on"]),
+                capture_output=True,
+                timeout=5.0,
+            )
+        except (subprocess.SubprocessError, OSError):
+            pass
+
         # #1102: best-effort operator-facing signal if the pane dies while
         # attached (e.g. an accidental kill-pane) rather than the session
-        # just silently vanishing.  Since a coord session has exactly one
-        # pane, pane-death and session-death are simultaneous, so this
-        # ``display-message`` may not always be visible before tmux tears
-        # the session down — it's cheap, harmless, and worth setting
+        # just silently vanishing.  With ``remain-on-exit`` (above) the
+        # session generally survives long enough for this ``display-message``
+        # to actually be seen, but it's cheap, harmless, and worth setting
         # regardless (attached-but-not-focused clients, slower teardown on
         # some tmux versions, etc. all still benefit).  Failure to set the
         # hook is non-fatal to the session itself.
@@ -958,9 +1106,24 @@ def _launch_via_tmux(
         else:
             cmd = list(host.cmd(["attach-session", "-t", session_name], tty=True))
         attach_result = subprocess.run(cmd)
-        return attach_result.returncode
+        rc = attach_result.returncode
     except (subprocess.SubprocessError, OSError):
-        return 1
+        rc = 1
+
+    # #2541: persist a snapshot of the pane's scrollback to the same
+    # conventional per-assignment log path `coord log <assignment_id>`
+    # reads from, regardless of how this launch turned out.  Before this,
+    # a human-attended tmux session left NO log at all — `coord log`
+    # reported "no log for assignment" even for a launch that crashed
+    # before the operator ever got to see a screen, and diagnosing it
+    # required manually SSHing in and reproducing by hand. Best-effort and
+    # unconditional (not just on a suspicious exit code): the point is
+    # that the *next* unrelated launch failure shouldn't need a manual
+    # repro either.
+    _persist_interactive_pane_log(
+        session_name[len(TMUX_SESSION_PREFIX):], session_name, host=host,
+    )
+    return rc
 
 
 # ── Quiescence constants for the PTY relay path ───────────────────────────────
@@ -4179,11 +4342,14 @@ def reap_stale_interactive_sessions(
         if moved is not None and terminal_status == "advisory":
             moved.status = "advisory"
 
-        # 4a. (Dead-pane only) Kill the now-empty tmux session so it disappears
-        #     from ``coord sessions`` immediately.  Best-effort — if kill fails
-        #     the session will be gone on its own eventually (or the operator
-        #     can kill it manually).
+        # 4a. (Dead-pane only) Snapshot the pane for `coord log` (#2541) —
+        #     `remain-on-exit` is what keeps it capturable at all — then
+        #     kill the now-empty tmux session so it disappears from
+        #     ``coord sessions`` immediately.  Both best-effort — if kill
+        #     fails the session will be gone on its own eventually (or the
+        #     operator can kill it manually).
         if _dead_pane_kill_needed:
+            _persist_interactive_pane_log(a.assignment_id, sname)
             try:
                 subprocess.run(
                     ["tmux", "kill-session", "-t", sname],
@@ -4371,12 +4537,29 @@ def reap_stale_remote_interactive_sessions(
         sname = tmux_session_name(a.assignment_id)
         tmux_host = TmuxHost(ssh_target=machine.host, batch=True)
         alive, ssh_ok = _probe_remote_tmux_alive(sname, tmux_host)
+        _dead_pane_kill_needed = False
 
         if alive:
-            # Session is genuinely running — clear any unreachable counter
-            # accumulated from prior SSH hiccups.
-            _REMOTE_SSH_UNREACHABLE_COUNTS.pop(a.assignment_id, None)
-            continue
+            # #2541: `remain-on-exit` (now set at session-creation time,
+            # see `_launch_via_tmux`) keeps a crashed/finished session's
+            # pane around instead of tmux tearing the session down with
+            # it — so `has-session` alone no longer proves the
+            # human-attended agent is still running. Distinguish a
+            # genuinely live pane from a dead one exactly the way
+            # `reap_stale_interactive_sessions` (the local complement)
+            # already does via `tmux_pane_dead`, so a remote session that
+            # crashed hours ago isn't treated as "still alive" forever
+            # once it clears the age gate above.
+            if not tmux_pane_dead(sname, host=tmux_host):
+                # Session is genuinely running — clear any unreachable
+                # counter accumulated from prior SSH hiccups.
+                _REMOTE_SSH_UNREACHABLE_COUNTS.pop(a.assignment_id, None)
+                continue
+            # Pane dead, session still up (remain-on-exit) — snapshot it
+            # for `coord log` before it's reaped below, then fall through
+            # to the same "reap it" path as a fully-gone session.
+            _persist_interactive_pane_log(a.assignment_id, sname, host=tmux_host)
+            _dead_pane_kill_needed = True
 
         if not ssh_ok:
             # SSH transport failure — host may be rebooting, not crashed.
@@ -4468,6 +4651,21 @@ def reap_stale_remote_interactive_sessions(
             # fall back to a bare DB mark so the machine slot is freed.
             terminal_status = "failed"
             _mark_stale_reap_in_db(a.assignment_id, terminal_status, now)
+
+        # #2541: the dead-pane case leaves an empty ``remain-on-exit``
+        # session on the remote host — kill it now that its pane has been
+        # captured and the assignment finalized, so `coord sessions`
+        # doesn't accumulate dead shells indefinitely. Best-effort; a
+        # failure here doesn't affect the reap outcome above.
+        if _dead_pane_kill_needed:
+            try:
+                subprocess.run(
+                    tmux_host.cmd(["kill-session", "-t", sname]),
+                    capture_output=True,
+                    timeout=5.0,
+                )
+            except (subprocess.SubprocessError, OSError):
+                pass
 
         # Update the in-memory board so the claim is released immediately.
         moved = board.mark_failed_by_id(a.assignment_id, finished_at=now)

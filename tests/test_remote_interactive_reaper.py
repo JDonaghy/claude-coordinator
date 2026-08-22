@@ -130,6 +130,11 @@ def _make_remote_board(
     return Board(active=[a], completed=[])
 
 
+def _old_dispatched_at(hours: float = 20.0) -> float:
+    """Return a dispatched_at timestamp that is *hours* old."""
+    return time.time() - (hours * 3600)
+
+
 # ── _probe_remote_tmux_alive tests ───────────────────────────────────────────
 
 
@@ -205,7 +210,7 @@ class TestReapStaleRemoteInteractiveSessions:
         """When interactive_session_timeout_hours=0 the sweep is a no-op."""
         from coord.interactive import reap_stale_remote_interactive_sessions
 
-        board = _make_remote_board(dispatched_at=self._old_dispatched_at())
+        board = _make_remote_board(dispatched_at=_old_dispatched_at())
         cfg = _load_config(_CONFIG_YAML_WITH_TIMEOUT_0)
         reaped = reap_stale_remote_interactive_sessions(board, cfg)
         assert reaped == []
@@ -232,7 +237,7 @@ class TestReapStaleRemoteInteractiveSessions:
 
         board = _make_remote_board(
             machine_name="localmachine",
-            dispatched_at=self._old_dispatched_at(),
+            dispatched_at=_old_dispatched_at(),
         )
         cfg = _load_config(_CONFIG_YAML_WITH_REMOTE)
 
@@ -250,7 +255,7 @@ class TestReapStaleRemoteInteractiveSessions:
 
         board = _make_remote_board(
             provider_name=None,  # regular agent worker
-            dispatched_at=self._old_dispatched_at(),
+            dispatched_at=_old_dispatched_at(),
         )
         cfg = _load_config(_CONFIG_YAML_WITH_REMOTE)
 
@@ -261,14 +266,18 @@ class TestReapStaleRemoteInteractiveSessions:
         assert reaped == []
 
     def test_alive_session_not_reaped(self, coord_db: Any) -> None:
-        """A live remote tmux session is left alone."""
+        """A live remote tmux session (pane still running) is left alone."""
         from coord.interactive import reap_stale_remote_interactive_sessions
 
-        board = _make_remote_board(dispatched_at=self._old_dispatched_at())
+        board = _make_remote_board(dispatched_at=_old_dispatched_at())
         cfg = _load_config(_CONFIG_YAML_WITH_SHORT_TIMEOUT)
 
+        # #2541: `alive=True` alone is no longer sufficient — `has-session`
+        # stays true for a `remain-on-exit` session whose pane already
+        # died, so the reaper additionally checks `tmux_pane_dead`.
         with patch("coord.interactive._probe_remote_tmux_alive",
-                   return_value=(True, True)):
+                   return_value=(True, True)), \
+             patch("coord.interactive.tmux_pane_dead", return_value=False):
             reaped = reap_stale_remote_interactive_sessions(board, cfg)
 
         assert reaped == []
@@ -280,7 +289,7 @@ class TestReapStaleRemoteInteractiveSessions:
         """When SSH is unreachable, a warning is emitted but the slot is not freed."""
         from coord.interactive import reap_stale_remote_interactive_sessions
 
-        board = _make_remote_board(dispatched_at=self._old_dispatched_at())
+        board = _make_remote_board(dispatched_at=_old_dispatched_at())
         cfg = _load_config(_CONFIG_YAML_WITH_SHORT_TIMEOUT)
 
         with patch("coord.interactive._probe_remote_tmux_alive",
@@ -307,7 +316,7 @@ class TestReapStaleRemoteInteractiveSessions:
         _REMOTE_SSH_UNREACHABLE_COUNTS.pop(aid, None)
 
         board = _make_remote_board(
-            assignment_id=aid, dispatched_at=self._old_dispatched_at()
+            assignment_id=aid, dispatched_at=_old_dispatched_at()
         )
         cfg = _load_config(_CONFIG_YAML_WITH_SHORT_TIMEOUT)
 
@@ -334,12 +343,13 @@ class TestReapStaleRemoteInteractiveSessions:
         _REMOTE_SSH_UNREACHABLE_COUNTS[aid] = 3  # simulate prior failures
 
         board = _make_remote_board(
-            assignment_id=aid, dispatched_at=self._old_dispatched_at()
+            assignment_id=aid, dispatched_at=_old_dispatched_at()
         )
         cfg = _load_config(_CONFIG_YAML_WITH_SHORT_TIMEOUT)
 
         with patch("coord.interactive._probe_remote_tmux_alive",
-                   return_value=(True, True)):
+                   return_value=(True, True)), \
+             patch("coord.interactive.tmux_pane_dead", return_value=False):
             reap_stale_remote_interactive_sessions(board, cfg)
 
         assert aid not in _REMOTE_SSH_UNREACHABLE_COUNTS
@@ -355,7 +365,7 @@ class TestReapStaleRemoteInteractiveSessions:
 
         board = _make_remote_board(
             assignment_id=aid,
-            dispatched_at=self._old_dispatched_at(),
+            dispatched_at=_old_dispatched_at(),
         )
         cfg = _load_config(_CONFIG_YAML_WITH_SHORT_TIMEOUT)
 
@@ -383,7 +393,7 @@ class TestReapStaleRemoteInteractiveSessions:
 
         board = _make_remote_board(
             assignment_id=aid,
-            dispatched_at=self._old_dispatched_at(),
+            dispatched_at=_old_dispatched_at(),
             branch="issue-42-fix",
         )
         cfg = _load_config(_CONFIG_YAML_WITH_SHORT_TIMEOUT)
@@ -418,7 +428,7 @@ class TestReapStaleRemoteInteractiveSessions:
 
         board = _make_remote_board(
             assignment_id=aid,
-            dispatched_at=self._old_dispatched_at(),
+            dispatched_at=_old_dispatched_at(),
             branch=None,  # not in DB
         )
         cfg = _load_config(_CONFIG_YAML_WITH_SHORT_TIMEOUT)
@@ -456,7 +466,7 @@ class TestReapStaleRemoteInteractiveSessions:
 
         board = _make_remote_board(
             assignment_id=aid,
-            dispatched_at=self._old_dispatched_at(),
+            dispatched_at=_old_dispatched_at(),
             branch=None,  # no branch
         )
         cfg = _load_config(_CONFIG_YAML_WITH_SHORT_TIMEOUT)
@@ -495,7 +505,7 @@ class TestReapStaleRemoteInteractiveSessions:
 
         board = _make_remote_board(
             assignment_id=aid,
-            dispatched_at=self._old_dispatched_at(),
+            dispatched_at=_old_dispatched_at(),
         )
         cfg = _load_config(_CONFIG_YAML_WITH_SHORT_TIMEOUT)
 
@@ -529,7 +539,7 @@ class TestReapStaleRemoteInteractiveSessions:
 
         board = _make_remote_board(
             assignment_id=aid,
-            dispatched_at=self._old_dispatched_at(),
+            dispatched_at=_old_dispatched_at(),
         )
         cfg = _load_config(_CONFIG_YAML_WITH_SHORT_TIMEOUT)
 
@@ -555,7 +565,7 @@ class TestReapStaleRemoteInteractiveSessions:
 
         board = _make_remote_board(
             assignment_id=aid,
-            dispatched_at=self._old_dispatched_at(),
+            dispatched_at=_old_dispatched_at(),
         )
         cfg = _load_config(_CONFIG_YAML_WITH_SHORT_TIMEOUT)
 
@@ -695,3 +705,104 @@ class TestReconcileCallsRemoteReaper:
             reconcile(board, cfg)
 
         mock_remote.assert_called_once_with(board, cfg)
+
+
+# ── #2541: `remain-on-exit` dead-pane handling ───────────────────────────────
+#
+# `_launch_via_tmux` now sets `remain-on-exit on`, so a crashed/finished
+# session's pane stays up instead of the whole (single-pane) session dying
+# with it. `has-session` (what `_probe_remote_tmux_alive` checks) therefore
+# no longer proves the agent is still running — without the dead-pane check
+# added alongside it, a remote session that crashed once would be reported
+# "alive" by this reaper FOREVER, never getting reaped.
+
+
+class TestDeadPaneTreatedAsReapable:
+    def test_dead_pane_alive_session_is_reaped(self, coord_db: Any) -> None:
+        """`has-session` true but `tmux_pane_dead` true must still reap,
+        exactly like a fully-gone session would."""
+        from coord.interactive import reap_stale_remote_interactive_sessions
+
+        aid = "remote-deadpane-aid"
+        _insert_assignment(coord_db, aid)
+
+        board = _make_remote_board(
+            assignment_id=aid, dispatched_at=_old_dispatched_at()
+        )
+        cfg = _load_config(_CONFIG_YAML_WITH_SHORT_TIMEOUT)
+
+        with patch("coord.interactive._probe_remote_tmux_alive",
+                   return_value=(True, True)), \
+             patch("coord.interactive.tmux_pane_dead", return_value=True), \
+             patch("coord.interactive._persist_interactive_pane_log"), \
+             patch("coord.interactive.subprocess.run", return_value=MagicMock(returncode=0)), \
+             patch("coord.interactive.finalize_remote_interactive_exit") as mock_fin:
+            mock_fin.return_value = MagicMock(
+                terminal_status="failed",
+                already_recorded=False,
+            )
+            reaped = reap_stale_remote_interactive_sessions(board, cfg)
+
+        assert aid in reaped
+        assert not any(a.assignment_id == aid for a in board.active)
+
+    def test_dead_pane_snapshot_persisted_before_kill(self, coord_db: Any) -> None:
+        """The pane is captured for `coord log` before the empty session is
+        killed off the remote host."""
+        from coord.interactive import reap_stale_remote_interactive_sessions
+
+        aid = "remote-deadpane-snapshot"
+        _insert_assignment(coord_db, aid)
+
+        board = _make_remote_board(
+            assignment_id=aid, dispatched_at=_old_dispatched_at()
+        )
+        cfg = _load_config(_CONFIG_YAML_WITH_SHORT_TIMEOUT)
+
+        with patch("coord.interactive._probe_remote_tmux_alive",
+                   return_value=(True, True)), \
+             patch("coord.interactive.tmux_pane_dead", return_value=True), \
+             patch("coord.interactive._persist_interactive_pane_log") as mock_persist, \
+             patch("coord.interactive.subprocess.run", return_value=MagicMock(returncode=0)), \
+             patch("coord.interactive.finalize_remote_interactive_exit") as mock_fin:
+            mock_fin.return_value = MagicMock(
+                terminal_status="failed",
+                already_recorded=False,
+            )
+            reap_stale_remote_interactive_sessions(board, cfg)
+
+        mock_persist.assert_called_once()
+        assert mock_persist.call_args[0][0] == aid
+
+    def test_dead_pane_kills_the_empty_remote_session(self, coord_db: Any) -> None:
+        from coord.interactive import reap_stale_remote_interactive_sessions
+
+        aid = "remote-deadpane-kill"
+        _insert_assignment(coord_db, aid)
+
+        board = _make_remote_board(
+            assignment_id=aid, dispatched_at=_old_dispatched_at()
+        )
+        cfg = _load_config(_CONFIG_YAML_WITH_SHORT_TIMEOUT)
+
+        run_calls: list[list[str]] = []
+
+        def _mock_run(cmd: list, **kw: Any) -> MagicMock:
+            run_calls.append(list(cmd))
+            return MagicMock(returncode=0, stdout="")
+
+        with patch("coord.interactive._probe_remote_tmux_alive",
+                   return_value=(True, True)), \
+             patch("coord.interactive.tmux_pane_dead", return_value=True), \
+             patch("coord.interactive._persist_interactive_pane_log"), \
+             patch("coord.interactive.subprocess.run", side_effect=_mock_run), \
+             patch("coord.interactive.finalize_remote_interactive_exit") as mock_fin:
+            mock_fin.return_value = MagicMock(
+                terminal_status="failed",
+                already_recorded=False,
+            )
+            reap_stale_remote_interactive_sessions(board, cfg)
+
+        kill_calls = [c for c in run_calls if "kill-session" in c]
+        assert kill_calls, "expected a `tmux kill-session` call for the empty session"
+        assert "coord-" + aid in kill_calls[0]
