@@ -637,16 +637,25 @@ def format_plan(
     to_dispatch: list = (),
     skipped: list = (),
     waiting: list = (),
+    deferred: list = (),
     footer: bool = True,
 ) -> list[str]:
     """Render a ``--dry-run`` report: the gate walk plus the work frontier.
 
-    ``to_dispatch``/``skipped``/``waiting`` come straight off a
+    ``to_dispatch``/``skipped``/``waiting``/``deferred`` come straight off a
     :class:`~coord.milestone_dispatch.MilestonePlan` (the same frontier
     ``coord milestone dispatch --dry-run`` prints), so the operator sees both
     halves of #1440's fourth acceptance bullet — every gate, *and* what would
     dispatch — in one output.  Returns lines rather than echoing so both the
     CLI and a test can consume it.
+
+    ``deferred`` (#2542) is populated only when the caller resolved
+    ``oracle_loop=True`` — entries the frontier considers ready but that the
+    `work` gate is deliberately holding back this tick so no two
+    same-milestone entries start authoring a JIT acceptance slice
+    concurrently. Rendered separately from ``skipped`` (no idle machine) so
+    the report never implies "we couldn't find a machine" for something
+    that's actually being serialized on purpose.
 
     ``footer`` controls whether the trailing blank line + "(dry run — ...)"
     line is included.  A non-dry-run confirmation (``coord milestone drive``
@@ -702,6 +711,10 @@ def format_plan(
         lines.append("  Waiting on declared-order dependencies:")
         for b in waiting:
             lines.append(f"    #{b.issue_number}: {b.reason}")
+    if deferred:
+        lines.append("  Deferred (oracle-loop: one entry per tick):")
+        for d in deferred:
+            lines.append(f"    #{d.entry.issue_number}: {d.reason}")
 
     if footer:
         lines.append("")

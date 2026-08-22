@@ -1286,18 +1286,25 @@ def milestone_drive_cmd(
 
     # The frontier half of the dry-run report. Computed for both modes so the
     # non-dry-run confirmation shows what the first `work` tick will do.
+    # #2542: pass the same `oracle_loop` the gate tick itself will use, so
+    # this preview never shows more than the one entry the actual `work`
+    # gate would dispatch for an oracle-loop milestone.
     if ctx.work_order.nodes:
         plan = plan_dispatch(
-            ctx.work_order, board, cfg, repo_entry, ctx.terminal_issues
+            ctx.work_order, board, cfg, repo_entry, ctx.terminal_issues,
+            oracle_loop=cfg.acceptance.has_driver(repo_entry.name),
         )
-        to_dispatch, skipped, waiting = plan.to_dispatch, plan.skipped, plan.waiting
+        to_dispatch, skipped, waiting, deferred = (
+            plan.to_dispatch, plan.skipped, plan.waiting, plan.deferred,
+        )
     else:
-        to_dispatch, skipped, waiting = [], [], []
+        to_dispatch, skipped, waiting, deferred = [], [], [], []
 
     if dry_run:
         for line in mg.format_plan(
             record, steps,
             to_dispatch=to_dispatch, skipped=skipped, waiting=waiting,
+            deferred=deferred,
         ):
             click.echo(line)
         return
@@ -1320,7 +1327,7 @@ def milestone_drive_cmd(
     state.save_milestone_gate(record.to_dict())
     for line in mg.format_plan(
         record, steps, to_dispatch=to_dispatch, skipped=skipped, waiting=waiting,
-        footer=False,
+        deferred=deferred, footer=False,
     ):
         click.echo(line)
     click.echo()
