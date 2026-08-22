@@ -31,6 +31,7 @@ from coord.milestone_order import (
     replace_sub_issues_section,
     replace_work_order_section,
     validate_milestone_membership,
+    validate_no_shared_oracle_group,
 )
 from coord.models import Assignment, Board
 
@@ -187,6 +188,41 @@ class TestValidateMilestoneMembership:
         # #1 closed, #2 still open — both are legitimately "under the
         # milestone"; the caller supplies membership regardless of state.
         validate_milestone_membership(wo, {1, 2})
+
+
+# ── validate_no_shared_oracle_group (#2542) ─────────────────────────────────
+
+
+class TestValidateNoSharedOracleGroup:
+    def test_shared_group_under_oracle_loop_raises(self) -> None:
+        wo = parse_work_order(SAMPLE_BODY)  # #762/#763 share {group: A}
+        with pytest.raises(
+            WorkOrderError, match=r"#762, #763 share group 'A'.*oracle-loop"
+        ):
+            validate_no_shared_oracle_group(wo, oracle_loop=True)
+
+    def test_shared_group_outside_oracle_loop_is_a_no_op(self) -> None:
+        wo = parse_work_order(SAMPLE_BODY)
+        validate_no_shared_oracle_group(wo, oracle_loop=False)  # no raise
+
+    def test_distinct_groups_under_oracle_loop_pass(self) -> None:
+        body = "## Work order\n- [ ] #1 {group: A}\n- [ ] #2 {group: B}\n"
+        wo = parse_work_order(body)
+        validate_no_shared_oracle_group(wo, oracle_loop=True)  # no raise
+
+    def test_no_group_under_oracle_loop_passes(self) -> None:
+        """This check only catches the EXPLICIT-group case — two ungrouped
+        nodes with no declared edge between them are a different hazard
+        (drive-queue concurrency), closed separately by plan_queue's
+        oracle_loop serialization, not here."""
+        body = "## Work order\n- [ ] #1\n- [ ] #2\n"
+        wo = parse_work_order(body)
+        validate_no_shared_oracle_group(wo, oracle_loop=True)  # no raise
+
+    def test_single_member_group_under_oracle_loop_passes(self) -> None:
+        body = "## Work order\n- [ ] #1 {group: A}\n- [ ] #2 {after: #1}\n"
+        wo = parse_work_order(body)
+        validate_no_shared_oracle_group(wo, oracle_loop=True)  # no raise
 
 
 # ── ready_frontier ───────────────────────────────────────────────────────────

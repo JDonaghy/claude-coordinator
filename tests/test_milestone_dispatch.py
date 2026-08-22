@@ -208,6 +208,59 @@ class TestPlanQueue:
         plan = plan_queue(order, terminal_issues=set(), repo_name="api")
         assert [q.issue_number for q in plan] == [3, 1, 2]
 
+    # ── oracle_loop serialization (#2542) ────────────────────────────────────
+
+    def test_oracle_loop_false_is_unchanged_from_default(self) -> None:
+        """Explicit `oracle_loop=False` must be byte-identical to omitting
+        it — every existing caller keeps today's behaviour exactly."""
+        plan = plan_queue(
+            WORK_ORDER, terminal_issues=set(), repo_name="api", oracle_loop=False
+        )
+        assert plan == plan_queue(WORK_ORDER, terminal_issues=set(), repo_name="api")
+
+    def test_oracle_loop_chains_same_group_cohort(self) -> None:
+        """#762/#763 share {group: A} — normally independent (no `after`
+        between them) — but under oracle-loop control the second entry in
+        topological order gets an implicit `after` onto the first, so the
+        drive-queue can never launch both at once (coord-portal#122's
+        original #128/#132 collision)."""
+        plan = plan_queue(
+            WORK_ORDER, terminal_issues=set(), repo_name="api", oracle_loop=True
+        )
+        assert [q.issue_number for q in plan] == [762, 763, 765]
+        assert plan[0].after == ()
+        assert plan[1].after == ("api#762",)
+        # #765 already declared `after: #762,#763` — the implicit chain onto
+        # its immediate predecessor (#763) is already covered, not duplicated.
+        assert plan[2].after == ("api#762", "api#763")
+
+    def test_oracle_loop_chains_ungrouped_independent_nodes_too(self) -> None:
+        """#2542's SECOND collision (#130 vs. #132): no declared group at
+        all, just independent nodes the drive-queue's per-repo concurrency
+        cap would otherwise launch concurrently. oracle_loop serializes
+        those too, not just declared-group cohorts."""
+        order = WorkOrder(
+            nodes=(WorkOrderNode(129), WorkOrderNode(130), WorkOrderNode(131))
+        )
+        plan = plan_queue(
+            order, terminal_issues=set(), repo_name="portal", oracle_loop=True
+        )
+        assert [q.issue_number for q in plan] == [129, 130, 131]
+        assert plan[0].after == ()
+        assert plan[1].after == ("portal#129",)
+        assert plan[2].after == ("portal#130",)
+
+    def test_oracle_loop_terminal_predecessor_never_becomes_an_edge(self) -> None:
+        """The implicit chain only ever points at another QUEUED (non-
+        terminal) entry — a closed predecessor is dropped from `ordered`
+        entirely, so it can never end up named in a later entry's `after`."""
+        plan = plan_queue(
+            WORK_ORDER, terminal_issues={762}, repo_name="api", oracle_loop=True
+        )
+        assert [q.issue_number for q in plan] == [763, 765]
+        assert plan[0].after == ()
+        assert plan[1].after == ("api#763",)
+
 
 # ── is_milestone_complete ────────────────────────────────────────────────────
 

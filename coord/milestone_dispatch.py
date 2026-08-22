@@ -708,6 +708,8 @@ def plan_queue(
     work_order: WorkOrder,
     terminal_issues: frozenset[int] | set[int],
     repo_name: str,
+    *,
+    oracle_loop: bool = False,
 ) -> tuple[QueuePlanEntry, ...]:
     """Translate the work order's DAG into drive-queue enqueues (#2335).
 
@@ -724,6 +726,31 @@ def plan_queue(
     :func:`~coord.milestone_order.parse_work_order` already refused cycles,
     self-edges, and edges to undeclared nodes, so the sort always terminates;
     the defensive tail below only fires on inputs constructed outside it.
+
+    ``oracle_loop`` (#2542) — the caller's already-resolved
+    ``config.acceptance.has_driver(repo_name)`` — additionally chains every
+    entry's ``after`` to the issue immediately before it in this function's
+    own topological order, so the drive-queue admits the WHOLE milestone
+    strictly one entry at a time. Without this, two entries with no declared
+    edge between them (different ``group``s, or neither declaring one) are
+    both ``waiting`` the moment their own pre-reqs land, and the
+    drive-queue's per-repo concurrency cap (``coord.drive_queue.plan_tick``)
+    launches both at once — each independently authoring its own JIT
+    acceptance slice into the SAME ``tests/acceptance/ms-N/manifest.yml``
+    (``coord.test_author``'s "later slices MERGE into this file"
+    convention), regardless of what the declared work order says is safe to
+    parallelize. This is exactly coord-portal#122's SECOND collision (#130
+    vs. #132, filed as #2542's correction) — ``validate_no_shared_oracle_
+    group`` only catches the explicit-group case, and this milestone's
+    entries shared no group at all.
+
+    Deliberately coarse: it serializes the entry's WHOLE dispatch (Work
+    through Merge), not just its slice-authoring phase, because the
+    drive-queue has no notion of "authoring" vs. "working" phases to hang a
+    narrower edge on. That is a real throughput cost for an oracle-loop
+    milestone dispatched in bulk — #2543 (giving each issue its own manifest
+    fragment instead of one shared appended file) is what would let real
+    concurrency come back safely; this is defense-in-depth until it lands.
     """
     from coord.drive_queue import entry_key  # noqa: PLC0415
 
@@ -746,16 +773,27 @@ def plan_queue(
         if not progressed:  # cycle — unreachable via parse_work_order; see above
             ordered.extend(remaining.values())
             break
-    return tuple(
-        QueuePlanEntry(
-            issue_number=n.issue_number,
-            after=tuple(
-                entry_key(repo_name, d) for d in n.after if d not in terminal
-            ),
-            group=n.group,
+
+    entries: list[QueuePlanEntry] = []
+    previous_issue_number: int | None = None
+    for n in ordered:
+        after_numbers = list(n.after)
+        if oracle_loop and (
+            previous_issue_number is not None
+            and previous_issue_number not in after_numbers
+        ):
+            after_numbers.append(previous_issue_number)
+        entries.append(
+            QueuePlanEntry(
+                issue_number=n.issue_number,
+                after=tuple(
+                    entry_key(repo_name, d) for d in after_numbers if d not in terminal
+                ),
+                group=n.group,
+            )
         )
-        for n in ordered
-    )
+        previous_issue_number = n.issue_number
+    return tuple(entries)
 
 
 @dataclass(frozen=True)

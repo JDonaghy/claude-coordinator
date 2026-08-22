@@ -41,6 +41,26 @@ def config_file(tmp_path: Path) -> Path:
     return p
 
 
+CONFIG_YAML_WITH_ACCEPTANCE_DRIVER = CONFIG_YAML + """\
+acceptance:
+  drivers:
+    api:
+      kind: tui-tuidriver
+      run: "cargo test"
+      mock: "*.screen"
+"""
+
+
+@pytest.fixture
+def config_file_with_gate_a(tmp_path: Path) -> Path:
+    """A repo under oracle-loop control (#2542) — an `acceptance.drivers`
+    entry configured, mirroring tests/test_cli_milestone_dispatch.py's
+    identically-named fixture."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(CONFIG_YAML_WITH_ACCEPTANCE_DRIVER)
+    return p
+
+
 TRACKING_BODY = """\
 Milestone plan.
 
@@ -408,6 +428,68 @@ class TestMilestoneWriteOrderCmd:
         )
         assert result.exit_code == 2
         assert "unknown repo" in result.output
+
+    def test_refuses_shared_group_under_oracle_loop(
+        self, config_file_with_gate_a: Path
+    ) -> None:
+        """#2542: this repo is under oracle-loop control (an acceptance
+        driver is configured) — a proposed work order putting #762/#763 in
+        the same `{group: A}` cohort must be refused before it's ever
+        written, since both would author their JIT acceptance slice into
+        the SAME tests/acceptance/ms-N/manifest.yml concurrently
+        (coord-portal#122)."""
+        def get_issue(repo, number):
+            return {
+                "number": 100, "title": "tracking", "body": "",
+                "state": "OPEN", "milestone": {"number": 9, "title": "M"},
+            }
+
+        open_issues = [
+            {"number": 762, "milestone": {"number": 9}},
+            {"number": 763, "milestone": {"number": 9}},
+        ]
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "write-order", "api", "100", "--config",
+                 str(config_file_with_gate_a)],
+                input="- [ ] #762  {group: A}\n- [ ] #763  {group: A}\n",
+            )
+        assert result.exit_code == 1
+        assert "#762, #763 share group 'A'" in result.output
+        assert "oracle-loop" in result.output
+        mock_update.assert_not_called()
+
+    def test_shared_group_without_acceptance_driver_still_writes(
+        self, config_file: Path
+    ) -> None:
+        """The same shared-group block is a no-op check for a repo NOT
+        under oracle-loop control — no `acceptance.drivers` entry -> writes
+        exactly as before #2542."""
+        def get_issue(repo, number):
+            return {
+                "number": 100, "title": "tracking", "body": "",
+                "state": "OPEN", "milestone": {"number": 9, "title": "M"},
+                "labels": [{"name": "epic"}],
+            }
+
+        open_issues = [
+            {"number": 762, "milestone": {"number": 9}},
+            {"number": 763, "milestone": {"number": 9}},
+        ]
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+             patch("coord.github_ops.add_issue_labels") as mock_add_labels, \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "write-order", "api", "100", "--config", str(config_file)],
+                input="- [ ] #762  {group: A}\n- [ ] #763  {group: A}\n",
+            )
+        assert result.exit_code == 0, result.output
+        mock_update.assert_called_once()
 
 
 # ── `coord milestone chat` (#770 Phase 2 dispatch) ──────────────────────────

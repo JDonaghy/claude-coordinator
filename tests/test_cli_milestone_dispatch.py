@@ -491,6 +491,109 @@ class TestMilestoneDispatchGateA:
         assert "Gate A" not in result.output
 
 
+class TestMilestoneDispatchOracleLoopSerializes:
+    """#2542: under oracle-loop control (an acceptance driver configured —
+    Gate A already satisfied by the `config_file_with_gate_a` fixture's
+    mocked contract), bulk `coord milestone dispatch` must chain the WHOLE
+    milestone into the drive-queue one entry at a time — the #130/#132
+    coord-portal#122 collision this issue's correction describes had no
+    shared `group` at all, so only the drive-queue translation itself (not
+    the write-order validator) can close it."""
+
+    def test_group_cohort_gets_a_serializing_after_edge(
+        self, config_file_with_gate_a: Path,
+    ) -> None:
+        """#762/#763 share {group: A} — plain (non-oracle) dispatch queues
+        them with no edge between them (see TestMilestoneDispatchBulk); under
+        an acceptance driver, #763 additionally gets `after api#762`."""
+        open_issues = [
+            {"number": 762, "milestone": {"number": 9}},
+            {"number": 763, "milestone": {"number": 9}},
+            {"number": 765, "milestone": {"number": 9}},
+        ]
+        with patch("coord.github_ops.get_issue", side_effect=_get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+             patch("coord.github_ops.get_repo_file", return_value="# Contract\n"), \
+             patch("coord.board_service.read_board", return_value=Board()), \
+             patch("coord.dispatch.dispatch") as disp:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "dispatch", "api", "100", "--config",
+                 str(config_file_with_gate_a)],
+            )
+        assert result.exit_code == 0, result.output
+        disp.assert_not_called()
+
+        rows = state_mod.list_drive_queue()
+        by_issue = {r["issue_number"]: r for r in rows}
+        assert by_issue[762]["after_json"] == []
+        assert by_issue[763]["after_json"] == ["api#762"]
+        # #765 was already declared `after: #762,#763` — unaffected by the
+        # implicit chain (its immediate predecessor, #763, is already there).
+        assert by_issue[765]["after_json"] == ["api#762", "api#763"]
+
+    def test_ungrouped_independent_issues_still_get_chained(
+        self, config_file_with_gate_a: Path,
+    ) -> None:
+        """The SECOND coord-portal#122 collision (#130 vs. #132): no shared
+        group, no declared `after` between them at all — the drive-queue's
+        per-repo concurrency cap alone would launch both. Confirms the fix
+        isn't scoped to the explicit-group case."""
+        body = "## Work order\n- [ ] #762\n- [ ] #763\n"
+        open_issues = [
+            {"number": 762, "milestone": {"number": 9}},
+            {"number": 763, "milestone": {"number": 9}},
+        ]
+
+        def get_issue(repo, number):
+            return _get_issue(repo, number, bodies={100: body})
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+             patch("coord.github_ops.get_repo_file", return_value="# Contract\n"), \
+             patch("coord.board_service.read_board", return_value=Board()), \
+             patch("coord.dispatch.dispatch") as disp:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "dispatch", "api", "100", "--config",
+                 str(config_file_with_gate_a)],
+            )
+        assert result.exit_code == 0, result.output
+        disp.assert_not_called()
+
+        rows = state_mod.list_drive_queue()
+        by_issue = {r["issue_number"]: r for r in rows}
+        assert by_issue[762]["after_json"] == []
+        assert by_issue[763]["after_json"] == ["api#762"]
+
+    def test_repo_without_acceptance_driver_is_not_chained(
+        self, config_file: Path,
+    ) -> None:
+        """No acceptance driver configured -> not under oracle-loop control
+        -> the group cohort dispatches exactly as before #2542 (no implicit
+        edge)."""
+        open_issues = [
+            {"number": 762, "milestone": {"number": 9}},
+            {"number": 763, "milestone": {"number": 9}},
+            {"number": 765, "milestone": {"number": 9}},
+        ]
+        with patch("coord.github_ops.get_issue", side_effect=_get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+             patch("coord.board_service.read_board", return_value=Board()), \
+             patch("coord.dispatch.dispatch") as disp:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "dispatch", "api", "100", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        disp.assert_not_called()
+
+        rows = state_mod.list_drive_queue()
+        by_issue = {r["issue_number"]: r for r in rows}
+        assert by_issue[762]["after_json"] == []
+        assert by_issue[763]["after_json"] == []
+
+
 class TestMilestoneDispatchGateControlled:
     """#1930 (epic #1440 S-2): a milestone under gate control (``coord
     milestone drive``) is drained exclusively by the daemon's gate tick.
