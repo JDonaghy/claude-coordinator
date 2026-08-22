@@ -397,8 +397,51 @@ def sealed_conflict_is_manifest_only(files: list[str]) -> bool:
     ``contract.md``, a mock, or any other sealed file returns ``False`` —
     out of this resolver's authority, still needs a human. An empty list
     also returns ``False`` (nothing to confirm as manifest-only).
+
+    NOTE (#2555 review): this is an EXACT-match test, and *files* coming
+    from a whole-branch compare (as opposed to the actual git-conflicting
+    subset) is normally a SUPERSET of what is really in conflict — a real
+    test-author/mock-author slice's own diff almost always also contains
+    the spec/test file(s) it authored alongside its ``manifest.yml`` edit.
+    Do not use this function to GATE a dispatch decision against a whole-
+    branch-diff file list — it will reject the common, textbook-compliant
+    case outright. Use :func:`sealed_conflict_could_touch_manifest` for
+    that; this function stays as the precise "IS it manifest-only" test for
+    a caller that already has the true conflicting-file set (e.g. a future
+    local ``git merge-tree``-based check — #2555 review, fix direction b).
     """
     return bool(files) and all(_is_sealed_manifest_path(f) for f in files)
+
+
+def sealed_conflict_could_touch_manifest(files: list[str]) -> bool:
+    """True when at least one path in *files* is a milestone acceptance
+    ``manifest.yml`` — i.e. the sealed-aware conflict-fix branch (#2555)
+    MIGHT have something to resolve here.
+
+    Unlike :func:`sealed_conflict_is_manifest_only` (which requires EVERY
+    file to be a manifest.yml), *files* here is expected to be a branch's
+    WHOLE changed-file list (``coord.notify._conflict_confined_to_sealed_
+    paths``'s three-dot compare) — a SUPERSET of whatever is actually in
+    git-merge conflict, since GitHub's compare API has no notion of "which
+    files conflict", only "which files differ between two refs". Requiring
+    every file in that superset to be a manifest.yml rejects the common,
+    textbook-compliant test-author/mock-author shape outright: such a
+    branch's own diff almost always also contains the new spec/test file(s)
+    it authored alongside its ``manifest.yml`` edit (#2555 review finding).
+
+    Requiring only that a manifest.yml appears SOMEWHERE in the branch's
+    diff is still a sound negative filter: a file can only be in conflict
+    if this branch's diff touches it too, so when no manifest.yml appears
+    in *files* at all, no manifest.yml conflict is possible and dispatching
+    the sealed-aware resolver is a guaranteed no-op — safe to skip. When a
+    manifest.yml IS present (whether alongside other sealed files or not),
+    dispatch and let the worker's own additive-only restriction
+    (:data:`SEALED_MANIFEST_CONFLICT_SYSTEM_PROMPT`) do the PRECISE
+    filtering at rebase time — it refuses via
+    :data:`SEALED_SCOPE_STUCK_MARKER` the instant the actual conflict
+    reaches beyond that one file, exactly as designed.
+    """
+    return any(_is_sealed_manifest_path(f) for f in files)
 
 
 def build_conflict_fix_briefing(

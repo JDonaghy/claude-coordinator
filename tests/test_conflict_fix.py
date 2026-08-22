@@ -30,6 +30,7 @@ from coord.conflict_fix import (
     build_sealed_manifest_conflict_briefing,
     dispatch_conflict_fix,
     pick_conflict_fix_machine,
+    sealed_conflict_could_touch_manifest,
     sealed_conflict_is_manifest_only,
     sealed_scope_verdict_in_text,
 )
@@ -303,6 +304,40 @@ class TestSealedConflictIsManifestOnly:
 
     def test_false_for_non_manifest_filename_ending_similarly(self) -> None:
         assert sealed_conflict_is_manifest_only(
+            ["tests/acceptance/ms-4/other_manifest.yml"]
+        ) is False
+
+
+class TestSealedConflictCouldTouchManifest:
+    """#2555 review fix: the notify.py gate must key off "does a manifest.yml
+    appear anywhere in the branch's whole diff", not "is the whole diff
+    nothing but manifest.yml" — the latter rejects the realistic mixed
+    shape (manifest.yml + a newly authored spec file) outright."""
+
+    def test_true_for_single_manifest_file(self) -> None:
+        assert sealed_conflict_could_touch_manifest(
+            ["tests/acceptance/ms-4/manifest.yml"]
+        ) is True
+
+    def test_true_when_manifest_accompanied_by_other_sealed_files(self) -> None:
+        """The realistic #132/#2555 shape: the branch's own diff also
+        contains the spec file it authored alongside its manifest.yml
+        edit — this must NOT be rejected as "not manifest-only"."""
+        assert sealed_conflict_could_touch_manifest([
+            "tests/acceptance/ms-4/manifest.yml",
+            "tests/acceptance/ms-4/new_spec.rs",
+        ]) is True
+
+    def test_false_when_no_manifest_present(self) -> None:
+        assert sealed_conflict_could_touch_manifest(
+            ["tests/acceptance/ms-4/audit_test.rs"]
+        ) is False
+
+    def test_false_for_empty_list(self) -> None:
+        assert sealed_conflict_could_touch_manifest([]) is False
+
+    def test_false_for_non_manifest_filename_ending_similarly(self) -> None:
+        assert sealed_conflict_could_touch_manifest(
             ["tests/acceptance/ms-4/other_manifest.yml"]
         ) is False
 

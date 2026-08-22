@@ -998,13 +998,17 @@ class StalledDispatchAction:
       :data:`coord.models.SEALED_PATH_AUTHOR_TYPES` row whose conflict was
       confirmed (:func:`_conflict_confined_to_sealed_paths`) to be confined
       to the repo's sealed acceptance-oracle paths AND (#2555:
-      :func:`coord.conflict_fix.sealed_conflict_is_manifest_only`) is NOT
-      confined further to just a milestone's ``manifest.yml`` — i.e. it
-      touches a test body, ``contract.md``, a mock, or some other sealed
-      file the sealed-aware conflict-fix branch is not authorized to edit.
-      A manifest.yml-only conflict on such a row no longer skips here — it
+      :func:`coord.conflict_fix.sealed_conflict_could_touch_manifest`) NO
+      file in that (whole-branch-diff) list is even a milestone
+      ``manifest.yml`` — i.e. a manifest.yml conflict is provably
+      impossible, so the sealed-aware conflict-fix branch is guaranteed to
+      have nothing to resolve. Whenever a manifest.yml DOES appear in that
+      list — whether alone or alongside other sealed files the branch also
+      authored, the realistic common shape — this no longer skips here: it
       falls through to :func:`coord.conflict_fix.dispatch_conflict_fix`,
-      whose sealed-author branch (#2555) resolves it.
+      whose sealed-author branch (#2555) attempts it and lets the worker's
+      own additive-only restriction do the precise, per-file filtering at
+      rebase time.
     - ``"disabled"``                — ``pipeline.auto_dispatch_stalled`` is
       off; detection/narration still happened, dispatch did not.
     """
@@ -1154,11 +1158,20 @@ def dispatch_stalled_pipeline_action(
       :data:`coord.models.SEALED_PATH_AUTHOR_TYPES` row AND the conflict can
       be confirmed (via :func:`_conflict_confined_to_sealed_paths`, a
       compare-API-only check) to be confined to the repo's sealed
-      acceptance-oracle paths — a conflict-fix worker is REQUIRED by
-      CLAUDE.md's own sealed-path rule to self-restrict from editing those,
-      so it is guaranteed to push nothing; that case returns
-      ``"skipped_sealed_conflict"`` instead of spending a worker session on
-      a known no-op.
+      acceptance-oracle paths AND (#2555:
+      :func:`coord.conflict_fix.sealed_conflict_could_touch_manifest`) that
+      confined, whole-branch-diff file list contains no manifest.yml at
+      all — a manifest.yml conflict is then provably impossible, and a
+      conflict-fix worker is REQUIRED by CLAUDE.md's own sealed-path rule to
+      self-restrict from editing any OTHER sealed file, so it is guaranteed
+      to push nothing; that case returns ``"skipped_sealed_conflict"``
+      instead of spending a worker session on a known no-op. When a
+      manifest.yml IS present in that list (even alongside other sealed
+      files the branch also authored — the realistic common shape), this
+      falls through to the ordinary dispatch, whose sealed-author branch
+      (#2555) resolves a genuine manifest-only conflict and self-refuses,
+      exactly like any other conflict-fix failure, the instant the actual
+      conflict reaches beyond that file.
     - ``review_failed_no_verdict`` (#1584) → :func:`coord.review.dispatch_review`
       again, the SAME call as ``done_no_review`` — the failed review left no
       verdict behind, so recovery is identical to "no review was ever
@@ -1483,6 +1496,7 @@ def dispatch_stalled_pipeline_action(
         from coord.conflict_fix import (  # noqa: PLC0415
             dispatch_conflict_fix,
             has_prior_conflict_fix,
+            sealed_conflict_could_touch_manifest,
         )
         from coord.merge_queue import load_queue  # noqa: PLC0415
 
@@ -1511,28 +1525,38 @@ def dispatch_stalled_pipeline_action(
         # `entry.assignment_type`, the same field checked below) that CAN
         # resolve the one shape that guarantee doesn't hold for: a conflict
         # confined to a milestone's `manifest.yml` — the file every slice
-        # under that milestone additively appends its own block to. So the
-        # skip now narrows to exactly the residual no-op case — confined to
-        # the sealed tree but NOT to a manifest.yml (a test body, contract.md,
-        # a mock, …) — and falls through to `dispatch_conflict_fix` for a
-        # manifest-only conflict, which the sealed branch now actually lands.
+        # under that milestone additively appends its own block to.
+        #
+        # `sealed_files` here is `entry`'s WHOLE branch diff (the three-dot
+        # compare), not the actual conflicting subset — GitHub's compare API
+        # cannot report "which files conflict", only "which files differ".
+        # A real test-author/mock-author slice's own diff almost always ALSO
+        # contains the spec/test file(s) it authored alongside its
+        # `manifest.yml` edit, so gating on "every file in this superset is
+        # a manifest.yml" (`sealed_conflict_is_manifest_only`) rejected the
+        # common, textbook-compliant case outright (#2555 review finding).
+        # Gate on "a manifest.yml appears somewhere in the superset" instead
+        # (`sealed_conflict_could_touch_manifest`) — still a sound negative
+        # filter (a file can only conflict if this branch touches it too, so
+        # NO manifest.yml anywhere in the diff means a manifest.yml conflict
+        # is impossible and dispatch would be a guaranteed no-op) — and let
+        # the worker's own additive-only restriction do the PRECISE
+        # filtering at rebase time, refusing via `SEALED_SCOPE_STUCK_MARKER`
+        # the instant the actual conflict reaches beyond that one file.
         if work.type in SEALED_PATH_AUTHOR_TYPES:
             sealed_files = _conflict_confined_to_sealed_paths(entry, config)
             if sealed_files is not None:
-                from coord.conflict_fix import (  # noqa: PLC0415
-                    sealed_conflict_is_manifest_only,
-                )
-
-                if not sealed_conflict_is_manifest_only(sealed_files):
+                if not sealed_conflict_could_touch_manifest(sealed_files):
                     return StalledDispatchAction(
                         kind="skipped_sealed_conflict",
                         detail=(
                             "conflict is confined to sealed acceptance paths ("
                             + ", ".join(sealed_files)
-                            + ") but not to a manifest.yml — the sealed "
-                            "conflict-fix branch (#2555) is only authorized "
-                            "to resolve a manifest.yml conflict, so a worker "
-                            "would push nothing here; needs a human"
+                            + ") and none of them is a manifest.yml — the "
+                            "sealed conflict-fix branch (#2555) is only "
+                            "authorized to resolve a manifest.yml conflict, "
+                            "so a worker would push nothing here; needs a "
+                            "human"
                         ),
                     )
         fix = dispatch_conflict_fix(entry, board, config, prefer_machine=work.machine_name)
