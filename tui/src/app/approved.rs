@@ -49,6 +49,14 @@ const APPROVED_NO_MAPPING: &str = "— no mapping —";
 /// the width of e.g. `"constraints: "`).
 const APPROVED_DETAIL_LABEL_WIDTH: usize = 13;
 
+/// Floor (in text rows) for the inline detail region when it is open — the
+/// `"── Submission Detail ──"` divider plus the nine identity/briefing
+/// fields, plus one row of headroom for a wrapped value. Without a floor a
+/// list long enough to fill the panel leaves the detail rect zero-height and
+/// `Enter` visibly does nothing; `render_audit_panel` reserves its own
+/// `lh * 7.0` floor for exactly this reason.
+const APPROVED_DETAIL_MIN_ROWS: f32 = 11.0;
+
 impl CoordApp {
     /// The approved-submissions list, server-order (contract §3c:
     /// oldest-first — mirrors `list_submissions()`'s own `ORDER BY
@@ -119,21 +127,66 @@ impl CoordApp {
         }
     }
 
-    /// Build the main-panel row list (contract §3c) — a header row naming
-    /// all four columns, then one row per submission. `list_view` (not a
-    /// `DataTable`): no sortable numeric columns, no drag-reorder verb.
+    /// The column-header row (contract §3c), painted into its own one-row
+    /// rect above the scrolling row list so it stays pinned no matter how
+    /// far `approved_scroll` has advanced. (It used to be item 0 of the row
+    /// list itself, which both scrolled the header away and forced every
+    /// selection index to carry a +1 offset.)
+    fn approved_header_view() -> ListView {
+        ListView {
+            id: WidgetId::new("approved-header"),
+            title: None,
+            items: vec![approved_plain_item(
+                format!(
+                    "{}{}{}{}",
+                    approved_pad("Submission", APPROVED_COL_SUBMISSION),
+                    approved_pad("Client / Project", APPROVED_COL_CLIENT),
+                    approved_pad("Repo(s)", APPROVED_COL_REPOS),
+                    "Outcome",
+                ),
+                Color::rgb(150, 180, 220),
+            )],
+            // No selection highlight on a header: `has_focus: false` keeps
+            // `draw_list` from painting the `▶` prefix / selected background.
+            selected_idx: 0,
+            scroll_offset: 0,
+            has_focus: false,
+            bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
+            show_v_scrollbar: false,
+        }
+    }
+
+    /// #1094-style scroll follow: keep `approved_sel` inside the visible
+    /// window. Must be called after every keyboard nav that moves
+    /// `approved_sel` (`j`/`k`/`Down`/`Up`/`Home`/`End` in `events.rs`) —
+    /// `ListView` has no "scroll to keep the selection visible" behaviour of
+    /// its own, so without this the selection walks off the bottom of the
+    /// first screenful and the selected row is never painted. Mirrors
+    /// `fix_audit_scroll` / `fix_queue_scroll`.
+    ///
+    /// `visible` is the number of *submission* rows the panel can paint —
+    /// pass `content_visible_rows(main_bounds, lh)`, whose one-row title
+    /// deduction matches the pinned header row this panel reserves.
+    pub(crate) fn fix_approved_scroll(&mut self, visible: usize) {
+        if visible == 0 {
+            return;
+        }
+        let sel = self.approved_selected_idx();
+        if sel < self.approved_scroll {
+            self.approved_scroll = sel;
+        } else if sel >= self.approved_scroll + visible {
+            self.approved_scroll = sel + 1 - visible;
+        }
+    }
+
+    /// Build the main-panel row list (contract §3c) — one row per
+    /// submission (the header is painted separately by
+    /// `approved_header_view`). `list_view` (not a `DataTable`): no sortable
+    /// numeric columns, no drag-reorder verb.
     fn approved_list_view(&self, sel: usize) -> ListView {
-        let mut items = Vec::with_capacity(1 + self.approved_submissions().len());
-        items.push(approved_plain_item(
-            format!(
-                "{}{}{}{}",
-                approved_pad("Submission", APPROVED_COL_SUBMISSION),
-                approved_pad("Client / Project", APPROVED_COL_CLIENT),
-                approved_pad("Repo(s)", APPROVED_COL_REPOS),
-                "Outcome",
-            ),
-            Color::rgb(150, 180, 220),
-        ));
+        let mut items = Vec::with_capacity(self.approved_submissions().len());
         for e in self.approved_submissions() {
             let client_project = format!("{} / {}", e.client, e.project_label);
             let repos_text = if e.repos.is_empty() {
@@ -156,10 +209,17 @@ impl CoordApp {
             id: WidgetId::new("approved-list"),
             title: None,
             items,
-            // #1: header occupies index 0, so a row's list index is its
-            // submission index + 1.
-            selected_idx: sel + 1,
-            scroll_offset: 0,
+            selected_idx: sel,
+            // Was hardcoded to `0`, which made every row past the first
+            // screenful unreachable however far `j`/`End` moved the
+            // selection. Kept in step with `approved_sel` by
+            // `fix_approved_scroll` at the events.rs nav sites; `.min(sel)`
+            // is the defensive half — a `/board` poll that shrinks the list
+            // can strand `approved_scroll` below a re-clamped selection, and
+            // the render path must never paint a window the selected row
+            // sits above. (The overshoot half is clamped by quadraui's own
+            // `clamp_scroll_offset`.)
+            scroll_offset: self.approved_scroll.min(sel),
             has_focus: true,
             bordered: false,
             h_scroll: 0,
@@ -246,21 +306,45 @@ impl CoordApp {
         }
 
         let sel = self.approved_selected_idx();
+        // Header row + one row per submission, capped at the panel.
         let list_natural_h = ((entries.len() + 1) as f32 * lh).min(rect.height);
         let (list_rect, detail_rect) = if self.approved_detail_open {
-            let list_rect = Rect::new(rect.x, rect.y, rect.width, list_natural_h);
-            let detail_rect = Rect::new(
-                rect.x,
-                rect.y + list_natural_h,
-                rect.width,
-                (rect.height - list_natural_h).max(0.0),
-            );
+            // The list only ever takes what it actually needs, so a short
+            // list still hands the whole remainder to the detail region —
+            // but the detail region never shrinks below
+            // `APPROVED_DETAIL_MIN_ROWS`, so a list long enough to fill the
+            // panel can no longer squeeze it to zero height (which made
+            // `Enter` look like a no-op). The floor is itself capped at half
+            // the panel so the list above never collapses on a short
+            // terminal either.
+            let min_detail_h = (lh * APPROVED_DETAIL_MIN_ROWS).min(rect.height * 0.5);
+            let detail_h = (rect.height - list_natural_h)
+                .max(min_detail_h)
+                .min(rect.height);
+            let list_h = (rect.height - detail_h).max(0.0);
+            let list_rect = Rect::new(rect.x, rect.y, rect.width, list_h);
+            let detail_rect = Rect::new(rect.x, rect.y + list_h, rect.width, detail_h);
             (list_rect, Some(detail_rect))
         } else {
             (rect, None)
         };
 
-        backend.draw_list(list_rect, &self.approved_list_view(sel));
+        // The header is painted into its own one-row rect so it stays pinned
+        // while the rows below it scroll.
+        let header_h = lh.min(list_rect.height);
+        backend.draw_list(
+            Rect::new(list_rect.x, list_rect.y, list_rect.width, header_h),
+            &Self::approved_header_view(),
+        );
+        backend.draw_list(
+            Rect::new(
+                list_rect.x,
+                list_rect.y + header_h,
+                list_rect.width,
+                (list_rect.height - header_h).max(0.0),
+            ),
+            &self.approved_list_view(sel),
+        );
 
         if let Some(detail_rect) = detail_rect {
             if let Some(entry) = self.approved_selected() {
@@ -341,4 +425,163 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
         lines.push(String::new());
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::fixtures::make_test_app;
+    use quadraui::tui::testing::driver_with_shell;
+
+    /// `n` synthetic approved submissions, ids `sub_0000`..`sub_{n-1}` —
+    /// enough of them to overflow any terminal the driver builds, which is
+    /// the precondition both regressions below need.
+    fn approved_rows(n: usize) -> Vec<ApprovedSubmission> {
+        (0..n)
+            .map(|i| ApprovedSubmission {
+                submission_id: format!("sub_{i:04}"),
+                client: format!("Client {i}"),
+                project_id: format!("proj-{i}"),
+                project_label: format!("Project {i}"),
+                outcome: format!("Outcome number {i} for the acceptance fixture"),
+                audience: "Internal ops".to_string(),
+                done_definition: "Ships and is observable".to_string(),
+                constraints: "No new dependencies".to_string(),
+                repos: vec!["claude-coordinator".to_string()],
+                received_at: "2026-08-01T00:00:00Z".to_string(),
+            })
+            .collect()
+    }
+
+    fn approved_driver(n: usize) -> quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic> {
+        let mut app = make_test_app(BoardData {
+            approved_submissions: approved_rows(n),
+            ..BoardData::default()
+        });
+        app.active_view = SidebarView::Approved;
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        driver.render();
+        driver
+    }
+
+    /// Regression: `approved_list_view` used to hardcode `scroll_offset: 0`,
+    /// so `End` (and a long run of `j`) moved `approved_sel` past the first
+    /// screenful while the list never scrolled — the selected row was simply
+    /// never painted. Same defect class as #1094's `fix_audit_scroll`.
+    #[test]
+    fn end_scrolls_the_last_approved_row_into_view() {
+        let mut driver = approved_driver(60);
+
+        // Precondition: the tail row is genuinely off-screen to begin with,
+        // otherwise this test would pass against the buggy code.
+        assert!(
+            !driver.screen_contains("sub_0059"),
+            "fixture must overflow the panel for this regression to bite:\n{}",
+            driver.screen(),
+        );
+
+        driver.press_named(quadraui::NamedKey::End);
+        driver.render();
+
+        assert!(
+            driver.screen_contains("sub_0059"),
+            "End must scroll the last approved row into view:\n{}",
+            driver.screen(),
+        );
+    }
+
+    /// Same regression from the other direction: repeated `j` past the
+    /// bottom of the window must drag the viewport along with it, and `k`
+    /// back to the head must rewind it.
+    #[test]
+    fn j_and_k_keep_the_selected_approved_row_on_screen() {
+        let mut driver = approved_driver(60);
+
+        for _ in 0..50 {
+            driver.type_char('j');
+        }
+        driver.render();
+        assert!(
+            driver.screen_contains("sub_0050"),
+            "j past the first screenful must scroll the selection into view:\n{}",
+            driver.screen(),
+        );
+
+        for _ in 0..50 {
+            driver.type_char('k');
+        }
+        driver.render();
+        assert!(
+            driver.screen_contains("sub_0000"),
+            "k back to the head must rewind the scroll window:\n{}",
+            driver.screen(),
+        );
+    }
+
+    /// The column header is painted into its own pinned rect, so it survives
+    /// scrolling instead of being item 0 of the scrolled list.
+    #[test]
+    fn column_header_stays_pinned_while_the_list_scrolls() {
+        let mut driver = approved_driver(60);
+        driver.press_named(quadraui::NamedKey::End);
+        driver.render();
+
+        assert!(
+            driver.screen_contains("Submission"),
+            "the column header must stay pinned once the list has scrolled:\n{}",
+            driver.screen(),
+        );
+    }
+
+    /// Regression: `render_approved_panel` handed the detail region whatever
+    /// height the list did not use, with no floor — so on a list long enough
+    /// to fill the panel `detail_rect` was zero-height and `Enter` looked
+    /// like a no-op. `render_audit_panel` has reserved a floor for exactly
+    /// this since it shipped.
+    #[test]
+    fn detail_pane_still_renders_when_the_list_fills_the_panel() {
+        let mut driver = approved_driver(60);
+        assert!(
+            !driver.screen_contains("Submission Detail"),
+            "detail must start closed:\n{}",
+            driver.screen(),
+        );
+
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        assert!(
+            driver.screen_contains("Submission Detail"),
+            "Enter must open a non-degenerate detail region even when the \
+             row list alone would fill the panel:\n{}",
+            driver.screen(),
+        );
+        for label in ["outcome:", "audience:", "done:", "constraints:"] {
+            assert!(
+                driver.screen_contains(label),
+                "the detail floor must leave room for the `{label}` field:\n{}",
+                driver.screen(),
+            );
+        }
+    }
+
+    /// The short-list case must be unchanged: with only a couple of rows the
+    /// detail region still gets all the leftover height, not just the floor.
+    #[test]
+    fn short_list_detail_pane_keeps_the_whole_remainder() {
+        let mut driver = approved_driver(2);
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        assert!(
+            driver.screen_contains("Submission Detail"),
+            "Enter must open the detail region on a short list too:\n{}",
+            driver.screen(),
+        );
+        assert!(
+            driver.screen_contains("received:"),
+            "the last detail field must be visible on a short list:\n{}",
+            driver.screen(),
+        );
+    }
 }
