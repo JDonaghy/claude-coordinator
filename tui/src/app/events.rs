@@ -2660,6 +2660,17 @@ impl CoordApp {
                         self.audit_detail_open = false;
                         needs_redraw = true;
                     }
+                    // #2532 (contract §3e): Esc closes the Approved
+                    // submission-detail pane back to the list-only view —
+                    // must precede the unguarded catch-all below, same
+                    // reasoning as the Audit arm just above.
+                    Key::Named(NamedKey::Escape)
+                        if self.active_view == SidebarView::Approved
+                            && self.approved_detail_open =>
+                    {
+                        self.approved_detail_open = false;
+                        needs_redraw = true;
+                    }
                     // #1040 contract §10: Esc clears all active Audit
                     // filters (time-range/category/type text) back to their
                     // defaults and re-arms the fetch — must precede the
@@ -2937,6 +2948,37 @@ impl CoordApp {
                     {
                         self.audit_category = self.audit_category.next();
                         self.on_audit_filters_changed();
+                        needs_redraw = true;
+                    }
+
+                    // ── Approved work items panel keyboard nav (#2532) ───
+                    // Nav/Enter are only meaningful in list-only mode; Esc
+                    // closes the detail pane back to the list (handled
+                    // earlier, alongside the other pending-state Escape
+                    // guards — see the Audit Esc arm above).
+                    Key::Char('j') | Key::Named(NamedKey::Down)
+                        if self.active_view == SidebarView::Approved
+                            && !self.approved_detail_open =>
+                    {
+                        let n = self.approved_submissions().len();
+                        if n > 0 {
+                            self.approved_sel = (self.approved_sel + 1).min(n - 1);
+                        }
+                        needs_redraw = true;
+                    }
+                    Key::Char('k') | Key::Named(NamedKey::Up)
+                        if self.active_view == SidebarView::Approved
+                            && !self.approved_detail_open =>
+                    {
+                        self.approved_sel = self.approved_sel.saturating_sub(1);
+                        needs_redraw = true;
+                    }
+                    Key::Named(NamedKey::Enter)
+                        if self.active_view == SidebarView::Approved
+                            && !self.approved_detail_open
+                            && !self.approved_submissions().is_empty() =>
+                    {
+                        self.approved_detail_open = true;
                         needs_redraw = true;
                     }
 
@@ -3598,6 +3640,10 @@ impl CoordApp {
                             // #1866: Queue grid j/k handled by the earlier
                             // guarded arm.
                             SidebarView::Queue => {}
+                            // #2532: Approved list j/k handled by the
+                            // earlier guarded arm (approved.rs); a no-op
+                            // here, same posture as Audit/Queue above.
+                            SidebarView::Approved => {}
                         }
                         needs_redraw = true;
                     }
@@ -3668,6 +3714,8 @@ impl CoordApp {
                             SidebarView::Reports => {}
                             // #1866: see Down/j arm above.
                             SidebarView::Queue => {}
+                            // #2532: see Down/j arm above.
+                            SidebarView::Approved => {}
                         }
                         needs_redraw = true;
                     }
@@ -3927,6 +3975,10 @@ impl CoordApp {
                                 self.queue_set_sel(0);
                                 self.queue_scroll = 0;
                             }
+                            // #2532: Approved — Home jumps to the first row.
+                            SidebarView::Approved => {
+                                self.approved_sel = 0;
+                            }
                         }
                         needs_redraw = true;
                     }
@@ -4030,6 +4082,13 @@ impl CoordApp {
                                     ctx.main_bounds(),
                                     lh,
                                 ));
+                            }
+                            // #2532: Approved — End jumps to the last row.
+                            SidebarView::Approved => {
+                                let n = self.approved_submissions().len();
+                                if n > 0 {
+                                    self.approved_sel = n - 1;
+                                }
                             }
                         }
                         needs_redraw = true;
@@ -6182,6 +6241,10 @@ impl CoordApp {
             // #1866: Queue sidebar is a read-only count summary; the grid
             // lives in the main panel (`mouse_main_click`).
             SidebarView::Queue => false,
+            // #2532: Approved sidebar is a read-only aggregate reading; the
+            // row list lives in the main panel (`mouse_main_click`), same
+            // posture as Queue immediately above.
+            SidebarView::Approved => false,
         }
     }
 
@@ -7082,6 +7145,9 @@ impl CoordApp {
             SidebarView::Reports => false,
             // #1866: Queue sidebar is a short count summary — no scroll.
             SidebarView::Queue => false,
+            // #2532: Approved sidebar is a short aggregate summary — no
+            // scroll, same posture as Queue immediately above.
+            SidebarView::Approved => false,
         }
     }
 
@@ -7475,6 +7541,9 @@ impl CoordApp {
                 }
                 true
             }
+            // #2532: Approved panel — j/k handles navigation; wheel is a
+            // no-op for now, same posture as Plans/Audit/MergeQueue above.
+            SidebarView::Approved => true,
         }
     }
 

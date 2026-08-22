@@ -137,6 +137,12 @@ impl ShellApp for CoordApp {
                 SidebarView::Queue => {
                     backend.draw_list(sidebar_rect, &self.queue_sidebar());
                 }
+                // #2532: Approved work items sidebar — the aggregate
+                // reading ("N ready to pull" + the conditional "missing a
+                // repo mapping" warning line, contract §3b).
+                SidebarView::Approved => {
+                    backend.draw_list(sidebar_rect, &self.approved_sidebar());
+                }
             }
         }
 
@@ -577,6 +583,11 @@ impl ShellApp for CoordApp {
             SidebarView::Queue => {
                 self.render_queue_panel(backend, m, lh);
             }
+            // #2532: Approved work items panel — the row list, with an
+            // inline detail split when `approved_detail_open`.
+            SidebarView::Approved => {
+                self.render_approved_panel(backend, m, lh);
+            }
         }
 
         // ── Inject chat overlay — renders over the main panel ───────────
@@ -760,6 +771,9 @@ impl ShellApp for CoordApp {
             // no fetch of its own (`/board` already ships `drive_queue`), so
             // unlike `panel:pipeline` above there is nothing to kick here.
             "panel:queue" => SidebarView::Queue,
+            // #2532: Approved work items panel — no fetch to kick, same as
+            // Queue immediately above (rows ride the existing `/board` poll).
+            "panel:approved" => SidebarView::Approved,
             _ => return,
         };
         // #1124: the `?` help overlay / `/` command palette are scoped to

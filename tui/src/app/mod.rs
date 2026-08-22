@@ -158,6 +158,9 @@ pub(crate) mod drive;
 pub(crate) mod escalation;
 pub(crate) mod fleet_health;
 pub(crate) mod drive_queue;
+// #2532 (ms-67 contract §3): Approved work items panel — portal submissions
+// ready for decomposition into coordinator work.
+pub(crate) mod approved;
 // #2282 (ms-65): per-panel document tabs with VS Code preview/pin semantics.
 pub(crate) mod doc_tabs;
 #[allow(unused_imports)]
@@ -2538,6 +2541,16 @@ pub struct CoordApp {
     /// the pre-#2500 behavior where the context-menu click fired
     /// unconditionally). Same posture as `pending_drive_queue_after`.
     pending_gate_a_changes_note: Option<PendingGateAChangesNote>,
+    // ── #2532: Approved work items ActivityBar panel ─────────────────────
+    /// Selected row index (0-based) into `approved_submissions()` (contract
+    /// §3c's oldest-first order). Clamped to bounds on navigation, same
+    /// pattern as `audit_sel`.
+    approved_sel: usize,
+    /// `true` when the inline submission-detail pane (Enter on a selected
+    /// row) is open. `Esc` closes it back to the list-only view (contract
+    /// §3e), same pattern as `audit_detail_open`.
+    approved_detail_open: bool,
+
     /// #1866 (Q-1): selected row index into `queue_rows()` — the Queue
     /// panel's own *filtered, possibly re-sorted* row set.
     queue_sel: usize,
@@ -3909,6 +3922,8 @@ impl CoordApp {
             fleet_health_overlay_open: false,
             pending_drive_queue_after: None,
             pending_gate_a_changes_note: None,
+            approved_sel: 0,
+            approved_detail_open: false,
             queue_sel: 0,
             queue_scroll: 0,
             queue_sort: None,
@@ -4337,6 +4352,20 @@ impl CoordApp {
                     icon: "⇅".into(),
                     tooltip: "Queue".into(),
                     title: "QUEUE".into(),
+                },
+                // #2532 (ms-67 contract §3a): Approved work items panel —
+                // portal submissions ready for decomposition. `✓` collides
+                // with none of the icons above (B M ▶ >_ ▦ ≣ ◆ ◉ § ▤ ⇅) or
+                // the pinned ⚙; it echoes the same glyph `icon_for_action`
+                // already uses for `mark-refined`/`approve-gate-a`/`ready`
+                // (a different namespace — panel icon vs. row-action icon —
+                // so not a re-collision). Appended after Queue and before
+                // the bottom-pinned Settings, per contract §3a.
+                PanelDefinition {
+                    id: WidgetId::new("panel:approved"),
+                    icon: "✓".into(),
+                    tooltip: "Approved work items".into(),
+                    title: "APPROVED WORK ITEMS".into(),
                 },
             ],
         )
@@ -9365,6 +9394,16 @@ impl CoordApp {
                 " j/k=section  Space=collapse  Tab=field  ←/→=value  \
                  Enter=run  r=re-run  q=quit "
                     .to_string()
+            }
+        } else if self.active_view == SidebarView::Approved {
+            // #2532 contract §3d/§3e: three hint sets — empty, list-mode,
+            // detail-mode — same three-way shape Audit/Queue use above.
+            if self.approved_submissions().is_empty() {
+                " no approved submissions  q=quit ".to_string()
+            } else if self.approved_detail_open {
+                " j/k=nav  Esc=close detail  right-click=menu  q=quit ".to_string()
+            } else {
+                " j/k=nav  Enter=detail  right-click=menu  q=quit ".to_string()
             }
         } else if self.active_view == SidebarView::Queue {
             // #1866: the two hint sets are "there is a queue" and "there

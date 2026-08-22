@@ -1703,6 +1703,11 @@ pub(crate) fn load_data() -> BoardData {
         // segment renders "QUEUE: empty" (which is the truth for this
         // client, and never a fabricated alert) on this path.
         Vec::new(),
+        // #2532: the `approved_submissions` join (portal submission →
+        // #2531's project↔repo mapping) is server-side only, same posture
+        // as `drive_queue` above. Pass empty; the Approved panel renders
+        // its "0 ready to pull" empty state on this path.
+        Vec::new(),
     )
 }
 
@@ -1744,6 +1749,7 @@ pub(crate) fn assemble_board_data(
     escalations: Vec<EscalationEntry>,
     fleet_health: FleetHealthBlock,
     drive_queue: Vec<BoardDriveQueueEntry>,
+    approved_submissions: Vec<ApprovedSubmission>,
 ) -> BoardData {
     // ── Machine reachability probes + health fetches ──────────────────────
     // Probe using the Tailscale host (fixes #121: machine name ≠ Tailscale hostname).
@@ -1865,6 +1871,7 @@ pub(crate) fn assemble_board_data(
         escalations,
         fleet_health,
         drive_queue,
+        approved_submissions,
     }
 }
 
@@ -2626,6 +2633,10 @@ pub(crate) fn load_data_remote(url: &str, token: Option<&str>) -> BoardData {
         // `#[serde(default)]`) on daemons that predate #1753, which never
         // emit this key at all.
         payload.drive_queue,
+        // #2532: server-computed approved-submissions list (repos already
+        // resolved via #2531's project↔repo mapping); empty (via
+        // `#[serde(default)]`) on daemons that predate #2532.
+        payload.approved_submissions,
     )
 }
 

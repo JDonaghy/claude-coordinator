@@ -155,6 +155,8 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         fleet_health_overlay_open: false,
         pending_drive_queue_after: None,
         pending_gate_a_changes_note: None,
+        approved_sel: 0,
+        approved_detail_open: false,
         queue_sel: 0,
         queue_scroll: 0,
         queue_sort: None,
@@ -587,6 +589,7 @@ fn board_data_from_payload(payload: BoardPayload) -> BoardData {
         escalations: payload.escalations,
         fleet_health: payload.fleet_health,
         drive_queue: payload.drive_queue,
+        approved_submissions: payload.approved_submissions,
     }
 }
 
