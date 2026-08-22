@@ -203,6 +203,7 @@ def reconcile_completed_assignments(
     agent_status_fn=_query_agent,
     update_state_fn=None,
     capture_plan: bool = True,
+    commits_ahead_fn=None,
 ) -> list[dict]:
     """Dispatch-free passive completion reconcile (#625).
 
@@ -275,9 +276,22 @@ def reconcile_completed_assignments(
     The fix is a positive disproof: ``/status`` carries both ``active`` and
     ``completed``, and an id in NEITHER is a statement about the agent's state,
     not an inference from its silence.  Those — and only those — are
-    reconciled, to ``failed`` (never ``done``) with :data:`NO_AGENT_RECORD_
-    REASON`.  See :func:`agent_has_no_record` and
-    :func:`_reconcile_no_agent_record`.
+    reconciled, never to ``done``, with :data:`NO_AGENT_RECORD_REASON`.  See
+    :func:`agent_has_no_record` and :func:`_reconcile_no_agent_record`.
+
+    **#2553 — "the agent forgot" is not "the work is gone".** The arm above
+    used to record ``failed`` unconditionally, but "the agent has no record"
+    is evidence about the agent's memory, not about the work: a
+    :data:`~coord.models.WORK_LIKE_TYPES` row's own ``branch`` is the one
+    artifact in this path that survives an agent restart, a machine reboot,
+    and the 25-entry completion-history cap, and the board row already has
+    its name. :func:`_reconcile_no_agent_record` now consults it
+    (``commits_ahead_fn``, defaulting to :func:`coord.github_ops.
+    branch_commits_ahead_for_assignment`) before choosing ``failed`` — a
+    branch with real commits ahead of its base lands on ``advisory`` instead
+    (work exists, provenance unverified, needs a human or a verify pass),
+    naming the branch in the reason so an operator doesn't have to go
+    spelunking for it.
 
     Three guards, because **this arm reaps** and #1658 is what getting that
     wrong looks like in production:
@@ -301,12 +315,23 @@ def reconcile_completed_assignments(
     #1421's handler) — and there the workers really are gone, so reconciling
     every row on that machine is the correct answer rather than an accident.
 
+    ``commits_ahead_fn`` (#2553) is the injectable seam for the branch check
+    above — ``fn(assignment, config) -> int | None`` — defaulting to
+    :func:`coord.github_ops.branch_commits_ahead_for_assignment`.  Tests stub
+    it to avoid a real ``gh`` call, exactly like ``agent_status_fn`` stubs the
+    real agent poll.
+
     Returns one dict per reconciled assignment (empty when nothing changed).
     """
     if update_state_fn is None:
         from coord.issue_store import _update_local_state  # noqa: PLC0415
 
         update_state_fn = _update_local_state
+
+    if commits_ahead_fn is None:
+        from coord import github_ops  # noqa: PLC0415
+
+        commits_ahead_fn = github_ops.branch_commits_ahead_for_assignment
 
     if board is None:
         from coord.state import build_board  # noqa: PLC0415
@@ -352,7 +377,10 @@ def reconcile_completed_assignments(
                 and not is_attended_session(a)
                 and _no_record_grace_elapsed(a)
             ):
-                _reconcile_no_agent_record(a, aid, update_state_fn, reconciled)
+                _reconcile_no_agent_record(
+                    a, aid, update_state_fn, reconciled,
+                    config=config, commits_ahead_fn=commits_ahead_fn,
+                )
             continue
         # #1534: `effective_agent_status` refuses an agent-reported `done`
         # that also carries a usage-limit-kill reason — the daemon's passive
@@ -516,49 +544,123 @@ def reconcile_completed_assignments(
     return reconciled
 
 
+def _no_agent_record_branch_reason(branch: str, ahead: int) -> str:
+    """#2553's operator-facing reason for the "work is on the branch" half.
+
+    Distinct from :data:`NO_AGENT_RECORD_REASON` (the "nothing was pushed"
+    half) precisely so the two are told apart at a glance — the acceptance
+    bar for #2553 is that the reason NAMES the branch rather than making an
+    operator go looking for it, since that branch is the whole point: it is
+    the one artifact of this leg that survived the agent's amnesia.
+    """
+    return (
+        "agent has no record of this assignment (present in neither its "
+        "/status `active` nor `completed` list), but its branch "
+        f"`{branch}` has {ahead} commit(s) ahead of its base — the worker "
+        "pushed real work before the agent's record of it was lost. "
+        "Provenance is unverified (no worker ever reported a verdict), so "
+        "this is recorded as advisory rather than failed: it needs a human "
+        "or a verify pass, not to be discarded (#2553)"
+    )
+
+
 def _reconcile_no_agent_record(
     a: Assignment,
     aid: str,
     update_state_fn,
     reconciled: list[dict],
+    *,
+    config: Config,
+    commits_ahead_fn,
 ) -> None:
-    """#2275: flip a ``running`` row the agent has no record of to ``failed``.
+    """#2275: flip a ``running`` row the agent has no record of to a terminal
+    status — ``failed`` by default, or ``advisory`` when #2553's branch check
+    below finds the row's own branch outlived the agent's amnesia.
 
     Called from :func:`reconcile_completed_assignments` only, and only once
     all three guards there have passed (positive disproof, not attended, past
     the grace window).
 
-    **``failed``, never ``done``.** This leg never reported a verdict, so the
-    one thing that must not happen is a silent flip to ``done`` — that
-    manufactures a pass and every downstream gate (review dispatch, the
-    acceptance gate, the merge queue) then behaves as if a slice exists that
-    nobody ever produced.  A stall is bad; a manufactured pass is worse.
-    ``failure_reason`` is the pinned :data:`NO_AGENT_RECORD_REASON`, so
-    ``coord status``/the TUI/``coord drive`` all name the cause rather than
-    showing a failure with no explanation.
+    **Never ``done``.** This leg never reported a verdict, so the one thing
+    that must not happen — regardless of which terminal status below fires —
+    is a silent flip to ``done``: that manufactures a pass and every
+    downstream gate (review dispatch, the acceptance gate, the merge queue)
+    then behaves as if a slice exists that nobody ever produced.  A stall is
+    bad; a manufactured pass is worse.
 
-    ``exit_code`` is deliberately left ``None``: there is no reap, so there is
-    no exit code, and writing a fake one would be the same class of lie as
-    writing ``done``.
+    **#2553 — "the agent forgot" is evidence about the agent, not the work.**
+    Before this, every row reaching here was unconditionally recorded
+    ``failed`` with :data:`NO_AGENT_RECORD_REASON`, even when the row's own
+    ``branch`` carried real, pushed commits — stranding that work with no
+    second chance (most visible on ``test-author``, whose sealed-path rule
+    means nothing else will ever pick the branch back up; see
+    claude-coordinator#2553, ``coord-portal``#129 assignment
+    ``c2120f7206ec``). The branch is the one artifact in this whole path
+    that survives an agent restart, a machine reboot, and the 25-entry
+    completion-history cap, and the board row already names it — so this now
+    asks it directly via ``commits_ahead_fn(a, config)`` before choosing:
+
+    * Only for :data:`~coord.models.WORK_LIKE_TYPES` (``work``,
+      ``mock-author``, ``test-author``) — the types whose ``a.branch`` holds
+      commits THIS row itself produced.  A ``smoke``/``review`` row's
+      ``branch`` is inherited verbatim from the work it rides on (e.g.
+      ``coord.smoke.dispatch_pending_smoke`` stamps
+      ``branch=completed.branch``), so "commits ahead of base" there would
+      just be re-discovering the PARENT's diff, not anything this leg
+      produced — checking it would misfire the #2208 smoke path (a dead Test
+      leg on an already-green branch) into ``advisory`` instead of the
+      environmental clear it needs.
+    * A positive, known commit count (``ahead`` a plain ``int > 0``) is the
+      only thing that moves the needle, to ``advisory`` with
+      :func:`_no_agent_record_branch_reason` (which names the branch).
+      Anything else — no branch, a non-``WORK_LIKE_TYPES`` row, ``ahead ==
+      0``, or ``ahead is None`` (unknown: the repo isn't in ``config``, the
+      remote call failed, ...) — keeps the pre-#2553 behaviour: ``failed``
+      with :data:`NO_AGENT_RECORD_REASON`.  Unknown fails CLOSED toward
+      ``failed`` rather than guessing ``advisory``, matching this arm's
+      existing polarity: a stall is recoverable, a manufactured verdict of
+      either kind is not the thing to guess at.
+    * ``commits_ahead_fn`` is called defensively — a network hiccup querying
+      the remote must not crash the passive daemon tick any more than an
+      unreachable agent does elsewhere in this module.
+
+    ``exit_code`` is deliberately left ``None`` in both cases: there is no
+    reap, so there is no exit code, and writing a fake one would be the same
+    class of lie as writing ``done``.
 
     Kept passive, per this module's #1616 contract — it writes state through
-    the same ``update_state_fn`` seam and dispatches nothing.  The ONE thing
-    it does beyond the write is the #1605 Test-stage propagation, which is not
-    a new side effect: it is the same call the ordinary ``terminal ==
-    "failed"`` path already makes, and skipping it would leave the parent
-    work row's ``test_state="running"`` forever — i.e. it would fix half of
-    #2208 and leave the other half stranded.
+    the same ``update_state_fn`` seam and dispatches nothing.  The commits-
+    ahead check is a read, not a mutation, and it decides between two
+    non-dispatching terminal states — it does not advance the pipeline any
+    more than the write itself does.  The #1605 Test-stage propagation below
+    is not a new side effect either: it is the same call the ordinary
+    ``terminal == "failed"`` path already makes, and skipping it would leave
+    the parent work row's ``test_state="running"`` forever — i.e. it would
+    fix half of #2208 and leave the other half stranded.
     """
+    terminal_status = "failed"
+    reason = NO_AGENT_RECORD_REASON
+    branch = (a.branch or "").strip()
+
+    if branch and a.type in WORK_LIKE_TYPES:
+        try:
+            ahead = commits_ahead_fn(a, config)
+        except Exception:  # noqa: BLE001 — best-effort; unknown → failed below
+            ahead = None
+        if isinstance(ahead, int) and not isinstance(ahead, bool) and ahead > 0:
+            terminal_status = "advisory"
+            reason = _no_agent_record_branch_reason(branch, ahead)
+
     update_state_fn(
         assignment_id=aid,
-        terminal_status="failed",
+        terminal_status=terminal_status,
         branch=a.branch,
         review_state=None,
-        failure_reason=NO_AGENT_RECORD_REASON,
+        failure_reason=reason,
         exit_code=None,
     )
 
-    if a.type == "smoke":
+    if a.type == "smoke" and terminal_status == "failed":
         # #2275: environmental by construction, so state it rather than
         # letting `classify_failure` guess.  `NO_AGENT_RECORD_REASON` is
         # coordinator-authored prose with no wire token in it, so the
@@ -569,9 +671,12 @@ def _reconcile_no_agent_record(
         # vanished worker is the machine's fault, not the work's; clearing
         # the verdict lets `dispatch_pending_smoke` re-run the Test stage on
         # its next tick, which is exactly what a human did in 14 minutes.
+        # (`terminal_status` is always "failed" for `smoke` in practice — the
+        # branch check above only ever fires for WORK_LIKE_TYPES — but the
+        # guard keeps this correct even if that scoping ever changes.)
         propagate_smoke_terminal_failure(
             parent_assignment_id=a.review_of_assignment_id,
-            failure_reason=NO_AGENT_RECORD_REASON,
+            failure_reason=reason,
             environmental=True,
         )
 
@@ -581,9 +686,9 @@ def _reconcile_no_agent_record(
             "issue_number": a.issue_number,
             "repo": a.repo_name,
             "type": a.type,
-            "to_status": "failed",
+            "to_status": terminal_status,
             "plan_captured": False,
-            "reason": NO_AGENT_RECORD_REASON,
+            "reason": reason,
         }
     )
 

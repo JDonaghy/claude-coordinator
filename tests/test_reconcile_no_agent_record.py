@@ -23,6 +23,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 from coord.config import Config
 from coord.models import Assignment, Board, Machine, Repo
 from coord.reconcile import (
@@ -31,6 +33,26 @@ from coord.reconcile import (
     is_attended_session,
     reconcile_completed_assignments,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_real_gh_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Safety net for #2553's branch check: every test in this module either
+    doesn't reach `_reconcile_no_agent_record`'s branch check at all, or
+    passes its own `commits_ahead_fn` stub. If a future test reaches it
+    without stubbing, this fails loudly instead of silently shelling out to
+    a real `gh` for a repo (`acme/cc`) that doesn't exist."""
+
+    def _boom(*_a, **_kw):  # pragma: no cover - only runs on regression
+        raise AssertionError(
+            "a test reached the real github_ops.branch_commits_ahead_for_"
+            "assignment default — pass commits_ahead_fn= explicitly instead "
+            "of hitting the network from a unit test"
+        )
+
+    monkeypatch.setattr(
+        "coord.github_ops.branch_commits_ahead_for_assignment", _boom
+    )
 
 
 def _config() -> Config:
@@ -97,6 +119,14 @@ def _status(*, active: list[dict] | None = None, completed: list[dict] | None = 
     return {"active": list(active or []), "completed": list(completed or [])}
 
 
+def _zero_ahead(*_a, **_kw) -> int:
+    """Stub `commits_ahead_fn` (#2553): "nothing pushed" — the pre-#2553
+    default. Passed explicitly by every test below that doesn't itself
+    exercise the branch-has-work half, so the no-record arm never shells out
+    to a real `gh` for a repo (`acme/cc`) that doesn't exist."""
+    return 0
+
+
 # ── the fix ────────────────────────────────────────────────────────────────
 
 
@@ -113,6 +143,7 @@ def test_row_in_neither_list_is_reconciled_to_failed_with_pinned_reason() -> Non
         ),
         update_state_fn=rec,
         capture_plan=False,
+        commits_ahead_fn=_zero_ahead,
     )
 
     assert len(rec.calls) == 1
@@ -158,6 +189,7 @@ def test_never_flips_to_done() -> None:
         agent_status_fn=lambda host: _status(),
         update_state_fn=rec,
         capture_plan=False,
+        commits_ahead_fn=_zero_ahead,
     )
     assert [c["terminal_status"] for c in rec.calls] == ["failed", "failed", "failed"]
 
@@ -176,6 +208,7 @@ def test_empty_agent_reconciles_every_row_on_that_machine() -> None:
         agent_status_fn=lambda host: _status(),
         update_state_fn=rec,
         capture_plan=False,
+        commits_ahead_fn=_zero_ahead,
     )
     assert {c["assignment_id"] for c in rec.calls} == {"a1", "a2", "a3"}
     assert len(out) == 3
@@ -208,6 +241,147 @@ def test_restart_recovered_row_takes_the_ordinary_path_not_the_no_record_arm() -
     # NOT the #2275 reason — the agent had a record and gave a real one.
     assert rec.calls[0]["failure_reason"] != NO_AGENT_RECORD_REASON
     assert rec.calls[0]["exit_code"] == 1
+
+
+# ── #2553: consult the row's own branch before guessing `failed` ───────────
+#
+# coord-portal#129, assignment c2120f7206ec: a `test-author` leg pushed 948
+# lines to `test-author-ms-4-slice-129` and then the agent forgot about it.
+# The no-record arm recorded `failed` without ever looking at the branch it
+# was already holding the name of, stranding real work behind a sealed path
+# nothing else would ever pick back up.
+
+
+def test_branch_with_pushed_commits_is_advisory_not_failed() -> None:
+    """Acceptance half 1: agent forgot, but the branch has commits ahead of
+    its base → `advisory`, not `failed` — the work must not be discarded."""
+    rec = _Recorder()
+    out = reconcile_completed_assignments(
+        _config(),
+        board=_board(_running("ta1", atype="test-author", branch="test-author-ms-4-slice-129")),
+        agent_status_fn=lambda host: _status(),
+        update_state_fn=rec,
+        capture_plan=False,
+        commits_ahead_fn=lambda a, cfg: 11,
+    )
+
+    assert len(rec.calls) == 1
+    assert rec.calls[0]["terminal_status"] == "advisory"
+    assert rec.calls[0]["branch"] == "test-author-ms-4-slice-129"
+    assert rec.calls[0]["exit_code"] is None
+    reason = rec.calls[0]["failure_reason"]
+    assert reason != NO_AGENT_RECORD_REASON
+    # The operator-facing reason must name the branch — that's the whole
+    # acceptance bar: an operator reading `coord status` shouldn't have to
+    # go spelunking for which branch carries the stranded work.
+    assert "test-author-ms-4-slice-129" in reason
+    assert "11" in reason
+    assert "#2553" in reason
+    assert out[0]["to_status"] == "advisory"
+    assert out[0]["reason"] == reason
+
+
+def test_branch_with_zero_commits_ahead_is_still_failed() -> None:
+    """Acceptance half 2: agent forgot, and nothing was ever pushed → the
+    pre-#2553 `failed` + pinned reason, unchanged."""
+    rec = _Recorder()
+    out = reconcile_completed_assignments(
+        _config(),
+        board=_board(_running("w1", atype="work")),
+        agent_status_fn=lambda host: _status(),
+        update_state_fn=rec,
+        capture_plan=False,
+        commits_ahead_fn=lambda a, cfg: 0,
+    )
+
+    assert rec.calls[0]["terminal_status"] == "failed"
+    assert rec.calls[0]["failure_reason"] == NO_AGENT_RECORD_REASON
+    assert out[0]["to_status"] == "failed"
+
+
+def test_unknown_commits_ahead_fails_closed_to_failed() -> None:
+    """An unconfirmable branch state (network hiccup, unknown repo, ...)
+    must not be guessed as `advisory` — that would be manufacturing a
+    "provenance unverified" verdict on no evidence at all. Fails closed to
+    the pre-#2553 `failed`, matching this arm's existing polarity."""
+    rec = _Recorder()
+    reconcile_completed_assignments(
+        _config(),
+        board=_board(_running("w1", atype="work")),
+        agent_status_fn=lambda host: _status(),
+        update_state_fn=rec,
+        capture_plan=False,
+        commits_ahead_fn=lambda a, cfg: None,
+    )
+    assert rec.calls[0]["terminal_status"] == "failed"
+    assert rec.calls[0]["failure_reason"] == NO_AGENT_RECORD_REASON
+
+
+def test_commits_ahead_fn_raising_fails_closed_to_failed() -> None:
+    """A network error from the branch check must not crash the passive
+    daemon tick — caught and treated as unknown, same as a `None` return."""
+    rec = _Recorder()
+    reconcile_completed_assignments(
+        _config(),
+        board=_board(_running("w1", atype="work")),
+        agent_status_fn=lambda host: _status(),
+        update_state_fn=rec,
+        capture_plan=False,
+        commits_ahead_fn=lambda a, cfg: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    assert rec.calls[0]["terminal_status"] == "failed"
+    assert rec.calls[0]["failure_reason"] == NO_AGENT_RECORD_REASON
+
+
+def test_branch_check_is_scoped_to_work_like_types() -> None:
+    """A `smoke`/`review` row's `branch` is inherited verbatim from the work
+    it rides on (see `coord.smoke.dispatch_pending_smoke`), so it is almost
+    always "ahead" for reasons that have nothing to do with what THIS leg
+    produced. The branch check must not run for these types — checked here
+    by making the stub explode if it's ever called for a non-WORK_LIKE_TYPES
+    row, which would otherwise misroute the #2208 smoke path into
+    `advisory` instead of its environmental `failed` clear."""
+
+    def _boom(a, cfg):  # pragma: no cover - only runs on regression
+        raise AssertionError(
+            f"commits_ahead_fn was called for a.type={a.type!r}, which is "
+            "not in WORK_LIKE_TYPES"
+        )
+
+    rec = _Recorder()
+    out = reconcile_completed_assignments(
+        _config(),
+        board=_board(
+            _running("smoke-1", atype="smoke", review_of="work-1"),
+            _running("review-1", atype="review"),
+        ),
+        agent_status_fn=lambda host: _status(),
+        update_state_fn=rec,
+        capture_plan=False,
+        commits_ahead_fn=_boom,
+    )
+    assert [c["terminal_status"] for c in rec.calls] == ["failed", "failed"]
+    assert [o["to_status"] for o in out] == ["failed", "failed"]
+
+
+def test_no_branch_recorded_is_still_failed() -> None:
+    """A row with no branch at all has nothing to consult — straight to the
+    pre-#2553 `failed` path without ever calling `commits_ahead_fn`."""
+
+    def _boom(a, cfg):  # pragma: no cover - only runs on regression
+        raise AssertionError("commits_ahead_fn was called with no branch")
+
+    rec = _Recorder()
+    reconcile_completed_assignments(
+        _config(),
+        board=_board(_running("w1", atype="work", branch=None)),
+        agent_status_fn=lambda host: _status(),
+        update_state_fn=rec,
+        capture_plan=False,
+        commits_ahead_fn=_boom,
+    )
+    assert rec.calls[0]["terminal_status"] == "failed"
+    assert rec.calls[0]["failure_reason"] == NO_AGENT_RECORD_REASON
 
 
 # ── guard rails ────────────────────────────────────────────────────────────
@@ -316,6 +490,7 @@ def test_grace_window_defers_a_just_dispatched_row() -> None:
         agent_status_fn=lambda host: _status(),
         update_state_fn=rec,
         capture_plan=False,
+        commits_ahead_fn=_zero_ahead,
     )
     assert rec.calls == []
     assert out == []
@@ -328,6 +503,7 @@ def test_grace_window_defers_a_just_dispatched_row() -> None:
         agent_status_fn=lambda host: _status(),
         update_state_fn=rec2,
         capture_plan=False,
+        commits_ahead_fn=_zero_ahead,
     )
     assert [c["assignment_id"] for c in rec2.calls] == ["fresh"]
 
@@ -342,6 +518,7 @@ def test_row_with_no_dispatched_at_is_eligible() -> None:
         agent_status_fn=lambda host: _status(),
         update_state_fn=rec,
         capture_plan=False,
+        commits_ahead_fn=_zero_ahead,
     )
     assert [c["assignment_id"] for c in rec.calls] == ["nodate"]
 
@@ -359,7 +536,13 @@ def test_agent_has_no_record_predicate() -> None:
 
 def test_arm_stays_passive_no_dispatch_no_github(monkeypatch) -> None:
     """#1616's contract: this function reflects state, it never advances the
-    pipeline.  The no-record arm must not become the exception."""
+    pipeline.  The no-record arm must not become the exception.
+
+    #2553's branch check is a READ (`commits_ahead_fn`), not a mutation, and
+    it only decides between two non-dispatching terminal statuses — it does
+    not violate this contract, so it is stubbed here (like `agent_status_fn`
+    always has been) rather than asserted against. What must still never
+    happen is a dispatch (`_reassign`) or a posted comment (`httpx.post`)."""
     import coord.reconcile as rec_mod
 
     def _boom(*a, **kw):  # pragma: no cover - only runs on regression
@@ -375,6 +558,7 @@ def test_arm_stays_passive_no_dispatch_no_github(monkeypatch) -> None:
         agent_status_fn=lambda host: _status(),
         update_state_fn=rec,
         capture_plan=False,
+        commits_ahead_fn=_zero_ahead,
     )
     assert rec.calls[0]["terminal_status"] == "failed"
 
@@ -526,6 +710,7 @@ def test_history_eviction_end_to_end(tmp_path: Path) -> None:
         agent_status_fn=lambda host: payload,
         update_state_fn=rec,
         capture_plan=False,
+        commits_ahead_fn=_zero_ahead,
     )
     server.shutdown()
 
