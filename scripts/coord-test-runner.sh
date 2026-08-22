@@ -829,6 +829,32 @@ run_python() {
         return $?
     fi
 
+    # #2562: the isolation re-run above is not all-or-nothing evidence — its
+    # own `FAILED ` lines say EXACTLY which node ids survived. Rebuild
+    # $failed from those before doing anything else: a test that dropped out
+    # PASSED in isolation and is by definition the flake case this whole
+    # block exists to catch. Handing the ORIGINAL (unpruned) set to the
+    # baseline comparison below is the bug this closes — one genuine failure
+    # was keeping a flake in the set, and the baseline comparison is itself
+    # all-or-nothing (#2170's unanimity), so the flake alone could suppress a
+    # correct BASELINE-RED downgrade.
+    local still_failed
+    still_failed="$(grep '^FAILED ' "$rerun" | awk '{print $2}' | sort -u || true)"
+    if [[ -z "$still_failed" ]]; then
+        # Non-zero exit but no parseable FAILED lines — e.g. a collection/
+        # import error on the isolated re-run. Nothing to prune against;
+        # fall back to the original set rather than claim a pruning that
+        # did not happen.
+        still_failed="$failed"
+    fi
+    local pruned_count; pruned_count="$(printf '%s\n' "$still_failed" | grep -c . || true)"
+    if [[ "$pruned_count" -lt "$count" ]]; then
+        log "$((count - pruned_count)) of $count failing test(s) passed in isolation — treating as flakes, comparing the remaining $pruned_count against the baseline"
+        FLAKES+=("python:$((count - pruned_count))")
+    fi
+    failed="$still_failed"
+    count="$pruned_count"
+
     # Not a flake. Before calling it the branch's fault, ask the question the
     # Test gate is actually asked: is this worse than $BASE_REF on THIS machine?
     # (#2170 — see the baseline section above for why this only ever downgrades
