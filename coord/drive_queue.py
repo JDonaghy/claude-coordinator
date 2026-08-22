@@ -95,7 +95,7 @@ from coord.merge_queue import (
     PLAN_READY,
     is_ci_flaky_reason,
     is_ci_infra_reason,
-    is_ci_pending_reason,
+    is_ci_terminal_reason,
     is_ci_unreadable_reason,
     is_stale_smoke_reason,
 )
@@ -1121,12 +1121,7 @@ def build_board_view(
         # board-build time. `plan_reason` already carries it whenever it
         # applies; the live plan reading and a live `coord merge` attempt's
         # raw reading can never disagree about this one.
-        if not (
-            is_ci_pending_reason(reason)
-            or is_ci_infra_reason(reason)
-            or is_ci_flaky_reason(reason)
-            or is_ci_unreadable_reason(reason)
-        ):
+        if is_ci_terminal_reason(reason):
             continue
         # #2158: the same plan row that came back with NO reason of its own
         # also carries `ci_summary` — `summarize_counts` over the very checks
@@ -3569,12 +3564,7 @@ def plan_tick(
                 # routes it through `_decide_merge`'s existing checks_failed
                 # handling (dispatch a fix, or block with a real reason) —
                 # exactly the path any other red-CI entry already takes.
-                if live_reason and not (
-                    is_ci_pending_reason(live_reason)
-                    or is_ci_infra_reason(live_reason)
-                    or is_ci_flaky_reason(live_reason)
-                    or is_ci_unreadable_reason(live_reason)
-                ):
+                if live_reason and is_ci_terminal_reason(live_reason):
                     reason = (
                         f"live re-check of {entry.key}'s gate this tick "
                         f"reads a terminal, non-pending result ({live_reason}) "

@@ -4662,24 +4662,33 @@ def driver_factory(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     monkeypatch.setattr("coord.drive_state.scratch_dir", lambda: tmp_path)
     monkeypatch.setattr("coord.drive.scratch_dir", lambda: tmp_path)
-    # A per-test notify.lock, so a Driver test's `--notify` nudge never
-    # contends with the OPERATOR'S real ~/.coord/notify.lock — the same
-    # convention `tests/test_notify_drain.py`'s `lock_path` fixture already
-    # documents ("so tests never touch the real ~/.coord one").
+    # #2170-class isolation, fixture-wide: `run_notify()` takes a REAL flock
+    # on `notify_lock_path()` (`Path.home()/".coord"/"notify.lock"`, resolved
+    # at call time) whenever `DriveOptions(notify=True)` is in play. Any
+    # driver test in this module can turn that on, and without isolating it
+    # the lock contends with whatever else on the host legitimately holds it
+    # — on a machine that actually runs the fleet, `coord-notify.timer`
+    # (5-minute cadence) and the board daemon's own drain both hold it for
+    # the length of a full notify pass. The test then burns up to the full
+    # 5-minute `timeout=300` per acquire, logs "could not take
+    # ~/.coord/notify.lock within 5m — skipping nudge", and fails with an
+    # empty call list. That is a race with whatever else is running on the
+    # machine, not a signal about the code under test — exactly the class
+    # `tests/test_ambient_home_isolation.py` and the `populated-home` CI job
+    # exist to keep out.
     #
-    # Without this, `Driver.run_notify()` takes the live lock for real: on
-    # any host that actually runs the fleet, `coord-notify.timer` (5-minute
-    # cadence) and the board daemon's own drain both hold it for the length
-    # of a full notify pass, so every nudge assertion here
-    # (`test_notify_nudges_coord_notify_under_the_shared_lock` and the two
-    # #1593 stall-nudge tests) was one unlucky overlap away from seeing
-    # LockBusy, logging "could not take ~/.coord/notify.lock within 5m —
-    # skipping nudge", and failing with an empty call list after a 5-minute
-    # stall. That is a race with whatever else is running on the machine,
-    # not a signal about the code under test.
-    monkeypatch.setattr(
-        "coord.drive.notify_lock_path", lambda: tmp_path / "notify.lock"
-    )
+    # Redirecting $HOME is the whole mechanism, and it subsumes the earlier
+    # #2536 fix (which pinned `coord.drive.notify_lock_path` at
+    # `tmp_path/"notify.lock"` instead): `notify_lock_path()` resolves
+    # `Path.home()` at call time, so the lock lands at
+    # `tmp_path/".coord"/"notify.lock"` either way — but $HOME also covers
+    # everything *else* in the driver that reaches for `~/.coord`, and it
+    # needs no upkeep as call sites move. Deliberately NOT belt-and-braces:
+    # re-pinning `notify_lock_path` on top of this would move the lock back
+    # out of the redirected $HOME and silently defeat
+    # `test_notify_nudges_coord_notify_under_the_shared_lock`, whose whole
+    # job is to assert the redirection took.
+    monkeypatch.setenv("HOME", str(tmp_path))
 
     def make(
         payloads, *, opts=None, verifier=None, config=None, oracle_gate=None,
@@ -5724,21 +5733,16 @@ def test_notify_is_off_by_default(driver_factory, monkeypatch):
     assert called == []
 
 
-def test_notify_nudges_coord_notify_under_the_shared_lock(
-    driver_factory, tmp_path, monkeypatch
-):
+def test_notify_nudges_coord_notify_under_the_shared_lock(driver_factory, tmp_path):
     # #2170-class isolation: `run_notify()` takes a REAL flock on
     # `notify_lock_path()` — i.e. `Path.home()/".coord"/"notify.lock"`,
-    # resolved at call time. Without redirecting $HOME this test contends
+    # resolved at call time. `driver_factory` redirects $HOME to `tmp_path`
+    # fixture-wide (see its definition) precisely so this doesn't contend
     # with whatever else on the host legitimately holds that lock (a live
     # `coord notify` / `run_drain` on a daemon host, or simply another
-    # pytest worker running the sibling drain tests), then burns the full
-    # 5-minute `timeout=300` before failing with an empty `seen`. That makes
-    # the result depend on the machine rather than on the code, which is
-    # exactly the class `tests/test_ambient_home_isolation.py` and the
-    # `populated-home` CI job exist to keep out. `tmp_path` was already a
-    # parameter here and simply went unused — this is what it was for.
-    monkeypatch.setenv("HOME", str(tmp_path))
+    # pytest worker running the sibling drain tests) and burn the full
+    # 5-minute `timeout=300` before failing with an empty `seen`. This
+    # assertion just confirms the redirection actually took.
     driver = driver_factory(
         [board(status="merged")], opts=DriveOptions(machine="precision", notify=True)
     )
