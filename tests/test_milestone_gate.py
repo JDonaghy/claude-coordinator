@@ -93,6 +93,75 @@ def _stub_dispatch(monkeypatch, dispatched: list) -> None:
     monkeypatch.setattr("coord.github_ops.check_branch_exists", lambda *a, **kw: False)
 
 
+# ── #2542: oracle-loop serialization at the daemon tick layer ───────────────
+#
+# Two machines + an acceptance driver on `api`, and a two-node work order
+# with no shared group and no `after` edge between them — #2542's "SECOND
+# collision" shape (coord-portal#122's #130 vs. #132): nothing about the
+# declared work order flags these as unsafe to parallelize, only the shared
+# `tests/acceptance/ms-N/manifest.yml` JIT-slice file does.
+
+
+def _make_config_oracle_loop(tmp_path: Path) -> Path:
+    content = (
+        "repos:\n"
+        "  - name: api\n"
+        "    github: acme/api\n"
+        "\n"
+        "machines:\n"
+        "  - name: laptop\n"
+        "    host: laptop.tailnet\n"
+        "    repos: [api]\n"
+        "    repo_paths:\n"
+        "      api: /tmp/api\n"
+        "  - name: server\n"
+        "    host: server.tailnet\n"
+        "    repos: [api]\n"
+        "    repo_paths:\n"
+        "      api: /tmp/api\n"
+        "\n"
+        "milestone:\n"
+        "  auto_dispatch: true\n"
+        "\n"
+        "acceptance:\n"
+        "  drivers:\n"
+        "    api:\n"
+        "      kind: tui-tuidriver\n"
+        "      run: \"cargo test\"\n"
+        "      mock: \"*.screen\"\n"
+    )
+    p = tmp_path / "coordinator-gate-oracle.yml"
+    p.write_text(content)
+    return p
+
+
+def _stub_github_two_ready(monkeypatch) -> None:
+    """Two-node work order (#762, #763), no shared group, no `after` between
+    them — both ready the moment the tracking issue is fetched, under
+    milestone 9 on tracking issue #100."""
+
+    def get_issue(repo, number):
+        if number == 100:
+            return {
+                "number": 100, "title": "tracking",
+                "body": "## Work order\n- [ ] #762\n- [ ] #763\n",
+                "state": "OPEN", "milestone": {"number": 9},
+            }
+        return {
+            "number": number, "title": f"issue {number}", "body": "",
+            "state": "OPEN", "milestone": {"number": 9}, "labels": [],
+        }
+
+    monkeypatch.setattr("coord.github_ops.get_issue", get_issue)
+    monkeypatch.setattr(
+        "coord.github_ops.get_open_issues",
+        lambda repo: [
+            {"number": 762, "milestone": {"number": 9}},
+            {"number": 763, "milestone": {"number": 9}},
+        ],
+    )
+
+
 # ── the pure machine ─────────────────────────────────────────────────────────
 
 
@@ -483,6 +552,44 @@ def test_gate_tick_work_state_drains_the_frontier(
     assert [r["issue_number"] for r in state.load_dispatched()] == [762]
 
 
+def test_gate_tick_work_state_serializes_oracle_loop_milestones(
+    tmp_path: Path, rw_db, monkeypatch
+) -> None:
+    """#2542 (reviewer's blocking finding): this is `coord drive`'s gate
+    walk — docs/ORACLE_LOOP.md's documented primary driver for an
+    oracle-loop milestone, #1453 — so its `work` DISPATCH branch must be as
+    oracle_loop-aware as `plan_queue`'s drive-queue chaining. Two ready
+    entries with no shared group and no `after` edge between them (#762 vs.
+    #763), two idle machines: without the fix `plan_dispatch`'s normal
+    N-ready -> N-machine fan-out would dispatch BOTH in this single tick,
+    each authoring its own JIT slice into the same
+    tests/acceptance/ms-9/manifest.yml concurrently. Only one may go out
+    this tick."""
+    from coord import state
+    from coord.serve_app import _milestone_gate_tick
+
+    _stub_github_two_ready(monkeypatch)
+    dispatched: list = []
+    _stub_dispatch(monkeypatch, dispatched)
+
+    state.save_milestone_gate(
+        mg.GateRecord(
+            repo_name="api", tracking_issue=100, gate=mg.WORK, cleared=(mg.GATE_A,)
+        ).to_dict()
+    )
+
+    results = _milestone_gate_tick(load_config(_make_config_oracle_loop(tmp_path)), now=200.0)
+
+    assert results[0].action == mg.DISPATCH
+    assert len(results[0].dispatched) == 1, (
+        "both #762 and #763 were ready with an idle machine each — an "
+        "oracle-loop milestone must still dispatch only one per tick"
+    )
+    assert [r["issue_number"] for r in state.load_dispatched()] == [
+        results[0].dispatched[0].issue_number
+    ]
+
+
 def test_gate_tick_resumes_mid_gate_after_a_restart(
     tmp_path: Path, rw_db, monkeypatch
 ) -> None:
@@ -619,6 +726,35 @@ def test_drain_tick_skips_gate_driven_milestones(
     assert state.list_milestone_drains() == [
         {"repo_name": "api", "tracking_issue": 100}
     ]
+
+
+def test_drain_tick_serializes_oracle_loop_milestones(
+    tmp_path: Path, rw_db, monkeypatch
+) -> None:
+    """#2542 non-blocking finding: the legacy standalone drain has the
+    identical gap as the gate tick's `work` state — same
+    `plan_dispatch`/`dispatch_entry` primitives, same N-ready -> N-machine
+    fan-out, no oracle_loop awareness. Closed the same way."""
+    from coord import state
+    from coord.serve_app import _milestone_drain_tick
+
+    _stub_github_two_ready(monkeypatch)
+    dispatched: list = []
+    _stub_dispatch(monkeypatch, dispatched)
+    # Unlike the gate tick (which only reaches `work` after Gate A already
+    # cleared), the legacy drain re-checks Gate A itself every tick — give
+    # it a contract so it gets far enough to drain the frontier at all.
+    monkeypatch.setattr("coord.github_ops.get_repo_file", lambda *a, **kw: "# Contract\n")
+
+    state.register_milestone_drain(repo_name="api", tracking_issue=100)
+
+    outcomes = _milestone_drain_tick(load_config(_make_config_oracle_loop(tmp_path)))
+
+    assert len(outcomes) == 1, (
+        "both #762 and #763 were ready with an idle machine each — an "
+        "oracle-loop milestone must still dispatch only one per tick"
+    )
+    assert outcomes[0].ok is True
 
 
 # ── the CLI dry-run ──────────────────────────────────────────────────────────

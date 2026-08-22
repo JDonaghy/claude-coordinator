@@ -168,6 +168,65 @@ class TestPlanDispatch:
         assert plan.skipped == ()
         assert plan.waiting == ()
 
+    # ── oracle_loop serialization (#2542) ────────────────────────────────────
+    #
+    # `_milestone_gate_tick`'s `work` DISPATCH state and the legacy
+    # `_milestone_drain_tick` both call `plan_dispatch` directly (not through
+    # the drive-queue `plan_queue` chains), so the same "two same-milestone
+    # entries must never both start their JIT slice-authoring phase in one
+    # tick" hazard `plan_queue`'s `oracle_loop` param closes for the
+    # drive-queue path has to be closed here too — the reviewer's blocking
+    # finding on this issue: the gate tick received no oracle_loop awareness
+    # at all in the first pass.
+
+    def test_oracle_loop_caps_dispatch_at_one_entry_per_tick(self) -> None:
+        """#762/#763 share {group: A} — normally independent (no claim or
+        `after` edge between them) and, per
+        `test_cohort_fans_out_to_distinct_machines` above, both fan out to
+        distinct idle machines in the SAME call. Under oracle-loop control
+        only the first may dispatch this tick; the second is held back as
+        `deferred`, not silently dropped."""
+        cfg = _config([_machine("laptop", ["api"]), _machine("server", ["api"])])
+        board = Board()
+        repo = cfg.repo("api")
+        plan = plan_dispatch(
+            WORK_ORDER, board, cfg, repo, terminal_issues=set(), oracle_loop=True
+        )
+
+        assert [p.entry.issue_number for p in plan.to_dispatch] == [762]
+        assert [d.entry.issue_number for d in plan.deferred] == [763]
+        assert "one entry dispatches per tick" in plan.deferred[0].reason
+        # #765's own `after` edge is unaffected — still correctly waiting.
+        assert {b.issue_number for b in plan.waiting} == {765}
+
+    def test_oracle_loop_false_is_unchanged_from_default(self) -> None:
+        """Explicit `oracle_loop=False` must be byte-identical to omitting
+        it — every existing caller keeps today's fan-out behaviour exactly."""
+        cfg = _config([_machine("laptop", ["api"]), _machine("server", ["api"])])
+        board = Board()
+        repo = cfg.repo("api")
+        default_plan = plan_dispatch(WORK_ORDER, board, cfg, repo, terminal_issues=set())
+        explicit_plan = plan_dispatch(
+            WORK_ORDER, board, cfg, repo, terminal_issues=set(), oracle_loop=False
+        )
+        assert default_plan == explicit_plan
+        assert default_plan.deferred == ()
+
+    def test_oracle_loop_no_machine_available_reports_skipped_not_swallowed(self) -> None:
+        """The one-dispatch-slot cap only engages once an entry is actually
+        picked (a machine found for it) — when nothing can dispatch at all,
+        every ready entry still surfaces as `skipped` (no idle machine), the
+        real reason, rather than being silently reclassified as `deferred`."""
+        cfg = _config([])  # no machines at all
+        board = Board()
+        repo = cfg.repo("api")
+        plan = plan_dispatch(
+            WORK_ORDER, board, cfg, repo, terminal_issues=set(), oracle_loop=True
+        )
+        assert plan.to_dispatch == ()
+        assert plan.deferred == ()
+        assert {s.entry.issue_number for s in plan.skipped} == {762, 763}
+
 
 # ── plan_queue (#2335) ───────────────────────────────────────────────────────
 

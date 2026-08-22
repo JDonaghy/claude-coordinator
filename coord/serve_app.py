@@ -1317,6 +1317,14 @@ def _milestone_drain_tick(config: Config) -> list:
     that filter for free). A per-milestone fetch/dispatch error must not
     silence the other registered milestones — caught and logged per entry.
 
+    Same ``oracle_loop`` capping as ``_milestone_gate_tick`` (#2542): a repo
+    under oracle-loop control gets at most one dispatch per registered
+    milestone per tick, so this legacy path can't fan two same-milestone
+    entries out to distinct machines in one call and race them on the
+    shared ``tests/acceptance/ms-N/manifest.yml`` either — even though only
+    pre-#2335 registrations feed it today (see above), it is the same class
+    of hole as the gate tick's and worth closing the same way.
+
     Extracted as a module-level function so tests can call it directly
     without wiring up the async ``_tick_loop`` infrastructure (mirrors
     ``_auto_drain_tick``'s doc comment above).
@@ -1390,7 +1398,15 @@ def _milestone_drain_tick(config: Config) -> list:
             )
             continue
 
-        plan = md.plan_dispatch(ctx.work_order, board, config, repo_cfg, ctx.terminal_issues)
+        # #2542: an oracle-loop repo (Gate A contract exists, JIT test-author
+        # slices apply) may only dispatch one ready-frontier entry per tick —
+        # see plan_dispatch's oracle_loop docstring for why (two concurrently
+        # dispatched entries under one milestone race on the same shared
+        # tests/acceptance/ms-N/manifest.yml).
+        plan = md.plan_dispatch(
+            ctx.work_order, board, config, repo_cfg, ctx.terminal_issues,
+            oracle_loop=config.acceptance.has_driver(repo_name),
+        )
         for pick in plan.to_dispatch:
             outcome = md.dispatch_entry(
                 pick, repo_cfg, config, board, tracking_issue=tracking_issue
@@ -1465,6 +1481,14 @@ def _milestone_gate_tick(config: Config, *, now: float | None = None) -> list:
     rather than adding a second dispatch mechanism. Every other gate is a
     hold-and-report: it logs why it cannot advance and leaves the record
     where it is. Nothing here silently falls through.
+
+    ``plan_dispatch`` is called with ``oracle_loop=config.acceptance.
+    has_driver(repo_cfg.name)`` (#2542) — for a repo under oracle-loop
+    control this caps the tick's dispatch at one ready-frontier entry, so
+    this walk (docs/ORACLE_LOOP.md's "oracle drive", #1453 — the documented
+    primary driver for an oracle-loop milestone) can never launch two
+    same-milestone entries into their JIT slice-authoring phase in the same
+    tick, racing on the shared ``tests/acceptance/ms-N/manifest.yml``.
 
     Deliberately **not** gated on ``config.milestone.auto_dispatch`` — that
     flag gates the legacy standalone drain (:func:`_milestone_drain_tick`),
@@ -1557,8 +1581,20 @@ def _milestone_gate_tick(config: Config, *, now: float | None = None) -> list:
             # and _milestone_drain_tick use, so gate policy and dispatch
             # policy can't drift apart.
             try:
+                # #2542: cap this tick's dispatch to one entry for an
+                # oracle-loop milestone — see plan_dispatch's oracle_loop
+                # docstring. Without it, `plan_dispatch`'s normal N-ready ->
+                # N-idle-machine fan-out (by design, for non-oracle-loop
+                # milestones) lets two same-milestone entries both start
+                # their JIT slice-authoring phase in this single for-loop,
+                # racing on the same tests/acceptance/ms-N/manifest.yml —
+                # this is the "third, independent place" gap the write-order
+                # validator and plan_queue's chaining alone don't cover: the
+                # gate walk (docs/ORACLE_LOOP.md's "oracle drive", #1453) is
+                # the documented primary driver for an oracle-loop milestone.
                 plan = md.plan_dispatch(
-                    ctx.work_order, board, config, repo_cfg, ctx.terminal_issues
+                    ctx.work_order, board, config, repo_cfg, ctx.terminal_issues,
+                    oracle_loop=config.acceptance.has_driver(repo_cfg.name),
                 )
                 for pick in plan.to_dispatch:
                     outcome = md.dispatch_entry(

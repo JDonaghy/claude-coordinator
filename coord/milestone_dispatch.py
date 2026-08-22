@@ -25,6 +25,11 @@ Three call sites share this module:
   same fetch → plan → dispatch sequence for milestones registered via a
   non-dry-run ``coord milestone dispatch`` call, so newly-unblocked frontier
   entries dispatch automatically as dependencies complete.
+- The daemon's gate tick (``coord.serve_app._milestone_gate_tick``, #1929),
+  whose ``work`` gate state IS the drain for a gate-driven milestone (``coord
+  milestone drive``, docs/ORACLE_LOOP.md) — same ``plan_dispatch`` +
+  ``dispatch_entry`` primitives, so gate policy and dispatch policy can't
+  drift apart.
 - Tests exercise the pure ``plan_dispatch``/``pick_machine`` functions
   directly with a seeded :class:`~coord.models.Board`, no GitHub or HTTP.
 """
@@ -66,6 +71,7 @@ __all__ = [
     "pick_machine",
     "MachinePick",
     "NoMachineAvailable",
+    "DeferredByOracleLoop",
     "MilestonePlan",
     "plan_dispatch",
     "QueuePlanEntry",
@@ -643,14 +649,36 @@ class NoMachineAvailable:
 
 
 @dataclass(frozen=True)
+class DeferredByOracleLoop:
+    """A ready-frontier entry withheld *this tick* because the milestone is
+    under oracle-loop control and another entry already claimed the tick's
+    one dispatch slot (#2542).
+
+    Distinct from both :class:`~coord.milestone_order.BlockedNode` (the
+    frontier itself considers this entry ready) and
+    :class:`NoMachineAvailable` (there may well be an idle machine for it) —
+    it is held back purely so two same-milestone entries never enter their
+    JIT-slice-authoring phase concurrently and race on the shared
+    ``tests/acceptance/ms-N/manifest.yml``. It will be reconsidered on the
+    next tick, by which point the dispatched entry is claimed (an active
+    board assignment) and drops out of the ready frontier on its own.
+    """
+
+    entry: FrontierEntry
+    reason: str = "oracle-loop milestone: only one entry dispatches per tick"
+
+
+@dataclass(frozen=True)
 class MilestonePlan:
     """The result of :func:`plan_dispatch`: what to dispatch now, what's
-    idle-machine-starved, and what Phase 0's frontier says is still blocked.
+    idle-machine-starved, what's withheld for oracle-loop serialization, and
+    what Phase 0's frontier says is still blocked.
     """
 
     to_dispatch: tuple[MachinePick, ...] = ()
     skipped: tuple[NoMachineAvailable, ...] = ()
     waiting: tuple[BlockedNode, ...] = ()
+    deferred: tuple[DeferredByOracleLoop, ...] = ()
 
 
 def plan_dispatch(
@@ -659,6 +687,8 @@ def plan_dispatch(
     config: "Config",
     repo_cfg: Repo,
     terminal_issues: frozenset[int] | set[int],
+    *,
+    oracle_loop: bool = False,
 ) -> MilestonePlan:
     """Compute the ready frontier and pick a machine for each ready entry.
 
@@ -667,6 +697,33 @@ def plan_dispatch(
     the first idle+capable machine not already claimed by an earlier entry
     in *this* call (so a cohort of N ready issues fans out across up to N
     distinct idle machines instead of piling onto one).
+
+    ``oracle_loop`` (#2542) — the caller's already-resolved
+    ``config.acceptance.has_driver(repo_cfg.name)`` — caps ``to_dispatch`` at
+    **one** entry per call. Without this, two ready-frontier entries with no
+    claim/dependency edge between them (the normal, desired fan-out above)
+    would both dispatch in the very same tick under an oracle-loop
+    milestone, and each independently authors its own JIT acceptance slice
+    into the SAME ``tests/acceptance/ms-N/manifest.yml``
+    (``coord.test_author``'s "later slices MERGE into this file"
+    convention) — a race regardless of what the declared work order says is
+    safe to parallelize. This is the same hazard :func:`plan_queue`'s
+    ``oracle_loop`` chaining closes for the drive-queue path; this is the
+    equivalent for the daemon's direct-dispatch paths
+    (``coord.serve_app._milestone_gate_tick``'s ``work`` state and the
+    legacy ``_milestone_drain_tick``), which call this function directly
+    rather than going through the drive-queue. Entries that would otherwise
+    have dispatched this tick are returned in :attr:`MilestonePlan.deferred`
+    instead of silently dropped; they re-enter ``ready`` on a later tick
+    once the dispatched entry is claimed (an active board assignment) and
+    falls out of the frontier on its own — see
+    :func:`~coord.milestone_order.ready_frontier`.
+
+    Deliberately coarse, mirroring ``plan_queue``: it withholds the ENTIRE
+    entry (not just its slice-authoring phase), a real throughput cost for
+    an oracle-loop milestone dispatched via the daemon in bulk. #2543
+    (per-issue manifest fragments) is what would let real concurrency come
+    back safely; this is defense-in-depth until it lands.
     """
     frontier = ready_frontier(
         work_order,
@@ -677,8 +734,12 @@ def plan_dispatch(
     )
     picks: list[MachinePick] = []
     skipped: list[NoMachineAvailable] = []
+    deferred: list[DeferredByOracleLoop] = []
     used: set[str] = set()
     for entry in frontier.ready:
+        if oracle_loop and picks:
+            deferred.append(DeferredByOracleLoop(entry))
+            continue
         machine = pick_machine(repo_cfg.name, board, config, exclude=frozenset(used))
         if machine is None:
             skipped.append(NoMachineAvailable(entry))
@@ -686,7 +747,10 @@ def plan_dispatch(
         used.add(machine.name)
         picks.append(MachinePick(entry, machine))
     return MilestonePlan(
-        to_dispatch=tuple(picks), skipped=tuple(skipped), waiting=frontier.blocked
+        to_dispatch=tuple(picks),
+        skipped=tuple(skipped),
+        waiting=frontier.blocked,
+        deferred=tuple(deferred),
     )
 
 
