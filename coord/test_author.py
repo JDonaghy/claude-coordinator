@@ -581,6 +581,19 @@ def dispatch_test_author(
 
     deny_commands = test_author_deny_commands(config, repo_name)
 
+    # #2549: this was the only dispatcher on the fleet that never sent
+    # "model" — with no model on the wire, the agent built `claude -p` with
+    # no `--model` flag and the CLI fell back to ITS OWN default (Opus),
+    # silently overriding `models.default` (sonnet) for every headless
+    # test-author slice. Mirrors `dispatch_test_author_interactive`'s
+    # `resolved_model = config.models.default` (this feature's already-
+    # established answer, see that function below) and `gate_b.py`'s plain
+    # `config.models.default` shape — deliberately NOT
+    # `resolve_dispatch_model_alias`'s label-routing (`coord/dispatch.py`):
+    # test-author dispatches off a milestone/tracking issue, not a single
+    # labelled work issue, so there's no per-issue label to route on.
+    resolved_model = config.models.default
+
     payload = {
         "repo_name": repo_name,
         "repo_path": repo_path,
@@ -594,6 +607,7 @@ def dispatch_test_author(
         "system_prompt": TEST_AUTHOR_SYSTEM_PROMPT,
         "deny_commands": deny_commands,
         "branch": repo_cfg.default_branch or "main",
+        "model": resolved_model,
     }
     if target_branch:
         payload["target_branch"] = target_branch
@@ -628,6 +642,7 @@ def dispatch_test_author(
         dispatched_at=time.time(),
         branch=branch,
         type="test-author",
+        model=resolved_model,
         # #1084: correlate this JIT dispatch back to the specific member
         # issue it's extending, so the TUI's per-issue Acceptance-Authoring
         # mini-pipeline can tell "issue #1039's slice" apart from a sibling
