@@ -40,6 +40,7 @@ import uuid
 
 import httpx
 
+from coord.acceptance import MANIFEST_FRAGMENTS_DIRNAME
 from coord.config import Config
 from coord.dispatch import AGENT_PORT
 from coord.merge_queue import QueuedMerge
@@ -400,8 +401,6 @@ def _is_sealed_manifest_path(path: str) -> bool:
     same-issue retry that manages to conflict with itself, still resolves
     the same additive way.
     """
-    from coord.acceptance import MANIFEST_FRAGMENTS_DIRNAME  # noqa: PLC0415 — avoid import cycle
-
     parts = path.split("/")
     name = parts[-1]
     if name == SEALED_MANIFEST_FILENAME:

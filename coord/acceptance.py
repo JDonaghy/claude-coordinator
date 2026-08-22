@@ -392,6 +392,50 @@ def parse_manifest_text(text: str, *, source: str = "<manifest>") -> ManifestDat
     )
 
 
+def merge_manifest_data(*datas: ManifestData) -> ManifestData:
+    """Merge multiple :class:`ManifestData` instances into one, as if their
+    source files had been scanned together (#2543) — same "later source
+    wins on a bare collision" rule :func:`load_manifest`/:func:`_manifest_paths`
+    already apply across files, just operating on already-parsed data
+    instead of paths. Shared by both the local-checkout readers (which
+    merge ``_manifest_paths``' legacy-file-then-fragments per ``ms-NN``) and
+    the API-only dispatch-time reader
+    (:func:`coord.milestone_dispatch._fetch_manifest_data`, which fetches
+    the legacy file and one issue's fragment separately over ``gh`` and
+    needs to combine them the same way).
+
+    ``tests``/``exempt``/``expected_red`` union across every *datas* entry
+    (a later entry's ``tests`` mapping overwrites an earlier one's on an
+    exact test-id collision; ``exempt``/``expected_red`` union rather than
+    overwrite since those are naturally per-issue-keyed sets, not a flat
+    mapping that can collide). ``gate_a_exempt``/``gate_a_exempt_reason``
+    are milestone-level, not per-issue, so they come from whichever entry
+    sets ``gate_a_exempt=True`` last — in practice always the legacy shared
+    file, since only that carries the ``gate_a:`` block (#2543 keeps it
+    there by choice; per-issue fragments never set it).
+    """
+    tests: dict[str, int] = {}
+    exempt: set[int] = set()
+    expected_red: dict[int, frozenset[str]] = {}
+    gate_a_exempt = False
+    gate_a_exempt_reason = ""
+    for data in datas:
+        tests.update(data.tests)
+        exempt |= set(data.exempt)
+        for issue_number, test_ids in data.expected_red.items():
+            expected_red[issue_number] = expected_red.get(issue_number, frozenset()) | test_ids
+        if data.gate_a_exempt:
+            gate_a_exempt = True
+            gate_a_exempt_reason = data.gate_a_exempt_reason or gate_a_exempt_reason
+    return ManifestData(
+        tests=tests,
+        exempt=frozenset(exempt),
+        gate_a_exempt=gate_a_exempt,
+        gate_a_exempt_reason=gate_a_exempt_reason,
+        expected_red=expected_red,
+    )
+
+
 def _parse_manifest_file(path: Path) -> dict[str, int]:
     """Parse one manifest file into ``{test_id: issue_number}`` (the
     ``exempt:`` list, if any, is dropped — callers that need it use
