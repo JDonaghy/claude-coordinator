@@ -48,6 +48,22 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+# #2561: this unit carried NO Environment=PATH= at all, so every subprocess
+# `coord notify` spawns — the #2464 out-of-band confirmation pass
+# (coord/confirm_test.py) re-running the repo's real build+test, and any
+# `coord_argv()` (coord/drive.py) escalation resolving `shutil.which("coord")`
+# — ran under systemd's bare user-manager PATH
+# (/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:
+# /usr/local/games:/snap/bin), which does NOT contain ~/.local/bin (where the
+# pinned `coord` shim lives) or ~/.cargo/bin (where rustup puts `cargo`). That
+# let this daemon's confirmation runs resolve a *different* toolchain than a
+# dev shell or coord-serve.service would for the identical command — and cost
+# a real dispatch when it refuted a genuinely clean CC#2556 branch over a
+# PATH-dependent test assertion having nothing to do with the diff under
+# review. Byte-identical to coord-serve.service's line (same host, same role
+# family, same #1831/#1117 reasoning — see that unit's comment for why each
+# entry is there and why the ordering matters).
+Environment=PATH=%h/.cargo/bin:%h/.local/bin:%h/src/code-coordinator/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 ExecStart=%h/.coord-venv/bin/coord notify --config %h/.coord/coordinator.yml
 # #2464: sized off `coord.confirm_test.notify_client_timeout_seconds()` — the
 # HTTP timeout the CLI gives its `/notify` POST — plus slack, because this is
