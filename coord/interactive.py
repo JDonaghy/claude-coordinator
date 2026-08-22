@@ -99,6 +99,7 @@ from coord.providers.claude_pty import (
     INPUT_BOX_MARKER,
     INPUT_BOX_MARKER_BYTES,
     briefing_fingerprint,
+    pane_shows_blocking_prompt,
     paste_landed,
     paste_landed_bytes,
 )
@@ -117,6 +118,7 @@ __all__ = [
     "tmux_available",
     "tmux_session_alive",
     "tmux_pane_dead",
+    "tmux_session_running",
     "list_coord_tmux_sessions",
     "gather_fleet_tmux_sessions",
     "TMUX_ATTACH_WARNING",
@@ -371,6 +373,51 @@ def tmux_pane_dead(
         return False
 
 
+def tmux_session_running(
+    session_name: str,
+    *,
+    host: TmuxHost = TmuxHost(None),
+) -> bool:
+    """Return ``True`` only when *session_name* both exists AND its pane is
+    still doing work — i.e. genuinely "claude is still running", not just
+    "the tmux session object hasn't been torn down yet".
+
+    Before #2541, ``tmux_session_alive`` (bare ``has-session``) WAS a
+    reliable answer to "is this interactive session still running": a
+    coord-managed session has exactly one pane, and without
+    ``remain-on-exit`` a pane's death is simultaneously the session's death.
+    #2541 set ``remain-on-exit on`` on every freshly-created coord tmux
+    session (see :func:`_launch_via_tmux`) so a crashed pane's screen stays
+    inspectable instead of vanishing — but that also means ``has-session``
+    now stays ``True`` after **any** pane exit, clean success or crash,
+    until a reaper (:func:`reap_stale_interactive_sessions` /
+    :func:`reap_stale_remote_interactive_sessions`) explicitly notices and
+    kills it, which can take up to ``interactive_session_timeout_hours``.
+
+    This is the ONE place :func:`tmux_session_alive` and
+    :func:`tmux_pane_dead` are composed so "is this session still running"
+    has a single answer everywhere it's asked — not just in the two reapers
+    that were updated when ``remain-on-exit`` landed. Callers that need
+    that question answered (the "session still running…" checks after a
+    local/remote human-attended launch in
+    :mod:`coord.commands.dispatch_workers`, ``coord reattach`` in
+    :mod:`coord.commands.sessions`, the ``clean_worktrees`` guard in
+    :mod:`coord.agent`, the worktree-sweep audit in
+    :mod:`coord.commands.status`, and the liveness probe in
+    :mod:`coord.diagnose`) must use this helper, not the bare
+    ``has-session`` check, or they will misreport a session whose ``claude``
+    already exited — successfully or not — as still running for as long as
+    the (now longer-lived) dead pane lingers.
+
+    Args:
+        session_name: The tmux session name to probe.
+        host: Target host.  Defaults to ``TmuxHost(None)`` (local).
+    """
+    return tmux_session_alive(session_name, host=host) and not tmux_pane_dead(
+        session_name, host=host
+    )
+
+
 def list_coord_tmux_sessions(
     *,
     host: TmuxHost = TmuxHost(None),
@@ -561,6 +608,20 @@ def _inject_briefing_into_tmux_session(
        unchanged for :data:`_READY_QUIESCE_S` seconds, or *timeout* lapses
        (degraded fallback: proceed anyway rather than hang forever on an
        unrecognised render).
+
+       **#2541**: if the settled pane instead shows a blocking human-answered
+       confirmation dialog — the first-run "do you trust the files in this
+       folder?" prompt, a tool/MCP permission question, the "bypass
+       permissions" warning, ... — detected via
+       :func:`~coord.providers.claude_pty.pane_shows_blocking_prompt`, the
+       injection is held: neither ``load-buffer`` nor ``paste-buffer`` is
+       ever issued. Those dialogs are single-choice menus that consume one
+       keystroke, not a bracketed-paste block of the (typically multi-line)
+       briefing text — pasting into one is the leading suspect for the
+       "claude exited with status 1" crash #2541 reported on a worktree
+       ``claude`` had never run in before. The operator answers the dialog
+       themselves once attached; the briefing is never auto-injected in
+       this case (there is nothing safe to paste it over yet).
     2. **Paste + verify + retry** — load the briefing into a tmux named
        buffer (``coord-brief``) via stdin and ``paste-buffer -p`` (bracketed
        paste), then re-capture the pane and check whether a fingerprint of
@@ -593,7 +654,9 @@ def _inject_briefing_into_tmux_session(
     Returns:
         ``True`` when the briefing was injected (verified, or verification
         was impossible and the paste was issued).  ``False`` when every
-        verifiable attempt confirmed the briefing did NOT land.
+        verifiable attempt confirmed the briefing did NOT land, OR (#2541)
+        a blocking confirmation dialog was detected and the paste was
+        deliberately never attempted.
     """
     if not briefing.strip():
         return True  # nothing to inject — trivially OK
@@ -637,6 +700,7 @@ def _inject_briefing_into_tmux_session(
         deadline = time.monotonic() + timeout
         prev_content: str | None = None
         quiescent_since: float | None = None
+        held_for_prompt = False
 
         while time.monotonic() < deadline:
             time.sleep(0.05)
@@ -650,13 +714,28 @@ def _inject_briefing_into_tmux_session(
                 prev_content = content
                 quiescent_since = now if stable else None
             elif stable and quiescent_since is not None:
+                quiet_for = now - quiescent_since
+                # #2541: a settled screen showing a blocking confirmation
+                # dialog (first-run trust prompt, tool/MCP permission
+                # question, "bypass permissions" warning, ...) is NOT the
+                # chat input box, even though it shares the same "❯" cursor
+                # glyph. Those dialogs consume one keystroke, not a
+                # bracketed-paste block — pasting the briefing into one is
+                # the leading suspect for the "claude exited with status 1"
+                # crash the issue reports on a fresh worktree. Hold: stop
+                # waiting and skip Phase 2 (below) entirely rather than
+                # ever calling load-buffer/paste-buffer against this pane.
+                if pane_shows_blocking_prompt(content):
+                    if quiet_for >= _READY_QUIESCE_S:
+                        held_for_prompt = True
+                        break
+                    continue
                 # A recognised input box needs less settle time to trust —
                 # we've seen the actual prompt render, not just SOME static
                 # content.  When the marker never shows (older CLI, unusual
                 # render, or a session that died before drawing anything),
                 # fall back to a longer quiescence window rather than
                 # spinning for the full ``timeout`` (#865).
-                quiet_for = now - quiescent_since
                 threshold = (
                     _READY_QUIESCE_S
                     if INPUT_BOX_MARKER in content
@@ -664,6 +743,17 @@ def _inject_briefing_into_tmux_session(
                 )
                 if quiet_for >= threshold:
                     break  # settled — inject
+
+        if held_for_prompt:
+            logging.warning(
+                "tmux session %r shows a claude confirmation dialog "
+                "(first-run trust prompt / tool permission question / "
+                "bypass-permissions warning) — holding off on the "
+                "briefing paste; the operator must answer it after "
+                "attaching (#2541)",
+                session_name,
+            )
+            return False
 
         # ── Phase 2: paste, verify, retry on a miss (#865 / #896) ─────────
         # Capture a baseline snapshot of the input-box region BEFORE the
@@ -804,7 +894,27 @@ def _persist_interactive_pane_log(
     to persist diagnostics must not affect the launch itself, and this is
     a point-in-time snapshot (taken once, after attach returns), not a
     live stream.
+
+    ``assignment_id`` is interpolated directly into a filesystem path
+    (local branch) or a remote shell string (remote branch). Every
+    assignment_id generator in this codebase produces the plain
+    ``[A-Za-z0-9_-]+`` shape — the SAME shape the read side
+    (``coord/agent_app.py``'s ``/logs/{id}`` handler) already enforces
+    with an identical regex — so reject anything else up front rather than
+    let a malformed id reach either interpolation. Today's only caller
+    always passes a coordinator-generated ``uuid4().hex[:12]``, so this is
+    defense-in-depth, not a fix for a live exploit: this is a
+    general-purpose helper, not one hardcoded to that single trusted
+    caller.
     """
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", assignment_id):
+        logging.warning(
+            "refusing to persist interactive pane log for malformed "
+            "assignment id %r",
+            assignment_id,
+        )
+        return
+
     header = (
         f"# coord: captured tmux pane for session {session_name!r} "
         f"(assignment {assignment_id}) -- human-attended interactive "
@@ -828,10 +938,15 @@ def _persist_interactive_pane_log(
 
     sname_q = shlex.quote(session_name)
     header_q = shlex.quote(header)
+    # #2541 review follow-up: assignment_id is already validated above, but
+    # shlex.quote it too for consistency with sname_q/header_q right next to
+    # it — a general-purpose helper shouldn't rely on the shape check alone
+    # to keep an interpolated value shell-safe.
+    aid_q = shlex.quote(assignment_id)
     remote_cmd = (
         "mkdir -p $HOME/.coord/logs && "
         f"{{ printf %s {header_q}; tmux capture-pane -p -t {sname_q} -S -; }} "
-        f"> $HOME/.coord/logs/{assignment_id}.log 2>/dev/null"
+        f"> $HOME/.coord/logs/{aid_q}.log 2>/dev/null"
     )
     try:
         subprocess.run(
@@ -1049,10 +1164,16 @@ def _launch_via_tmux(
             if not injected:
                 print(
                     "\n"
-                    "!!! coord: briefing injection could not be verified after "
-                    "multiple attempts.\n"
-                    "!!! The input box in the session below may be EMPTY — "
-                    "paste the briefing yourself if so.\n",
+                    "!!! coord: briefing was NOT injected into the session "
+                    "below.\n"
+                    "!!! Either the paste could not be verified after "
+                    "multiple attempts, OR (#2541) the pane is showing a "
+                    "claude confirmation dialog (first-run trust prompt / "
+                    "tool permission question / bypass-permissions "
+                    "warning) that coord deliberately did not paste into.\n"
+                    "!!! Answer any dialog you see first, then check "
+                    "whether the input box is EMPTY and paste the briefing "
+                    "yourself if so.\n",
                     file=sys.stderr,
                 )
                 try:
@@ -4226,7 +4347,7 @@ def reap_stale_interactive_sessions(
             continue
 
         sname = tmux_session_name(a.assignment_id)
-        _dead_pane_kill_needed = False
+        dead_pane_kill_needed = False
         if tmux_session_alive(sname):
             # Session is alive — but check whether the claude pane has already
             # exited (dead pane).  This is the detach-and-abandon case: the
@@ -4237,7 +4358,7 @@ def reap_stale_interactive_sessions(
                 continue  # session alive AND pane running — genuinely in progress
             # Pane exited; the session is now an empty shell.  Fall through to
             # the reap logic and kill the session at the end of this iteration.
-            _dead_pane_kill_needed = True
+            dead_pane_kill_needed = True
 
         # ── Session is dead (or dead-pane) locally: check locality ──────────
 
@@ -4348,7 +4469,7 @@ def reap_stale_interactive_sessions(
         #     ``coord sessions`` immediately.  Both best-effort — if kill
         #     fails the session will be gone on its own eventually (or the
         #     operator can kill it manually).
-        if _dead_pane_kill_needed:
+        if dead_pane_kill_needed:
             _persist_interactive_pane_log(a.assignment_id, sname)
             try:
                 subprocess.run(
@@ -4537,7 +4658,7 @@ def reap_stale_remote_interactive_sessions(
         sname = tmux_session_name(a.assignment_id)
         tmux_host = TmuxHost(ssh_target=machine.host, batch=True)
         alive, ssh_ok = _probe_remote_tmux_alive(sname, tmux_host)
-        _dead_pane_kill_needed = False
+        dead_pane_kill_needed = False
 
         if alive:
             # #2541: `remain-on-exit` (now set at session-creation time,
@@ -4559,7 +4680,7 @@ def reap_stale_remote_interactive_sessions(
             # for `coord log` before it's reaped below, then fall through
             # to the same "reap it" path as a fully-gone session.
             _persist_interactive_pane_log(a.assignment_id, sname, host=tmux_host)
-            _dead_pane_kill_needed = True
+            dead_pane_kill_needed = True
 
         if not ssh_ok:
             # SSH transport failure — host may be rebooting, not crashed.
@@ -4657,7 +4778,7 @@ def reap_stale_remote_interactive_sessions(
         # captured and the assignment finalized, so `coord sessions`
         # doesn't accumulate dead shells indefinitely. Best-effort; a
         # failure here doesn't affect the reap outcome above.
-        if _dead_pane_kill_needed:
+        if dead_pane_kill_needed:
             try:
                 subprocess.run(
                     tmux_host.cmd(["kill-session", "-t", sname]),

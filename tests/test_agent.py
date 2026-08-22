@@ -932,6 +932,28 @@ def test_clean_worktrees_tmux_probe_failure_does_not_abort_sweep(
     assert not (server.state_dir / "worktrees" / "aid-b").exists()
 
 
+def test_tmux_session_alive_treats_dead_pane_as_not_alive(monkeypatch) -> None:
+    """#2541: ``remain-on-exit on`` keeps ``has-session`` True after ANY
+    pane exit (clean success or crash) until a reaper notices — so the
+    ``clean_worktrees`` load-bearing guard must consult
+    ``tmux_session_running`` (alive AND pane not dead), not the bare
+    ``has-session`` check, or it would keep protecting a worktree whose
+    interactive session has already finished, indefinitely.
+    """
+    from coord import interactive as _interactive  # noqa: PLC0415
+
+    monkeypatch.setattr(_interactive, "tmux_available", lambda: True)
+
+    # A session that "exists" (has-session succeeds) but whose pane already
+    # exited must be reported as NOT alive by the AgentServer wrapper.
+    monkeypatch.setattr(_interactive, "tmux_session_running", lambda *a, **k: False)
+    assert AgentServer._tmux_session_alive("dead-pane-aid") is False
+
+    # A session whose pane is genuinely still running is reported alive.
+    monkeypatch.setattr(_interactive, "tmux_session_running", lambda *a, **k: True)
+    assert AgentServer._tmux_session_alive("running-aid") is True
+
+
 def test_clean_worktrees_respects_protect_list(tmp_path: Path) -> None:
     """#1295: a coordinator-supplied ``protect`` list of assignment_ids is
     honoured even when the agent has no local record of them and no tmux

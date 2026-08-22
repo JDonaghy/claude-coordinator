@@ -1055,6 +1055,41 @@ class TestAssignInteractiveReview:
         assert "session still running in remote tmux" in result.output
         assert "coord report-result" in result.output
 
+    def test_review_of_remote_dead_pane_session_finalizes(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """#2541: ``remain-on-exit on`` keeps ``tmux has-session`` True after
+        the review session's claude exits — clean completion OR crash —
+        until a reaper notices. A bare ``tmux_session_alive`` check would
+        misreport this as "still running" (as the sibling test above
+        proves for the genuinely-alive case) and skip finalize forever.
+        With the pane-dead check, a session that exists but whose pane has
+        already died must be treated the same as "session ended"."""
+        from unittest.mock import MagicMock
+
+        _seed_done_work("work-abc", "issue-1-fix-bug")
+        fake_result = MagicMock(already_recorded=False, terminal_status="advisory")
+        finalize_spy = MagicMock(return_value=fake_result)
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "the body"}), \
+             patch("socket.gethostname", return_value="laptop"), \
+             patch("coord.interactive._launch_via_tmux", return_value=0), \
+             patch("coord.interactive.tmux_session_alive", return_value=True), \
+             patch("coord.interactive.tmux_pane_dead", return_value=True), \
+             patch("coord.interactive.finalize_interactive_exit", finalize_spy):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "server", "api", "1", "--config", str(config_file),
+                 "--interactive", "--review-of", "work-abc"],
+            )
+        assert result.exit_code == 0, result.output
+        assert finalize_spy.call_count == 1, (
+            "a dead-pane session (claude exited, pane lingers under "
+            "remain-on-exit) must still be finalized, not misreported as "
+            "'still running'"
+        )
+        assert "session still running in remote tmux" not in result.output
+
     def test_review_of_local_session_ended_prompts_for_verdict(
         self, config_file: Path, coord_dir: Path
     ) -> None:

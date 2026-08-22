@@ -25,6 +25,7 @@ from coord.interactive import (
     tmux_pane_dead,
     tmux_session_alive,
     tmux_session_name,
+    tmux_session_running,
 )
 
 
@@ -333,6 +334,61 @@ class TestTmuxPaneDead:
         assert "coord-testme" in cmd
 
 
+# ── tmux_session_running (#2541) ─────────────────────────────────────────────
+
+
+class TestTmuxSessionRunning:
+    """#2541: ``remain-on-exit on`` (set on every freshly-created coord tmux
+    session) means bare ``tmux_session_alive`` (``has-session``) no longer
+    means "claude is still running" — a session whose pane already exited
+    (clean success OR crash) stays has-session-alive until a reaper kills
+    it. ``tmux_session_running`` composes ``tmux_session_alive`` with
+    ``tmux_pane_dead`` so callers get the right answer to "is this session
+    still doing work" without duplicating that composition themselves.
+    """
+
+    def test_true_when_alive_and_pane_running(self) -> None:
+        with patch(
+            "coord.interactive.tmux_session_alive", return_value=True
+        ), patch("coord.interactive.tmux_pane_dead", return_value=False):
+            assert tmux_session_running("coord-abc") is True
+
+    def test_false_when_alive_but_pane_dead(self) -> None:
+        """The exact #2541 regression case: has-session is True (the dead
+        pane lingers under remain-on-exit) but claude already exited."""
+        with patch(
+            "coord.interactive.tmux_session_alive", return_value=True
+        ), patch("coord.interactive.tmux_pane_dead", return_value=True):
+            assert tmux_session_running("coord-abc") is False
+
+    def test_false_when_session_does_not_exist(self) -> None:
+        with patch(
+            "coord.interactive.tmux_session_alive", return_value=False
+        ), patch("coord.interactive.tmux_pane_dead", return_value=False):
+            assert tmux_session_running("coord-abc") is False
+
+    def test_host_is_forwarded_to_both_checks(self) -> None:
+        from coord.interactive import TmuxHost
+
+        host = TmuxHost(ssh_target="remotehost")
+        seen: dict[str, Any] = {}
+
+        def _alive(_name: str, *, host: Any = None) -> bool:
+            seen["alive_host"] = host
+            return True
+
+        def _dead(_name: str, *, host: Any = None) -> bool:
+            seen["dead_host"] = host
+            return False
+
+        with patch("coord.interactive.tmux_session_alive", side_effect=_alive), \
+             patch("coord.interactive.tmux_pane_dead", side_effect=_dead):
+            tmux_session_running("coord-abc", host=host)
+
+        assert seen["alive_host"] is host
+        assert seen["dead_host"] is host
+
+
 # ── launch_human_attended_interactive — tmux path selection ──────────────────
 
 
@@ -564,7 +620,7 @@ class TestLaunchViaTmuxUnverifiedInjectionSurfaced:
         printed = " ".join(
             str(call.args[0]) if call.args else "" for call in mock_print.call_args_list
         )
-        assert "briefing injection could not be verified" in printed
+        assert "briefing was NOT injected" in printed
 
     def test_no_warning_or_ack_when_injection_verified(self) -> None:
         """No *injection*-specific warning/ack when injection succeeded.

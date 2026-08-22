@@ -1084,6 +1084,7 @@ def reattach(assignment_id: str, config_path: Path) -> None:
         tmux_available,
         tmux_session_alive,
         tmux_session_name,
+        tmux_session_running,
     )
 
     if not tmux_available():
@@ -1609,7 +1610,12 @@ def reattach(assignment_id: str, config_path: Path) -> None:
         exit_code = 1
 
     # After attach returns: check if session ended or user detached.
-    if tmux_session_alive(sname, host=_tmux_host):
+    # #2541: use tmux_session_running (alive AND pane not dead), not the
+    # bare has-session check — remain-on-exit means a session whose claude
+    # already exited (crash OR a clean, successful completion) stays
+    # has-session-alive until a reaper notices, so a bare check here would
+    # misreport a finished session as "still running" and skip finalize.
+    if tmux_session_running(sname, host=_tmux_host):
         click.echo(
             f"\n  Session is still running.  "
             f"Reattach later with: coord reattach {assignment_id}"

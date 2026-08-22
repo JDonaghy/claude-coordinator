@@ -114,6 +114,61 @@ BRACKETED_PASTE_ENABLE = b"\x1b[?2004h"
 INPUT_BOX_MARKER = "❯"
 INPUT_BOX_MARKER_BYTES = INPUT_BOX_MARKER.encode("utf-8")
 
+# ── #2541: first-run / permission prompt detection ──────────────────────────
+#
+# Claude Code's TUI renders BOTH its normal chat input box AND any blocking,
+# human-answered confirmation dialog (the first-run "do you trust the files
+# in this folder?" prompt, a per-tool/MCP permission question, the
+# "bypass permissions" warning, ...) with the same ``INPUT_BOX_MARKER`` ("❯")
+# cursor glyph. The #865 readiness heuristic only checked for that glyph, so
+# it could not tell "the chat box is ready for a paste" apart from "a
+# confirmation dialog is waiting for a keypress" — and pasting the full,
+# multi-line briefing text into a single-choice menu (which handles single
+# keystrokes, not a bracketed-paste block) is the leading suspect for
+# #2541's "claude exited with status 1" crash on a fresh worktree's
+# first-run prompt.
+#
+# The distinguishing signal: the chat box's own render always follows "❯ "
+# with free-form placeholder/typed text (e.g. "❯ Try a task, ask a question,
+# or type /help", confirmed live in the #865 capture) — never a bare
+# "<digit>.". A confirmation dialog's selected option, by contrast, is
+# rendered "❯ 1. Yes" / "❯ 2. No, ..." — Claude Code's numbered-choice
+# convention for every confirmation prompt it has (trust dialog, tool/MCP
+# permission, bypass-permissions warning, model picker, ...). Matching that
+# shape lets injection callers hold off on pasting into ANY such dialog
+# without having to enumerate their exact wording, which the #2541 issue
+# itself could not pin down ("the exact interaction is unconfirmed").
+BLOCKING_PROMPT_SELECTION_RE = re.compile(
+    rf"{re.escape(INPUT_BOX_MARKER)}\s*\d+\.\s"
+)
+
+#: Known first-run/onboarding dialog text, matched case-insensitively as a
+#: belt-and-suspenders check alongside :data:`BLOCKING_PROMPT_SELECTION_RE`
+#: — catches the dialog even mid-render, before its "❯ 1." cursor line has
+#: painted yet.
+BLOCKING_PROMPT_TEXT_MARKERS = (
+    "do you trust the files in this folder",
+    "trust the files in this folder",
+    "bypass permissions",
+)
+
+
+def pane_shows_blocking_prompt(text: str) -> bool:
+    """True when *text* (a captured pane/screen) shows a human-answered
+    confirmation dialog rather than the normal chat input box (#2541).
+
+    See :data:`BLOCKING_PROMPT_SELECTION_RE` for the detection rationale.
+    Callers use this to withhold a briefing paste while such a dialog is on
+    screen — pasting free text into a single-choice menu (rather than the
+    free-text chat box) is the leading suspect for the #2541 "claude exited
+    with status 1" crash on a fresh worktree's first-run prompt.
+    """
+    if BLOCKING_PROMPT_SELECTION_RE.search(text):
+        return True
+    lowered = text.lower()
+    return any(marker in lowered for marker in BLOCKING_PROMPT_TEXT_MARKERS)
+
+
 _WS_RE_STR = re.compile(r"\s+")
 _WS_RE_BYTES = re.compile(rb"\s+")
 

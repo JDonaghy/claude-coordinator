@@ -18,6 +18,7 @@ from coord.providers.claude_pty import (
     INPUT_BOX_MARKER,
     INPUT_BOX_MARKER_BYTES,
     briefing_fingerprint,
+    pane_shows_blocking_prompt,
     paste_landed,
     paste_landed_bytes,
 )
@@ -287,3 +288,62 @@ class TestPasteLandedBytes:
         fp = briefing_fingerprint("Something that never landed " * 10)
         raw = b"READY_BANNER\r\n" + INPUT_BOX_MARKER_BYTES + b" placeholder\r\n"
         assert paste_landed_bytes(raw, fp) is False
+
+
+# ---------------------------------------------------------------------------
+# pane_shows_blocking_prompt (#2541)
+# ---------------------------------------------------------------------------
+
+
+class TestPaneShowsBlockingPrompt:
+    """A confirmation dialog (first-run trust prompt, tool/MCP permission
+    question, "bypass permissions" warning, ...) shares the same "❯" cursor
+    glyph as the normal chat input box, so callers need a way to tell them
+    apart before pasting — see :data:`pane_shows_blocking_prompt`'s
+    docstring for the #2541 rationale.
+    """
+
+    def test_normal_input_box_is_not_a_blocking_prompt(self) -> None:
+        assert pane_shows_blocking_prompt(_EMPTY_BOX) is False
+
+    def test_input_box_with_typed_text_is_not_a_blocking_prompt(self) -> None:
+        text = f"{INPUT_BOX_MARKER} Fix the bug in issue #42: the login\n"
+        assert pane_shows_blocking_prompt(text) is False
+
+    def test_numbered_selection_cursor_is_a_blocking_prompt(self) -> None:
+        """The "❯ <digit>." shape is Claude Code's confirmation-menu
+        convention (trust dialog, tool/MCP permission, bypass-permissions
+        warning, model picker, ...)."""
+        dialog = (
+            "Bash command\n"
+            "  rm -rf /tmp/scratch\n"
+            "Do you want to proceed?\n"
+            f"{INPUT_BOX_MARKER} 1. Yes\n"
+            "  2. Yes, and don't ask again for rm commands\n"
+            "  3. No, and tell Claude what to do differently (esc)\n"
+        )
+        assert pane_shows_blocking_prompt(dialog) is True
+
+    def test_trust_dialog_text_is_a_blocking_prompt(self) -> None:
+        assert pane_shows_blocking_prompt(
+            "Do you trust the files in this folder?\n"
+        ) is True
+
+    def test_bypass_permissions_text_is_a_blocking_prompt(self) -> None:
+        assert pane_shows_blocking_prompt(
+            "WARNING: Bypass Permissions mode skips all confirmations.\n"
+        ) is True
+
+    def test_case_insensitive_text_match(self) -> None:
+        assert pane_shows_blocking_prompt(
+            "DO YOU TRUST THE FILES IN THIS FOLDER?\n"
+        ) is True
+
+    def test_pasted_chip_is_not_a_blocking_prompt(self) -> None:
+        """A collapsed paste chip after a successful injection must not be
+        mistaken for a confirmation dialog on a later poll."""
+        chip = f"{INPUT_BOX_MARKER} [Pasted text #1 +58 lines]\n"
+        assert pane_shows_blocking_prompt(chip) is False
+
+    def test_empty_text_is_not_a_blocking_prompt(self) -> None:
+        assert pane_shows_blocking_prompt("") is False
