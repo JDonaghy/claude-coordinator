@@ -1933,6 +1933,35 @@ def merge(
                 "— nothing to do"
             )
             sys.exit(0)
+        # #2558: a CONFLICT entry used to dead-end right here — the generic
+        # "not PENDING) — cannot merge" refusal below applies equally to
+        # HUMAN_REQUIRED/DROPPED, but CONFLICT is different from those: it is
+        # the state #241's conflict-fix exists to clear, and nothing else
+        # ever gives it a second look (`merge_queue.process()` only acts on
+        # PENDING; the reconcile pass above only unparks an entry GitHub
+        # already reports mergeable again). Give it the SAME
+        # classify-and-dispatch chance the whole-queue path gets for a fresh
+        # conflict, then still fall through to the generic refusal below —
+        # dispatching a fix does not put the branch on the target branch
+        # THIS pass, so the postcondition genuinely isn't met yet.
+        if only_entry.state == CONFLICT:
+            _verb = "(dry run) would retry" if dry_run else "retrying"
+            click.echo(
+                f"  {only_entry.repo_name} #{only_entry.issue_number} "
+                f"({only_entry.branch}): still CONFLICT — {_verb} #241 "
+                "conflict-fix dispatch instead of refusing outright (#2558)"
+            )
+            _dispatch_conflict_fixes(
+                [mq.MergeEvent(only_entry, "conflict", only_entry.error)],
+                cfg_only, dry_run=dry_run,
+            )
+            if not dry_run:
+                all_items_only = mq.load_queue()
+                by_id_only = {only_entry.assignment_id: only_entry}
+                merged_only = [
+                    by_id_only.get(x.assignment_id, x) for x in all_items_only
+                ]
+                mq.save_queue(merged_only)
         if only_entry.state != PENDING:
             click.echo(
                 f"merge-queue: entry {only_assignment!r} is in state "
@@ -2292,7 +2321,44 @@ def merge(
         presorted = True
 
     pending = [x for x in items if x.state == PENDING]
+
+    # #2558: a CONFLICT row is a dead end everywhere else in this command.
+    # #241's conflict-fix is normally dispatched off a FRESH transition into
+    # CONFLICT — process() below, the sibling sweep, --revalidate — because
+    # all three build their dispatch event from the transition itself. An
+    # entry that transitioned on some EARLIER tick and is still sitting
+    # there (no machine was free at the time, the fix is still running, or
+    # dispatch was simply declined) never reappears in a fresh `events`
+    # list, so nothing ever asks again — see the #2558 issue's coord-portal
+    # #131 repro, wedged this way with zero conflict-fix assignments ever
+    # dispatched. Give every standing CONFLICT row a fresh chance on EVERY
+    # invocation, before the terminal-state early-return below — a queue
+    # that is 100% terminal (#131's exact shape) is exactly the case that
+    # return skips.
+    standing_conflicts = [x for x in items if x.state == CONFLICT]
+    if standing_conflicts:
+        _verb = "(dry run) would retry" if dry_run else "retrying"
+        for x in standing_conflicts:
+            click.echo(
+                f"  {x.repo_name} #{x.issue_number} ({x.branch}): still "
+                f"CONFLICT — {_verb} #241 conflict-fix dispatch (#2558)"
+            )
+        _dispatch_conflict_fixes(
+            [mq.MergeEvent(x, "conflict", x.error) for x in standing_conflicts],
+            cfg, dry_run=dry_run,
+        )
+
     if not pending:
+        if not dry_run and standing_conflicts:
+            # process() never runs this pass (nothing is PENDING), so its
+            # own save-queue step below is unreached — persist whatever the
+            # redispatch above mutated (e.g. a retry-cap escalation to
+            # HUMAN_REQUIRED) before returning, same convention as the
+            # --only path above.
+            all_items = mq.load_queue()
+            by_id = {x.assignment_id: x for x in items}
+            merged = [by_id.get(x.assignment_id, x) for x in all_items]
+            mq.save_queue(merged)
         # Still surface terminal states so the user knows what happened.
         for x in items:
             click.echo(f"  [{x.state}] {x.repo_name} #{x.issue_number} ({x.branch})")

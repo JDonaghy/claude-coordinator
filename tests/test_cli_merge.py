@@ -563,6 +563,56 @@ class TestMergeConflictReconciliation:
         states = {e.assignment_id: e.state for e in mq.load_queue()}
         assert states["c2"] == mq.CONFLICT
 
+    def test_terminal_queue_still_redispatches_a_standing_conflict(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """#2558: a queue where EVERY entry is terminal (one MERGED, one
+        genuinely-still-conflicting CONFLICT — coord-portal#131's exact
+        shape) used to hit `if not pending: return` before ever reaching
+        the #241 classify-and-dispatch step, so a standing CONFLICT row got
+        zero chances at a conflict-fix dispatch, forever. The dispatch
+        attempt must happen BEFORE that early return, not only when other
+        PENDING work happens to be in the same batch.
+        """
+        from coord.models import Board
+        from coord.state import save_board
+        save_board(Board())
+        conflict_entry = mq.QueuedMerge(
+            assignment_id="c4", repo_name="api", repo_github="acme/api",
+            branch="worker/c4", target_branch="main", issue_number=4,
+            issue_title="t", state=mq.CONFLICT, pr_number=903,
+            error="merge conflict: GitHub reports PR #903 as CONFLICTING",
+        )
+        merged_entry = mq.QueuedMerge(
+            assignment_id="m4", repo_name="api", repo_github="acme/api",
+            branch="worker/m4", target_branch="main", issue_number=5,
+            issue_title="t", state=mq.MERGED,
+        )
+        _seed_queue([conflict_entry, merged_entry])
+
+        fake_fix = MagicMock()
+        fake_fix.machine_name = "laptop"
+
+        with patch("coord.github_ops.check_pr_mergeable", return_value=False), \
+             patch("coord.github_ops.merge_pr") as merge_fn, \
+             patch(
+                 "coord.conflict_fix.dispatch_conflict_fix",
+                 return_value=fake_fix,
+             ) as dcf:
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, result.output
+        merge_fn.assert_not_called()
+        assert dcf.called, "expected a #241 dispatch attempt for the standing conflict"
+        assert "conflict-fix dispatched to laptop" in result.output
+        assert "[conflict]" in result.output or "[merged]" in result.output
+
+        states = {e.assignment_id: e.state for e in mq.load_queue()}
+        assert states["c4"] == mq.CONFLICT
+        assert states["m4"] == mq.MERGED
+
     def test_dry_run_reflects_cleared_conflict_not_stale_verdict(
         self, config_file: Path, coord_dir: Path
     ) -> None:
@@ -783,6 +833,52 @@ class TestMergeOnly:
 
         states = {x.assignment_id: x.state for x in mq.load_queue()}
         assert states["cf1"] == mq.CONFLICT
+
+    def test_only_redispatches_a_standing_conflict(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """#2558: an entry that was ALREADY sitting at CONFLICT before this
+        invocation (not one that just transitioned during it, the case
+        `test_only_dispatches_conflict_fix_on_a_fresh_conflict` covers) used
+        to hit the generic "not PENDING) — cannot merge" refusal and nothing
+        else — no reconsideration, ever, since `merge_queue.process()` only
+        acts on PENDING entries. `--only` must give it the SAME
+        classify-and-dispatch chance the whole-queue path gets, then still
+        refuse to merge it this pass (the branch isn't on the target branch
+        yet).
+        """
+        from coord.models import Board
+        from coord.state import save_board
+        save_board(Board())
+        entry = mq.QueuedMerge(
+            assignment_id="sc1", repo_name="api", repo_github="acme/api",
+            branch="worker/sc1", target_branch="main", issue_number=1,
+            issue_title="t", state=mq.CONFLICT, pr_number=910,
+            error="merge conflict: GitHub reports PR #910 as CONFLICTING",
+        )
+        _seed_queue([entry])
+
+        fake_fix = MagicMock()
+        fake_fix.machine_name = "laptop"
+
+        with patch("coord.github_ops.check_pr_mergeable", return_value=False), \
+             patch(
+                 "coord.conflict_fix.dispatch_conflict_fix",
+                 return_value=fake_fix,
+             ) as dcf:
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(config_file), "--only", "sc1"]
+            )
+
+        # Still refuses to merge THIS pass — dispatching a fix doesn't land
+        # the branch on the target branch immediately.
+        assert result.exit_code == 1
+        assert "is in state 'conflict' (not PENDING) — cannot merge" in result.output
+        assert dcf.called, "expected a fresh #241 dispatch attempt for a standing conflict"
+        assert "conflict-fix dispatched to laptop" in result.output
+
+        states = {x.assignment_id: x.state for x in mq.load_queue()}
+        assert states["sc1"] == mq.CONFLICT
 
     def test_only_errors_when_entry_not_pending(
         self, config_file: Path, coord_dir: Path
