@@ -18,6 +18,19 @@ On success, the coordinator re-enqueues the original merge entry so
 Why a separate module: same reason :mod:`coord.review` lives apart from
 ``coord.dispatch`` — conflict-fix is triggered by a merge_queue event, not
 by a planner proposal, so it shares little with the work-dispatch shape.
+
+#2555: a merge conflict on a :data:`coord.models.SEALED_PATH_AUTHOR_TYPES`
+branch (``test-author``/``mock-author``) is a special case — this repo's own
+CLAUDE.md tells every worker to never touch ``tests/acceptance/**``, so the
+*ordinary* conflict-fix worker above structurally refuses the only edit
+that would resolve it (almost always another slice's additive block in the
+milestone's ``manifest.yml``) and no-ops. ``dispatch_conflict_fix`` detects
+this from ``entry.assignment_type`` and dispatches a differently-briefed
+worker instead — see :func:`build_sealed_manifest_conflict_briefing` — that
+is explicitly authorized to resolve a ``manifest.yml`` conflict additively
+and nothing else. It refuses (and the entry escalates to a human exactly
+like any other conflict-fix failure) the moment the conflict reaches beyond
+that one file.
 """
 
 from __future__ import annotations
@@ -30,7 +43,13 @@ import httpx
 from coord.config import Config
 from coord.dispatch import AGENT_PORT
 from coord.merge_queue import QueuedMerge
-from coord.models import Assignment, Board, Machine
+from coord.models import (
+    SEALED_MANIFEST_FILENAME,
+    SEALED_PATH_AUTHOR_TYPES,
+    Assignment,
+    Board,
+    Machine,
+)
 
 
 CONFLICT_FIX_SYSTEM_PROMPT = """\
@@ -181,6 +200,205 @@ def build_semantic_conflict_briefing(
         f"Last merge error: {entry.error or 'unknown conflict'}",
     ]
     return "\n".join(lines)
+
+
+# ── #2555: sealed-author (test-author/mock-author) conflict resolution ─────
+#
+# An ordinary conflict-fix worker (the briefing above) is dispatched with the
+# generic CONFLICT_FIX_SYSTEM_PROMPT — no mention of `tests/acceptance/` at
+# all — and every worker session, regardless of `system_prompt`, still gets
+# this repo's own CLAUDE.md loaded, which tells it to never touch
+# `tests/acceptance/**`. For a SEALED_PATH_AUTHOR_TYPES branch that IS almost
+# always exactly where the conflict lives (another slice's block in the
+# milestone's `manifest.yml`), so the ordinary worker structurally refuses
+# the only edit that would resolve it and no-ops — the gap #2555 exists to
+# close. This section gives that class of entry a differently-briefed worker
+# that is explicitly, narrowly authorized to resolve a `manifest.yml`
+# conflict additively, and told to refuse (STUCK, no guessing) the instant
+# the conflict reaches beyond that one file — mirroring the existing
+# mechanical/semantic self-classification pattern above, not a new
+# escalation tier: a sealed-scope refusal has no stronger-model retry,
+# since the file stays sealed regardless of which model resolves it.
+
+# Marker a sealed conflict-fix worker's STUCK: line starts with when the
+# conflict reaches outside the one file it's authorized to touch (a test
+# body, contract.md, a mock, a fixture, an entry-point registration, or a
+# manifest.yml edit that isn't a clean additive case). Same shape as
+# SEMANTIC_STUCK_MARKER above — a fixed, machine-parseable string, not prose
+# — but deliberately a DIFFERENT marker: `detect_semantic_conflict`/
+# `semantic_verdict_in_text` must not mistake this for a mechanical/semantic
+# verdict and route it into the (not sealed-aware) stronger-model escalation
+# path, which would just reproduce the same self-refusal one level up.
+SEALED_SCOPE_STUCK_MARKER = "coord:conflict=sealed-scope"
+
+# Title prefix for a sealed-author conflict-fix dispatch — visible in the TUI
+# Pipeline row so an operator can tell at a glance that this conflict-fix
+# used the narrower, sealed-aware briefing rather than the ordinary one.
+SEALED_CONFLICT_FIX_TITLE_PREFIX = "[sealed-conflict-fix]"
+
+SEALED_MANIFEST_CONFLICT_SYSTEM_PROMPT = f"""\
+You are a Claude Code conflict-fix worker for a SEALED acceptance-oracle \
+branch (a test-author/mock-author slice under `tests/acceptance/`). The \
+merge of this branch into its target failed because the branch is out of \
+date or conflicts with another slice.
+
+This repo's CLAUDE.md tells every ordinary worker to never touch \
+`tests/acceptance/**` — that rule keeps the acceptance oracle independent \
+of the workers it grades. It does NOT apply to you for this one narrow \
+purpose: resolving a merge conflict in a milestone's \
+`tests/acceptance/ms-NN/{SEALED_MANIFEST_FILENAME}`, the file every slice \
+under that milestone appends its own block to. You are explicitly \
+authorized to edit ONLY that file, and only additively.
+
+Rules:
+- The coordinator denies `gh` and `git push --force` for this worker. \
+Don't try to use them — the harness will reject the call.
+- Stay on the worker's branch — do NOT push to main / develop / target.
+- Use git push --force-with-lease (NOT --force).
+- Rebase onto the target branch. If the ONLY conflict is inside a \
+`{SEALED_MANIFEST_FILENAME}` under `tests/acceptance/`, resolve it \
+ADDITIVELY: keep BOTH sides' issue blocks, without reordering or rewriting \
+any block that isn't yours. Never delete or rewrite another issue's block \
+— this mirrors the "one block per issue, later slices merge in" rule the \
+manifest files document in their own header comment.
+- Do NOT create, edit, or delete ANY OTHER file under `tests/acceptance/` \
+— not a test body, not `contract.md`, not a mock, not a fixture, not an \
+entry-point registration. Those stay sealed even for you.
+- If the conflict is NOT confined to a `{SEALED_MANIFEST_FILENAME}` — it \
+also touches a test body or any other sealed file, OR the \
+`{SEALED_MANIFEST_FILENAME}` conflict itself is not a clean additive case \
+(e.g. the same issue's own block was edited two different ways) — DO NOT \
+GUESS and do NOT touch it. Exit non-zero with a STUCK: line that starts \
+with the exact marker `{SEALED_SCOPE_STUCK_MARKER}` and then names the \
+file(s) in conflict, e.g.
+  STUCK: {SEALED_SCOPE_STUCK_MARKER} tests/acceptance/ms-33/audit.rs:1-40 \
+— conflict is in a test body, not {SEALED_MANIFEST_FILENAME}
+The coordinator reads that marker and hands this off to a human — there is \
+no stronger-model retry for this class of conflict, since the file stays \
+sealed regardless of which model resolves it.
+
+Progress reporting:
+- After each significant step (rebase started, manifest conflict resolved, \
+tests passed, pushed), output:
+  STATUS: [what you just did] → [what you're about to do] → [confidence]
+- If you stop, output the STUCK: line described above and wait for \
+guidance.\
+"""
+
+
+def build_sealed_manifest_conflict_briefing(
+    *,
+    entry: QueuedMerge,
+    repo_path: str,
+    test_command: str | None,
+) -> str:
+    """Briefing for a conflict-fix dispatched against a
+    :data:`coord.models.SEALED_PATH_AUTHOR_TYPES` branch (#2555).
+
+    Unlike :func:`build_conflict_fix_briefing`, this worker IS authorized to
+    edit one specific sealed file — the milestone's ``manifest.yml`` —
+    because that is the one file every acceptance slice under a milestone
+    appends an additive block to (see e.g.
+    ``tests/acceptance/ms-33/manifest.yml``'s own header comment), so a
+    two-slice collision there is a mechanical, written-down-rule merge, not
+    a semantic one. Everything else under ``tests/acceptance/`` stays
+    off-limits — see :data:`SEALED_MANIFEST_CONFLICT_SYSTEM_PROMPT`'s
+    "Rules" for the exact boundary and :data:`SEALED_SCOPE_STUCK_MARKER`,
+    the marker the worker uses to escalate when the conflict crosses it.
+    """
+    test_cmd = test_command or "echo '(no test command configured)'"
+    lines: list[str] = [
+        f"# Sealed conflict fix: {entry.repo_github} branch `{entry.branch}`",
+        "",
+        f"The merge of `{entry.branch}` → `{entry.target_branch}` failed.",
+        f"Reason: {entry.error or 'unknown conflict'}",
+        "",
+        f"Issue: #{entry.issue_number} — {entry.issue_title}",
+        f"Assignment type: `{entry.assignment_type}` — this branch's whole "
+        "job was authoring under `tests/acceptance/`, so its conflict is "
+        f"almost always another slice's additive edit to the same "
+        f"milestone's `{SEALED_MANIFEST_FILENAME}`.",
+        "",
+        "## Where you are",
+        "",
+        f"You are already in a dedicated git worktree checked out on "
+        f"`{entry.branch}` — the coordinator created it for you. Work HERE.",
+        "",
+        f"Do **NOT** `cd {repo_path}` (that is the machine's shared base "
+        "checkout) and do NOT `git checkout` / `git switch` anywhere. Leaving "
+        f"the base checkout parked on `{entry.branch}` breaks every later "
+        "dispatch against that branch on this machine (#1694).",
+        "",
+        "## Steps",
+        "",
+        "1. `git fetch origin`",
+        f"2. `git pull --rebase origin {entry.target_branch}`",
+        f"3. If a conflict marker appears in a `{SEALED_MANIFEST_FILENAME}` "
+        "under `tests/acceptance/`, resolve it by keeping BOTH sides' issue "
+        "blocks (additive — see the system prompt's rules). If a conflict "
+        "marker appears ANYWHERE ELSE, stop — see \"When NOT to guess\" "
+        "below.",
+        f"4. Run tests: `{test_cmd}`",
+        f"5. `git push --force-with-lease origin {entry.branch}`",
+        "6. Exit 0 if push succeeds; non-zero otherwise.",
+        "",
+        "## When NOT to guess",
+        "",
+        f"You are authorized to edit ONLY a `{SEALED_MANIFEST_FILENAME}` "
+        "under `tests/acceptance/`, and only additively. If the conflict "
+        "touches a test body, `contract.md`, a mock, a fixture, an "
+        "entry-point registration, or anything else sealed — or the "
+        f"`{SEALED_MANIFEST_FILENAME}` conflict is not a clean additive "
+        "case — DO NOT touch it. Exit non-zero with a `STUCK:` line "
+        f"starting with the exact marker `{SEALED_SCOPE_STUCK_MARKER}` and "
+        "the file(s)/reason, e.g.",
+        "",
+        f"    STUCK: {SEALED_SCOPE_STUCK_MARKER} tests/acceptance/ms-33/"
+        "audit.rs:1-40 — conflict is in a test body, not "
+        f"{SEALED_MANIFEST_FILENAME}",
+        "",
+        "The coordinator reads that marker and hands this off to a human — "
+        "there is no stronger-model retry for this class of conflict, since "
+        "the file stays sealed regardless of which model resolves it.",
+        "",
+        "You will NOT use `gh` or `git push --force` — both are denied by "
+        "the harness. The coordinator owns PR retries and issue posting.",
+    ]
+    return "\n".join(lines)
+
+
+def sealed_scope_verdict_in_text(text: str | None) -> bool:
+    """True when a sealed conflict-fix worker's log carries the
+    :data:`SEALED_SCOPE_STUCK_MARKER` — i.e. it refused because the conflict
+    reached outside the one ``manifest.yml`` it was authorized to touch.
+    Mirrors :func:`semantic_verdict_in_text`.
+    """
+    if not text:
+        return False
+    return SEALED_SCOPE_STUCK_MARKER in _decode_worker_text(text)
+
+
+def _is_sealed_manifest_path(path: str) -> bool:
+    """True when *path* is (any milestone's) ``manifest.yml`` — the one file
+    a sealed-author conflict-fix dispatch is authorized to touch."""
+    return path.rsplit("/", 1)[-1] == SEALED_MANIFEST_FILENAME
+
+
+def sealed_conflict_is_manifest_only(files: list[str]) -> bool:
+    """True when every path in *files* is a milestone acceptance
+    ``manifest.yml`` — exactly the shape :func:`dispatch_conflict_fix`'s
+    sealed-author branch (#2555) is authorized to resolve.
+
+    *files* is expected to already be confirmed confined to a repo's sealed
+    acceptance paths (e.g. via ``coord.notify._conflict_confined_to_sealed_
+    paths``, a GitHub-compare-API best-effort check) — this function only
+    narrows that further, from "somewhere under the sealed tree" to
+    "nowhere but a manifest.yml". A conflict that also touches a test body,
+    ``contract.md``, a mock, or any other sealed file returns ``False`` —
+    out of this resolver's authority, still needs a human. An empty list
+    also returns ``False`` (nothing to confirm as manifest-only).
+    """
+    return bool(files) and all(_is_sealed_manifest_path(f) for f in files)
 
 
 def build_conflict_fix_briefing(
@@ -522,6 +740,25 @@ def dispatch_conflict_fix(
     while another conflict-fix is in flight.  Because the escalated attempt
     is itself a ``conflict-fix`` row, its failure consumes the ordinary
     retry cap and the entry goes HUMAN_REQUIRED — no loop.
+
+    #2555: when *entry.assignment_type* is a
+    :data:`coord.models.SEALED_PATH_AUTHOR_TYPES` member (``test-author``/
+    ``mock-author``) — captured on the entry at ``enqueue()`` time, so no
+    extra board lookup is needed — and *semantic* is ``False``, this
+    dispatches the sealed-aware briefing (see
+    :func:`build_sealed_manifest_conflict_briefing`) instead of the ordinary
+    one. The ordinary briefing is a guaranteed no-op for this branch class:
+    its worker gets no authorization to touch ``tests/acceptance/**`` and
+    this repo's own CLAUDE.md, loaded into every session regardless of
+    ``system_prompt``, tells it never to. The sealed-aware briefing narrowly
+    authorizes exactly the one file (a milestone's ``manifest.yml``) most of
+    these conflicts actually live in, and refuses (STUCK, retry cap consumed
+    exactly like any other conflict-fix failure) the moment the conflict
+    reaches beyond it — same retry-cap and machine-selection logic as
+    everywhere else in this function, only the briefing/system-prompt/title
+    differ. Not wired into the ``semantic=True`` escalation path: a sealed
+    entry's refusal is a scope boundary, not a call for a stronger model —
+    the file stays sealed regardless of which model resolves it.
     """
     if semantic:
         if has_prior_semantic_escalation(board, entry.assignment_id):
@@ -532,6 +769,8 @@ def dispatch_conflict_fix(
         board, entry.assignment_id, current_error=entry.error,
     ):
         return None
+
+    sealed_author = not semantic and entry.assignment_type in SEALED_PATH_AUTHOR_TYPES
 
     repo = config.repo(entry.repo_name)
     if repo is None:
@@ -561,6 +800,14 @@ def dispatch_conflict_fix(
         title = f"{SEMANTIC_FIX_TITLE_PREFIX} {entry.issue_title}"
         if model:
             title = f"{SEMANTIC_FIX_TITLE_PREFIX}[{model}] {entry.issue_title}"
+    elif sealed_author:
+        briefing = build_sealed_manifest_conflict_briefing(
+            entry=entry,
+            repo_path=repo_path,
+            test_command=repo.test_command,
+        )
+        system_prompt = SEALED_MANIFEST_CONFLICT_SYSTEM_PROMPT
+        title = f"{SEALED_CONFLICT_FIX_TITLE_PREFIX} {entry.issue_title}"
     else:
         briefing = build_conflict_fix_briefing(
             entry=entry,
@@ -683,6 +930,10 @@ def dispatch_conflict_fix(
             "merge_entry_id": entry.assignment_id,
             "semantic": semantic,
             "model": model,
+            # #2555: lets the audit trail (and anyone diffing it) tell a
+            # narrowly-authorized sealed-manifest dispatch apart from the
+            # ordinary conflict-fix without re-deriving it from the title.
+            "sealed_author": sealed_author,
         },
     )
 

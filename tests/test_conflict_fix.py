@@ -7,10 +7,14 @@ Covers:
 - Dispatcher integration with the board
 - Reconcile hook: conflict-fix done → merge entry re-enqueued
 - Reconcile hook: conflict-fix failed → merge entry HUMAN_REQUIRED
+- #2555: sealed-author (test-author/mock-author) conflict resolution — a
+  manifest.yml-only collision auto-heals; a conflict reaching outside
+  manifest.yml refuses and escalates to a human.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from unittest.mock import patch
 
@@ -19,9 +23,15 @@ import pytest
 from coord.config import Config, ReviewsConfig
 from coord.conflict_fix import (
     CONFLICT_FIX_SYSTEM_PROMPT,
+    SEALED_CONFLICT_FIX_TITLE_PREFIX,
+    SEALED_MANIFEST_CONFLICT_SYSTEM_PROMPT,
+    SEALED_SCOPE_STUCK_MARKER,
     build_conflict_fix_briefing,
+    build_sealed_manifest_conflict_briefing,
     dispatch_conflict_fix,
     pick_conflict_fix_machine,
+    sealed_conflict_is_manifest_only,
+    sealed_scope_verdict_in_text,
 )
 from coord.merge_queue import (
     CONFLICT,
@@ -61,7 +71,9 @@ def two_machine_config(repo: Repo) -> Config:
     )
 
 
-def _entry(*, error: str | None = "Merge conflict in foo.py") -> QueuedMerge:
+def _entry(
+    *, error: str | None = "Merge conflict in foo.py", assignment_type: str = "work",
+) -> QueuedMerge:
     return QueuedMerge(
         assignment_id="abc123",
         repo_name="api",
@@ -74,6 +86,7 @@ def _entry(*, error: str | None = "Merge conflict in foo.py") -> QueuedMerge:
         pr_number=42,
         pr_url="https://github.com/acme/api/pull/42",
         error=error,
+        assignment_type=assignment_type,
     )
 
 
@@ -200,6 +213,198 @@ class TestBuildBriefing:
             entry=_entry(), repo_path="/work/api", test_command=None,
         )
         assert "no test command configured" in briefing
+
+
+# ── #2555: sealed-author (test-author/mock-author) conflict resolution ─────
+
+
+class TestBuildSealedManifestBriefing:
+    def test_authorizes_manifest_yml_only(self) -> None:
+        briefing = build_sealed_manifest_conflict_briefing(
+            entry=_entry(assignment_type="test-author"),
+            repo_path="/work/api",
+            test_command="pytest -x",
+        )
+        assert "manifest.yml" in briefing
+        assert "additively" in briefing.lower() or "additive" in briefing.lower()
+        assert "git fetch origin" in briefing
+        assert "git pull --rebase origin main" in briefing
+        assert "git push --force-with-lease origin issue-1-fix" in briefing
+        assert "pytest -x" in briefing
+
+    def test_forbids_everything_else_under_sealed_tree(self) -> None:
+        briefing = build_sealed_manifest_conflict_briefing(
+            entry=_entry(assignment_type="mock-author"),
+            repo_path="/work/api",
+            test_command="pytest",
+        )
+        assert "test body" in briefing.lower()
+        assert "contract.md" in briefing
+
+    def test_names_the_sealed_scope_marker(self) -> None:
+        briefing = build_sealed_manifest_conflict_briefing(
+            entry=_entry(assignment_type="test-author"),
+            repo_path="/work/api",
+            test_command="pytest",
+        )
+        assert SEALED_SCOPE_STUCK_MARKER in briefing
+
+    def test_no_test_command_falls_back(self) -> None:
+        briefing = build_sealed_manifest_conflict_briefing(
+            entry=_entry(assignment_type="test-author"),
+            repo_path="/work/api",
+            test_command=None,
+        )
+        assert "no test command configured" in briefing
+
+
+class TestSealedScopeVerdictInText:
+    def test_true_when_marker_present(self) -> None:
+        assert sealed_scope_verdict_in_text(
+            f"STATUS: rebasing\nSTUCK: {SEALED_SCOPE_STUCK_MARKER} "
+            "tests/acceptance/ms-4/audit.rs:1-9 — test body conflict"
+        ) is True
+
+    def test_false_when_absent(self) -> None:
+        assert sealed_scope_verdict_in_text("STATUS: pushed\n") is False
+        assert sealed_scope_verdict_in_text(None) is False
+        assert sealed_scope_verdict_in_text("") is False
+
+    def test_false_for_ordinary_semantic_marker(self) -> None:
+        """A plain `coord:conflict=semantic` verdict must NOT also read as a
+        sealed-scope verdict — the two markers are deliberately distinct so
+        the (not sealed-aware) semantic-escalation path never fires for a
+        sealed-author entry's refusal."""
+        assert sealed_scope_verdict_in_text(
+            "STUCK: coord:conflict=semantic src/foo.py:1-9 — contradictory"
+        ) is False
+
+
+class TestSealedConflictIsManifestOnly:
+    def test_true_for_single_manifest_file(self) -> None:
+        assert sealed_conflict_is_manifest_only(
+            ["tests/acceptance/ms-4/manifest.yml"]
+        ) is True
+
+    def test_true_for_multiple_milestone_manifests(self) -> None:
+        assert sealed_conflict_is_manifest_only([
+            "tests/acceptance/ms-4/manifest.yml",
+            "tests/acceptance/ms-5/manifest.yml",
+        ]) is True
+
+    def test_false_when_any_file_is_not_manifest(self) -> None:
+        assert sealed_conflict_is_manifest_only([
+            "tests/acceptance/ms-4/manifest.yml",
+            "tests/acceptance/ms-4/audit_test.rs",
+        ]) is False
+
+    def test_false_for_empty_list(self) -> None:
+        assert sealed_conflict_is_manifest_only([]) is False
+
+    def test_false_for_non_manifest_filename_ending_similarly(self) -> None:
+        assert sealed_conflict_is_manifest_only(
+            ["tests/acceptance/ms-4/other_manifest.yml"]
+        ) is False
+
+
+class TestDispatchSealedAuthorBranch:
+    def test_test_author_entry_gets_sealed_briefing(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        client = _FakeHTTPClient({"id": "fix-sealed-1"})
+        result = dispatch_conflict_fix(
+            _entry(assignment_type="test-author"),
+            Board(),
+            two_machine_config,
+            http_client=client,
+            prefer_machine="laptop",
+        )
+        assert result is not None
+        assert result.issue_title.startswith(SEALED_CONFLICT_FIX_TITLE_PREFIX)
+        _, payload = client.calls[0]
+        assert payload["system_prompt"] == SEALED_MANIFEST_CONFLICT_SYSTEM_PROMPT
+        assert "manifest.yml" in payload["briefing"]
+        assert payload["issue_title"].startswith(SEALED_CONFLICT_FIX_TITLE_PREFIX)
+
+    def test_mock_author_entry_gets_sealed_briefing(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        client = _FakeHTTPClient({"id": "fix-sealed-2"})
+        result = dispatch_conflict_fix(
+            _entry(assignment_type="mock-author"),
+            Board(),
+            two_machine_config,
+            http_client=client,
+            prefer_machine="laptop",
+        )
+        assert result is not None
+        _, payload = client.calls[0]
+        assert payload["system_prompt"] == SEALED_MANIFEST_CONFLICT_SYSTEM_PROMPT
+
+    def test_plain_work_entry_keeps_ordinary_briefing(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """A default `assignment_type="work"` entry must be unaffected by
+        #2555 — it keeps the ordinary conflict-fix briefing, which is never
+        authorized to touch tests/acceptance/**."""
+        client = _FakeHTTPClient({"id": "fix-plain-1"})
+        result = dispatch_conflict_fix(
+            _entry(assignment_type="work"),
+            Board(),
+            two_machine_config,
+            http_client=client,
+            prefer_machine="laptop",
+        )
+        assert result is not None
+        assert not result.issue_title.startswith(SEALED_CONFLICT_FIX_TITLE_PREFIX)
+        _, payload = client.calls[0]
+        assert payload["system_prompt"] == CONFLICT_FIX_SYSTEM_PROMPT
+
+    def test_default_entry_assignment_type_is_work(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """`QueuedMerge.assignment_type` defaults to "work" for entries
+        enqueued before #1077 added the field — must not be mistaken for a
+        sealed-author entry."""
+        client = _FakeHTTPClient({"id": "fix-plain-2"})
+        dispatch_conflict_fix(
+            _entry(), Board(), two_machine_config,
+            http_client=client, prefer_machine="laptop",
+        )
+        _, payload = client.calls[0]
+        assert payload["system_prompt"] == CONFLICT_FIX_SYSTEM_PROMPT
+
+    def test_deny_commands_unchanged_for_sealed_branch(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """gh and force-push stay denied for the sealed resolver too — the
+        narrow authorization is only for editing manifest.yml, not for the
+        harness-level command denials every conflict-fix worker gets."""
+        client = _FakeHTTPClient({"id": "fix-sealed-3"})
+        dispatch_conflict_fix(
+            _entry(assignment_type="test-author"), Board(), two_machine_config,
+            http_client=client, prefer_machine="laptop",
+        )
+        _, payload = client.calls[0]
+        deny = payload.get("deny_commands", [])
+        assert "Bash(gh *)" in deny
+        assert "Bash(git push --force *)" in deny
+
+    def test_audit_row_flags_sealed_author(
+        self, two_machine_config: Config, coord_db, monkeypatch, tmp_path,
+    ) -> None:
+        monkeypatch.setenv("COORD_CONFIG", str(tmp_path / "nonexistent.yml"))
+        client = _FakeHTTPClient({"id": "fix-sealed-4"})
+        result = dispatch_conflict_fix(
+            _entry(assignment_type="mock-author"), Board(), two_machine_config,
+            http_client=client, prefer_machine="laptop",
+        )
+        assert result is not None
+        row = coord_db.execute(
+            "SELECT * FROM audit_log WHERE tier='operational'"
+        ).fetchone()
+        details = json.loads(row["details_json"])
+        assert details["sealed_author"] is True
 
 
 # ── Machine selection ───────────────────────────────────────────────────────
@@ -786,3 +991,116 @@ class TestReconcileHook:
             "conflict-fix completion via notify should reset queue entry to PENDING"
         )
         assert queue[0].error is None
+
+
+# ── #2555 end-to-end: additive manifest.yml collision merges with no human ─
+
+
+class TestSealedConflictEndToEnd:
+    """Drives the #2555 acceptance scenario: two acceptance-oracle slices
+    (test-author/mock-author branches) collide on the SAME milestone
+    `manifest.yml` — an additive, mechanical conflict per the file's own
+    "one block per issue" rule. Covers both outcomes:
+
+    - the sealed resolver lands the collision and the merge entry is ready
+      to merge again with no operator involvement;
+    - a conflict that reaches outside manifest.yml (a test body) is refused
+      and the entry escalates to a human, exactly like any other
+      conflict-fix failure.
+    """
+
+    def _populate_queue(self, entry: QueuedMerge) -> None:
+        from coord import merge_queue as mq
+        mq.save_queue([entry])
+
+    def test_additive_manifest_collision_merges_without_a_human(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        # Slice B (this branch) collided with slice A's already-merged block
+        # in the SAME milestone's manifest.yml — the exact coord-portal#132/
+        # #129 shape described in #2555.
+        entry = _entry(
+            assignment_type="test-author",
+            error="could not be rebased onto main",
+        )
+        self._populate_queue(entry)
+
+        # 1. The stalled/#241 dispatch path picks the sealed-aware branch —
+        #    the same `dispatch_conflict_fix` every caller (coord merge's
+        #    #241 sweep, `coord notify`'s stalled-pipeline arm) already uses.
+        client = _FakeHTTPClient({"id": "sealed-fix-1"})
+        fix = dispatch_conflict_fix(
+            entry, Board(), two_machine_config,
+            http_client=client, prefer_machine="laptop",
+        )
+        assert fix is not None
+        assert fix.issue_title.startswith(SEALED_CONFLICT_FIX_TITLE_PREFIX)
+        _, payload = client.calls[0]
+        assert payload["system_prompt"] == SEALED_MANIFEST_CONFLICT_SYSTEM_PROMPT
+        assert "manifest.yml" in payload["briefing"]
+
+        # 2. The dispatched worker rebases, resolves the manifest.yml
+        #    conflict additively (keeping both issues' blocks), pushes, and
+        #    exits 0 — simulated here as the reconcile hook's success path,
+        #    the same hook every conflict-fix completion (real or test)
+        #    goes through.
+        from coord.reconcile import _on_conflict_fix_done
+        from coord import merge_queue as mq
+
+        fix.status = "done"
+        _on_conflict_fix_done(fix, succeeded=True)
+
+        # 3. No human touched anything: the merge entry is back to PENDING,
+        #    exactly what `coord merge`'s next sweep needs to retry the
+        #    merge — this IS "merges without a human" for the parts under
+        #    this repo's control (the actual `gh pr merge` call is a wire
+        #    call this test doesn't reach, same as every other reconcile-hook
+        #    test in this file).
+        landed = mq.load_queue()[0]
+        assert landed.state == PENDING
+        assert landed.error is None
+
+    def test_conflict_reaching_a_test_body_refuses_and_escalates(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """The same dispatch is attempted, but this time the conflict also
+        touches a test body — outside the sealed resolver's authority. The
+        worker refuses (STUCK with the sealed-scope marker) instead of
+        guessing, and the entry escalates to HUMAN_REQUIRED exactly like any
+        other conflict-fix failure — no silent guess at a sealed file."""
+        entry = _entry(
+            assignment_type="mock-author",
+            error="could not be rebased onto main",
+        )
+        self._populate_queue(entry)
+
+        client = _FakeHTTPClient({"id": "sealed-fix-2"})
+        fix = dispatch_conflict_fix(
+            entry, Board(), two_machine_config,
+            http_client=client, prefer_machine="laptop",
+        )
+        assert fix is not None
+
+        # The worker's own log carries the sealed-scope STUCK marker — used
+        # here only to confirm the marker this dispatch's briefing documents
+        # is exactly what `sealed_scope_verdict_in_text` recognizes; the
+        # reconcile hook's own conflict-fix failure path (shared with every
+        # other class of conflict-fix failure) is what actually parks the
+        # entry, exercised via `succeeded=False` below.
+        worker_log = (
+            "STATUS: rebase started\n"
+            f"STUCK: {SEALED_SCOPE_STUCK_MARKER} "
+            "tests/acceptance/ms-4/audit_test.rs:10-22 — conflict is in a "
+            "test body, not manifest.yml"
+        )
+        assert sealed_scope_verdict_in_text(worker_log) is True
+
+        from coord.reconcile import _on_conflict_fix_done
+        from coord import merge_queue as mq
+
+        fix.status = "failed"
+        _on_conflict_fix_done(fix, succeeded=False)
+
+        parked = mq.load_queue()[0]
+        assert parked.state == HUMAN_REQUIRED
+        assert "Manual rebase required" in (parked.error or "")

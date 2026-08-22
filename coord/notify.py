@@ -993,14 +993,18 @@ class StalledDispatchAction:
       (#602).
     - ``"skipped_human_required"``  — the conflict-fix retry cap was already
       hit; surfacing to a human, not auto-retrying.
-    - ``"skipped_sealed_conflict"`` (#2537) — ``merge_conflict_unresolved``
-      on a :data:`coord.models.SEALED_PATH_AUTHOR_TYPES` row whose conflict
-      was confirmed (:func:`_conflict_confined_to_sealed_paths`) to be
-      confined to the repo's sealed acceptance-oracle paths — a
-      conflict-fix worker is guaranteed to self-restrict and push nothing
-      there, so the dispatch was skipped rather than spending a worker
-      session on a known no-op; needs a sealed-path-aware rebase dispatcher
-      (a follow-up issue, not yet implemented).
+    - ``"skipped_sealed_conflict"`` (#2537, narrowed by #2555) —
+      ``merge_conflict_unresolved`` on a
+      :data:`coord.models.SEALED_PATH_AUTHOR_TYPES` row whose conflict was
+      confirmed (:func:`_conflict_confined_to_sealed_paths`) to be confined
+      to the repo's sealed acceptance-oracle paths AND (#2555:
+      :func:`coord.conflict_fix.sealed_conflict_is_manifest_only`) is NOT
+      confined further to just a milestone's ``manifest.yml`` — i.e. it
+      touches a test body, ``contract.md``, a mock, or some other sealed
+      file the sealed-aware conflict-fix branch is not authorized to edit.
+      A manifest.yml-only conflict on such a row no longer skips here — it
+      falls through to :func:`coord.conflict_fix.dispatch_conflict_fix`,
+      whose sealed-author branch (#2555) resolves it.
     - ``"disabled"``                — ``pipeline.auto_dispatch_stalled`` is
       off; detection/narration still happened, dispatch did not.
     """
@@ -1496,35 +1500,41 @@ def dispatch_stalled_pipeline_action(
                 kind="skipped_human_required",
                 detail="conflict-fix already active or its retry cap was already hit",
             )
-        # #2537: dispatch_conflict_fix is guaranteed to no-op on a conflict
-        # confined to the repo's sealed acceptance-oracle paths — the
-        # conflict-fix worker is REQUIRED by CLAUDE.md's own sealed-path
-        # rule to self-restrict from editing them (the additive carve-out
-        # applies only to test-author/mock-author dispatches, never
-        # conflict-fix), so it pushes nothing and the entry just re-stalls
-        # next tick. Confirmed live on coord-portal#132/#135: a manually
-        # forced dispatch_conflict_fix restored its worktree clean and
-        # pushed nothing. Skip the known-wasted dispatch when we can
-        # confirm confinement in advance; resolving it for real needs a
-        # sealed-path-aware re-dispatch (tracked as a follow-up issue, not
-        # yet implemented) — dispatch_conflict_fix stays the fallback for
-        # every other case (can't confirm confinement, or genuinely not
-        # confined).
+        # #2537/#2555: dispatch_conflict_fix used to be guaranteed to no-op on
+        # a conflict confined to the repo's sealed acceptance-oracle paths —
+        # an ordinary conflict-fix worker is required by CLAUDE.md's own
+        # sealed-path rule to self-restrict from editing them (the additive
+        # carve-out applied only to test-author/mock-author dispatches, never
+        # conflict-fix) — so it pushed nothing and the entry just re-stalled
+        # next tick (confirmed live on coord-portal#132/#135). #2555 gave
+        # `dispatch_conflict_fix` a sealed-aware branch (keyed off
+        # `entry.assignment_type`, the same field checked below) that CAN
+        # resolve the one shape that guarantee doesn't hold for: a conflict
+        # confined to a milestone's `manifest.yml` — the file every slice
+        # under that milestone additively appends its own block to. So the
+        # skip now narrows to exactly the residual no-op case — confined to
+        # the sealed tree but NOT to a manifest.yml (a test body, contract.md,
+        # a mock, …) — and falls through to `dispatch_conflict_fix` for a
+        # manifest-only conflict, which the sealed branch now actually lands.
         if work.type in SEALED_PATH_AUTHOR_TYPES:
             sealed_files = _conflict_confined_to_sealed_paths(entry, config)
             if sealed_files is not None:
-                return StalledDispatchAction(
-                    kind="skipped_sealed_conflict",
-                    detail=(
-                        "conflict is confined to sealed acceptance paths ("
-                        + ", ".join(sealed_files)
-                        + ") — a conflict-fix worker is required to "
-                        "self-restrict from editing them (CLAUDE.md's "
-                        "sealed-path rule) and would push nothing; needs a "
-                        "sealed-path-aware rebase dispatcher (follow-up "
-                        "issue), not dispatch_conflict_fix"
-                    ),
+                from coord.conflict_fix import (  # noqa: PLC0415
+                    sealed_conflict_is_manifest_only,
                 )
+
+                if not sealed_conflict_is_manifest_only(sealed_files):
+                    return StalledDispatchAction(
+                        kind="skipped_sealed_conflict",
+                        detail=(
+                            "conflict is confined to sealed acceptance paths ("
+                            + ", ".join(sealed_files)
+                            + ") but not to a manifest.yml — the sealed "
+                            "conflict-fix branch (#2555) is only authorized "
+                            "to resolve a manifest.yml conflict, so a worker "
+                            "would push nothing here; needs a human"
+                        ),
+                    )
         fix = dispatch_conflict_fix(entry, board, config, prefer_machine=work.machine_name)
         if fix is None:
             return StalledDispatchAction(

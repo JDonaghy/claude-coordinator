@@ -1439,9 +1439,17 @@ class TestMergeConflictSealedConfinement:
         )
         return config
 
-    def test_skips_dispatch_when_conflict_confined_to_sealed_paths(
+    def test_dispatches_sealed_conflict_fix_when_confined_to_manifest_yml(
         self, config: Config, monkeypatch
     ) -> None:
+        """#2555: a conflict confined to a milestone's `manifest.yml` is
+        exactly what the sealed-aware conflict-fix branch
+        (`coord.conflict_fix.dispatch_conflict_fix`'s `sealed_author`
+        branch) is authorized to resolve, so this no longer skips — it
+        falls through to the ordinary dispatch call, which now lands it.
+        Was `test_skips_dispatch_when_conflict_confined_to_sealed_paths`
+        before #2555 supplied a resolver that could actually handle this
+        exact shape."""
         config.pipeline.auto_dispatch_stalled = True
         config = self._sealed_config(config)
         board = _board(
@@ -1459,7 +1467,12 @@ class TestMergeConflictSealedConfinement:
         assert detection.reason == "merge_conflict_unresolved"
         assert work.type == "mock-author"
 
-        conflict_fix_stub = MagicMock()
+        fix_assignment = Assignment(
+            machine_name="mac-mini", repo_name="vimcode", issue_number=602,
+            issue_title="[sealed-conflict-fix] t", assignment_id="cf-sealed-1",
+            status="pending", type="conflict-fix",
+        )
+        conflict_fix_stub = MagicMock(return_value=fix_assignment)
         monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", conflict_fix_stub)
         monkeypatch.setattr("coord.merge_queue.load_queue", lambda: queued)
         monkeypatch.setattr(
@@ -1469,8 +1482,46 @@ class TestMergeConflictSealedConfinement:
 
         action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
 
+        assert action.kind == "conflict_fix_dispatched"
+        conflict_fix_stub.assert_called_once()
+
+    def test_skips_dispatch_when_conflict_touches_sealed_path_outside_manifest(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """#2555: a conflict confined to the sealed tree but reaching beyond
+        `manifest.yml` (here, a test body) is still out of the sealed
+        conflict-fix branch's authority — a worker dispatched for it would
+        push nothing, so this stays skipped exactly like the pre-#2555
+        behavior for the manifest-only case."""
+        config.pipeline.auto_dispatch_stalled = True
+        config = self._sealed_config(config)
+        board = _board(
+            _mock_author_work("ma-work-1b", test_state="passed"),
+            _review("ma-work-1b", aid="ma-review-1b", review_verdict="approve"),
+        )
+        queued = [QueuedMerge(
+            assignment_id="ma-work-1b", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="ms-65-gate-a", target_branch="main", issue_number=602,
+            issue_title="t", state=CONFLICT, error="could not be rebased onto main",
+        )]
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )[0]
+        assert detection.reason == "merge_conflict_unresolved"
+        assert work.type == "mock-author"
+
+        conflict_fix_stub = MagicMock()
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", conflict_fix_stub)
+        monkeypatch.setattr("coord.merge_queue.load_queue", lambda: queued)
+        monkeypatch.setattr(
+            "coord.github_ops.get_compare_files",
+            lambda repo, base, head: ["tests/acceptance/ms-4/audit_test.rs"],
+        )
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
         assert action.kind == "skipped_sealed_conflict"
-        assert "tests/acceptance/ms-4/manifest.yml" in action.detail
+        assert "tests/acceptance/ms-4/audit_test.rs" in action.detail
         assert action.kind not in notify_mod._STALLED_DISPATCH_KINDS
         conflict_fix_stub.assert_not_called()
 
