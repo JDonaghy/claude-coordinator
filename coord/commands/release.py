@@ -581,6 +581,41 @@ def _lane_versions_by_host(report) -> dict[str, list[str | None]]:
     return out
 
 
+def _ensure_roll_pending_marker(target_version: str, *, reason: str) -> None:
+    """#2587: make sure a roll-pending marker exists for *target_version*,
+    without resetting an already-live one's clock.
+
+    Called from the one place `coord release propagate` itself hits the
+    #2112 daemon-busy deadlock it cannot roll through on its own (the
+    daemon-first ``busy_hosts`` check in :func:`release_propagate`) — so a
+    plain, periodic ``coord-release-propagate.timer`` firing while the
+    daemon host is behind and itself busy ALSO queues the marker
+    :func:`coord.drive_queue.plan_tick` and the drive-queue tick watch for,
+    exactly like ``coord release nightly-window`` does explicitly. See
+    :class:`coord.drive_queue.RollPending`'s docstring for the mechanism
+    this feeds.
+
+    Never overwrites an existing marker for the SAME target — resetting
+    ``set_at``/``deferrals`` every few minutes while this timer keeps
+    finding the fleet busy would make the TTL bound
+    (:meth:`~coord.drive_queue.RollPending.expired`) unreachable in
+    practice, exactly the "never actually bounded" failure #2587's own
+    bound exists to prevent. A marker for a DIFFERENT (stale) target IS
+    replaced — the newly resolved version is the one that should roll.
+    """
+    import time as _time  # noqa: PLC0415
+
+    from coord.commands.drive_queue import read_roll_pending, write_roll_pending  # noqa: PLC0415
+    from coord.drive_queue import RollPending  # noqa: PLC0415
+
+    existing = read_roll_pending()
+    if existing is not None and existing.target_version == target_version:
+        return
+    write_roll_pending(
+        RollPending(target_version=target_version, set_at=_time.time(), reason=reason)
+    )
+
+
 @release_group.command(
     "propagate",
     help=(
@@ -908,6 +943,12 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
     # (the documented 405). This is the one case a per-host window still
     # has to defer the WHOLE run rather than just skip the busy host.
     if daemon_name in busy_hosts and daemon_name not in current:
+        # #2587: this is exactly the deadlock `coord release nightly-window`
+        # exists to route around — queue the SAME roll-pending marker here
+        # too, so a plain periodic `coord-release-propagate.timer` run also
+        # arms the drive-queue tick's own inter-drive-gap trigger instead of
+        # requiring an operator to separately reach for `nightly-window`.
+        _ensure_roll_pending_marker(record.target_version, reason="propagate")
         _finish(rp.STATUS_DEFERRED, 0)
 
     still_busy = busy_hosts - set(current)
@@ -2679,11 +2720,11 @@ def _escalate_window(record, *, reason: str) -> None:
 @release_group.command(
     "nightly-window",
     help=(
-        "Guarantee the daemon host rolls at a nightly window instead of "
-        "waiting for a fleet-wide quiescent moment that may never come "
-        "(#2112). Stops the drive queue, drains in-flight drives (bounded), "
-        "rolls with `coord release propagate`, and ALWAYS restarts the "
-        "queue timer before exiting — whether or not anything rolled."
+        "Guarantee the daemon host rolls, without waiting for a fleet-wide "
+        "quiescent moment that may never come (#2112, #2587). Sets a "
+        "roll-pending marker naming the target version and returns "
+        "immediately — the drive-queue tick fires the actual roll at the "
+        "next inter-drive gap. Never stops `coord-drive-queue.timer`."
     ),
 )
 @_CONFIG_OPTION
@@ -2693,24 +2734,30 @@ def _escalate_window(record, *, reason: str) -> None:
               help="Machine name running coord-serve. Normally DERIVED from the "
                    "fleet's own /health, same as `coord release propagate`.")
 @click.option("--queue-timer", default="coord-drive-queue.timer", show_default=True,
-              help="The systemd --user timer to stop for the duration of the drain.")
+              help="DEPRECATED, ignored (#2587): this command no longer stops or "
+                   "starts any timer — kept only so an old invocation (or the "
+                   "deployed unit, before it is redeployed) does not fail on an "
+                   "unrecognised flag.")
 @click.option("--drain-deadline", default=3600.0, show_default=True, type=float,
-              help="Bounded wait (seconds) for in-flight drives before giving up, "
-                   "restarting the queue and reporting failure (trap 2) — the "
-                   "queue is never left stopped past this.")
+              help="DEPRECATED, ignored (#2587): there is no drain to bound any "
+                   "more — see `coord.drive_queue.ROLL_PENDING_DEFAULT_TTL_SECONDS` "
+                   "for the marker's own bound instead.")
 @click.option("--poll-interval", default=30.0, show_default=True, type=float,
-              help="Seconds between drain re-checks.")
+              help="DEPRECATED, ignored (#2587): nothing here polls any more — "
+                   "the drive-queue tick's own cadence is what re-checks.")
 @click.option("--dry-run", is_flag=True,
-              help="Print what this run would do; stop nothing, roll nothing.")
+              help="Print what this run would do; set nothing.")
 @click.option("--ensure-queue-running", is_flag=True,
-              help="Do ONLY `systemctl --user start <queue-timer>` and exit — the "
-                   "SIGKILL-safe half of trap 4/acceptance 4. Wired as "
-                   "deploy/coord-release-window.service's ExecStopPost=, which "
-                   "systemd runs after the main process exits for ANY reason "
-                   "(success, failure, or a signal a Python `finally` cannot "
-                   "catch). Every other option is ignored with this flag.")
+              help="Legacy escape hatch, kept for a hand invocation only: does "
+                   "ONLY `systemctl --user start <queue-timer>` and exits. #2587 "
+                   "never stops the timer in the first place, so this is no "
+                   "longer wired into `deploy/coord-release-window.service` — "
+                   "it exists purely so `systemctl --user start "
+                   "coord-drive-queue.timer` after a hand-stopped timer is one "
+                   "recognisable command rather than a new one to remember. "
+                   "Every other option is ignored with this flag.")
 @click.option("--json", "as_json", is_flag=True, help="Emit the window record as JSON.")
-def release_nightly_window(  # noqa: PLR0912, PLR0915 — a pipeline; see module docstring
+def release_nightly_window(
     config_path: Path,
     target: str | None,
     daemon_host_override: str | None,
@@ -2721,19 +2768,36 @@ def release_nightly_window(  # noqa: PLR0912, PLR0915 — a pipeline; see module
     ensure_queue_running: bool,
     as_json: bool,
 ) -> None:
-    """One nightly-window attempt. Exit 0 on up-to-date/rolled/dry-run, 1+ otherwise.
+    """One nightly-window attempt. Exit 0 on up-to-date/roll-pending/rolled/
+    dry-run, 1+ otherwise.
 
     #2112: `coord release propagate` cannot roll the daemon host past a busy
     fleet on its own — the daemon leads every roll (the documented 405), and
     dellserver's own drive-queue tick charges itself as busy for essentially
-    any queued drive (see `coord/release_window.py`'s module docstring). This
-    command manufactures the window propagate can't: stop the queue, drain
-    what's already running (bounded — trap 2), roll, restart the queue —
-    ALWAYS restart the queue (trap 4), whatever happened in between.
+    any queued drive (see `coord/release_window.py`'s module docstring).
 
-    Never carries `--force` to the `coord release propagate` it shells out
-    to (trap 1) — a drain that did not finish is reported and declined, not
-    overridden.
+    #2587 REWRITE: this used to manufacture the window itself — stop
+    `coord-drive-queue.timer`, poll a bounded drain (up to an hour), roll,
+    always restart the timer. Measured 2026-08-22: that drain ran the full
+    60 minutes, drained nothing, rolled nothing, with the timer — and
+    therefore ALL reconciliation and ALL new dispatch — stopped the entire
+    time. The fleet was never going to reach fleet-wide quiescence; it did
+    not need to. Now this command does the one thing only IT can do (resolve
+    the target, decide a roll is needed) and hands the actual waiting off to
+    :func:`coord.drive_queue.plan_tick` via the roll-pending marker
+    (`coord.commands.drive_queue.write_roll_pending`) — the tick already
+    knows the fleet's true busy/idle state every ~3 minutes, for free,
+    without stopping anything. See `RollPending`'s own docstring for the
+    full mechanism and `docs/AGENT_OPERATIONS.md`'s propagation section for
+    the incident this replaces.
+
+    If a roll is ALREADY pending for THIS target (e.g. a previous night's
+    marker never got its window and #2587's own TTL has not yet lapsed),
+    this makes one best-effort attempt to fire it directly via `coord
+    release propagate` — never `--force` (trap 1) — rather than leaving it
+    to the tick alone; a real fleet host running its own nightly timer while
+    genuinely idle is a fine moment to roll immediately. A still-busy fleet
+    just leaves the marker exactly as it was for the tick to keep watching.
     """
     import json as _json  # noqa: PLC0415
     import time  # noqa: PLC0415
@@ -2742,6 +2806,12 @@ def release_nightly_window(  # noqa: PLR0912, PLR0915 — a pipeline; see module
     from coord import release_verify as rv  # noqa: PLC0415
     from coord import release_window as rw  # noqa: PLC0415
     from coord.commands._common import _load_config  # noqa: PLC0415
+    from coord.commands.drive_queue import (  # noqa: PLC0415
+        clear_roll_pending,
+        read_roll_pending,
+        write_roll_pending,
+    )
+    from coord.drive_queue import RollPending  # noqa: PLC0415
 
     if ensure_queue_running:
         ok, detail = _systemctl(queue_timer, "start")
@@ -2810,158 +2880,141 @@ def release_nightly_window(  # noqa: PLR0912, PLR0915 — a pipeline; see module
         report, [daemon_name], record.target_version
     ).get(daemon_name)
 
-    # ── 2. acceptance 3 — already current, so the queue is never touched ──
+    # ── 2. acceptance 3 — already current, so nothing EXTERNAL is touched:
+    #      no systemctl call, no `coord release propagate` subprocess. A
+    #      pending marker IS cleared here, though (never left standing) — if
+    #      the daemon has already reached the freshest resolvable target by
+    #      some other means (a human ran `coord release propagate` by hand,
+    #      or a previous run already rolled it), the marker's whole job is
+    #      done and leaving it would force `--reconcile-only` posture on the
+    #      queue for up to its own TTL/deferral ceiling for nothing. Safe
+    #      under the deployed unit's normal call shape (no explicit
+    #      `--target`, always PyPI's current latest — see
+    #      `deploy/coord-release-window.service`): any marker still present
+    #      was set by an EARLIER resolution of the same "latest" lookup, so
+    #      it can only name an equal-or-older target, never a newer one this
+    #      check has not yet accounted for.
     if not rw.needs_roll(record.daemon_version, record.target_version):
+        if read_roll_pending() is not None:
+            clear_roll_pending()
         _finish(rw.STATUS_UP_TO_DATE, 0)
 
+    existing = read_roll_pending()
+
     if dry_run:
-        click.echo(
-            f"would stop {queue_timer}, drain up to {drain_deadline:.0f}s "
-            f"({daemon_name} currently reports v{record.daemon_version or '?'}, "
-            f"target v{record.target_version}), then `coord release propagate "
-            f"--daemon-host {daemon_name} --target {record.target_version}`, "
-            f"then restart {queue_timer}"
-        )
+        if existing is not None:
+            click.echo(
+                f"a roll is already pending ({existing.describe()}) — would "
+                f"attempt `coord release propagate --daemon-host {daemon_name} "
+                f"--target {existing.target_version}` now, leaving the marker "
+                "for the drive-queue tick if the fleet is still busy"
+            )
+        else:
+            click.echo(
+                f"would set a roll-pending marker for v{record.target_version} "
+                f"({daemon_name} currently reports "
+                f"v{record.daemon_version or '?'}) — the drive-queue tick "
+                "fires `coord release propagate` at the next inter-drive gap "
+                f"(#2587); {queue_timer} is never stopped"
+            )
         _finish(rw.STATUS_DRY_RUN, 0)
 
-    # ── 3. stop the queue — no new drives may launch for the rest of this
-    #      run — and from here on ALWAYS restart it before exiting ─────────
-    stop_ok, stop_detail = _systemctl(queue_timer, "stop")
-    record.queue_stopped = stop_ok
-    record.queue_stop_detail = stop_detail
-    click.echo(f"{'✓' if stop_ok else '✗'} stop {queue_timer}: {stop_detail}")
+    if existing is not None and existing.target_version == record.target_version:
+        # #2587: a roll is already pending for this exact target — most
+        # likely set by a PRIOR run of this same nightly timer that never
+        # got its window yet. The drive-queue tick is the PRIMARY trigger
+        # (see `RollPending`'s docstring); this is a belt-and-braces extra
+        # attempt, safe to make redundantly since `coord release propagate`
+        # never carries `--force` here (trap 1) and simply defers again if
+        # the fleet is still busy.
+        prop_status, prop_exit, prop_output, prop_started_at = _run_propagate(
+            daemon_host=daemon_name, target_version=existing.target_version,
+            config_path=config_path, state_dir=state_dir,
+        )
+        record.propagate_status = prop_status
+        record.propagate_exit_code = prop_exit
+        record.propagate_output = prop_output
+        record.propagate_started_at = prop_started_at
+        if prop_output:
+            click.echo(prop_output)
 
-    status = rw.STATUS_ERROR
-    exit_code = 1
-    try:
-        if not stop_ok:
+        if prop_exit == 0 and prop_status in (
+            rp.STATUS_VERIFIED, rp.STATUS_UP_TO_DATE, rp.STATUS_ROLLED,
+        ):
+            clear_roll_pending()
+            status = (
+                rw.STATUS_UP_TO_DATE if prop_status == rp.STATUS_UP_TO_DATE
+                else rw.STATUS_ROLLED
+            )
+            _finish(status, 0)
+        elif prop_exit == 0 and prop_status == rp.STATUS_DEFERRED:
+            # Still busy — completely normal. Leave the marker exactly as it
+            # is (this attempt spends none of its TTL/deferral bound; only
+            # the tick's own per-tick deferrals do) for the tick to keep
+            # watching.
+            click.echo(
+                f"roll for v{existing.target_version} still pending — "
+                f"{daemon_name} not yet quiescent "
+                f"({existing.deferrals}/{existing.max_deferrals} tick "
+                "deferral(s) recorded so far)"
+            )
+            _finish(rw.STATUS_ROLL_PENDING, 0)
+        elif prop_status.startswith("exit ") or prop_status.startswith("error:"):
+            # #2187 proposal 3, preserved verbatim through the #2587 rewrite:
+            # this arm is reached only when NEITHER ground truth was
+            # available — no matching entry in `coord release history` (see
+            # `_latest_propagate_record_since`) AND no parseable `--json`
+            # payload on stdout (`_parse_trailing_json`). `prop_status` here
+            # is one of those two functions' placeholder fallbacks, never a
+            # real outcome — so the message must say exactly what evidence
+            # is missing instead of quoting the placeholder as if it were
+            # one (the old text, "status=exit 0, exit=0", read as a
+            # verification failure when exit 0 is what a VERIFIED roll also
+            # produces).
             record.error = (
-                f"could not stop {queue_timer} — refusing to drain or roll "
-                f"without a guaranteed no-new-launches window: {stop_detail}"
+                f"coord release propagate exited {prop_exit}, but its "
+                "outcome could not be confirmed: no matching entry "
+                "was found in `coord release history` for this run, "
+                "and its --json stdout had no parseable status "
+                "either — see propagate_output"
             )
             click.echo(f"error: {record.error}", err=True)
             _escalate_window(record, reason=record.error)
+            _finish(rw.STATUS_PROPAGATE_FAILED, prop_exit or 1)
         else:
-            # ── 4. bounded drain (trap 2) ──────────────────────────────────
-            outcome = _drain(
-                daemon_host=daemon_name, config_path=config_path,
-                deadline=drain_deadline, poll_interval=poll_interval,
-                config=config,
+            # A real, ground-truth status from `coord release history` — just
+            # not a verified roll (e.g. `failed` or `rolled-back`). A real
+            # failure, not a mere deferral — loud (trap 3), and the marker
+            # survives so the tick keeps trying too, bounded by its own
+            # TTL/deferral ceiling.
+            record.error = (
+                f"coord release propagate did not verify the pending roll — "
+                f"`coord release history` recorded status="
+                f"{prop_status!r} (exit {prop_exit}) for this run"
             )
-            record.drained = outcome.drained
-            record.drain_seconds = outcome.elapsed_seconds
-            record.drain_detail = outcome.detail
-            click.echo(
-                f"{'✓' if outcome.drained else '✗'} drain: "
-                f"{'clean' if outcome.drained else 'TIMED OUT'} after "
-                f"{outcome.elapsed_seconds:.0f}s"
-                + (f" — {outcome.detail}" if outcome.detail else "")
-            )
+            click.echo(f"error: {record.error}", err=True)
+            _escalate_window(record, reason=record.error)
+            _finish(rw.STATUS_PROPAGATE_FAILED, prop_exit or 1)
 
-            if not outcome.drained:
-                record.error = (
-                    f"drain deadline ({drain_deadline:.0f}s) hit with "
-                    f"{daemon_name} still busy — {outcome.detail}; declining "
-                    "to roll (never --force from an unattended window)"
-                )
-                click.echo(f"error: {record.error}", err=True)
-                _escalate_window(record, reason=record.error)
-                status = rw.STATUS_DRAIN_TIMEOUT
-            else:
-                # ── 5. roll — the daemon host is now provably free ─────────
-                prop_status, prop_exit, prop_output, prop_started_at = _run_propagate(
-                    daemon_host=daemon_name, target_version=record.target_version,
-                    config_path=config_path, state_dir=state_dir,
-                )
-                record.propagate_status = prop_status
-                record.propagate_exit_code = prop_exit
-                record.propagate_output = prop_output
-                record.propagate_started_at = prop_started_at
-                if prop_output:
-                    click.echo(prop_output)
-
-                if prop_exit == 0 and prop_status in (
-                    rp.STATUS_VERIFIED, rp.STATUS_UP_TO_DATE, rp.STATUS_ROLLED,
-                ):
-                    status = (
-                        rw.STATUS_UP_TO_DATE if prop_status == rp.STATUS_UP_TO_DATE
-                        else rw.STATUS_ROLLED
-                    )
-                    exit_code = 0
-                elif prop_exit == 0 and prop_status == rp.STATUS_DEFERRED:
-                    # A drained daemon host still deferred: some OTHER host
-                    # (or an unattributable signal) is busy. Not this
-                    # command's #2110-shaped deadlock — that would show up
-                    # as the drain never clearing — but still a night that
-                    # did not roll, and just as loud (trap 3).
-                    record.error = (
-                        f"{daemon_name} drained clean but `coord release "
-                        f"propagate` still deferred (status={prop_status}) — "
-                        "see propagate_output for why"
-                    )
-                    click.echo(f"error: {record.error}", err=True)
-                    _escalate_window(record, reason=record.error)
-                    status = rw.STATUS_PROPAGATE_DEFERRED
-                elif prop_status.startswith("exit ") or prop_status.startswith("error:"):
-                    # #2187 proposal 3: this arm is reached only when NEITHER
-                    # ground truth was available — no matching entry in
-                    # `coord release history` (see
-                    # `_latest_propagate_record_since`) AND no parseable
-                    # `--json` payload on stdout (`_parse_trailing_json`).
-                    # `prop_status` here is one of those two functions'
-                    # placeholder fallbacks, never a real outcome — so the
-                    # message must say exactly what evidence is missing
-                    # instead of quoting the placeholder as if it were one
-                    # (the old text, "status=exit 0, exit=0", read as a
-                    # verification failure when exit 0 is what a VERIFIED
-                    # roll also produces).
-                    record.error = (
-                        f"coord release propagate exited {prop_exit}, but its "
-                        "outcome could not be confirmed: no matching entry "
-                        "was found in `coord release history` for this run, "
-                        "and its --json stdout had no parseable status "
-                        "either — see propagate_output"
-                    )
-                    click.echo(f"error: {record.error}", err=True)
-                    _escalate_window(record, reason=record.error)
-                    status = rw.STATUS_PROPAGATE_FAILED
-                    exit_code = prop_exit or 1
-                else:
-                    # A real, ground-truth status from `coord release
-                    # history` — just not a verified roll (e.g. `failed` or
-                    # `rolled-back`).
-                    record.error = (
-                        f"coord release propagate did not verify a roll — "
-                        f"`coord release history` recorded status="
-                        f"{prop_status!r} (exit {prop_exit}) for this run"
-                    )
-                    click.echo(f"error: {record.error}", err=True)
-                    _escalate_window(record, reason=record.error)
-                    status = rw.STATUS_PROPAGATE_FAILED
-                    exit_code = prop_exit or 1
-    finally:
-        # Trap 4 / acceptance 4: ALWAYS restart the timer — whatever
-        # happened above, including an exception raised out of this block.
-        # This is the in-process half of the guarantee; --ensure-queue-running
-        # wired as ExecStopPost= (deploy/coord-release-window.service) is the
-        # SIGKILL-safe half, since a `finally` cannot run after SIGKILL.
-        # Leaving the fleet's work queue stopped is the worst outcome this
-        # mechanism exists to prevent, so this runs no matter what.
-        start_ok, start_detail = _systemctl(queue_timer, "start")
-        record.queue_restarted = start_ok
-        record.queue_restart_detail = start_detail
-        click.echo(f"{'✓' if start_ok else '✗'} restart {queue_timer}: {start_detail}")
-        if not start_ok:
-            _escalate_window(
-                record,
-                reason=(
-                    "queue timer restart FAILED after a nightly window run — "
-                    f"{queue_timer} may be stopped: {start_detail}. Run "
-                    f"`systemctl --user start {queue_timer}` by hand NOW."
-                ),
-            )
-
-    _finish(status, exit_code)
+    # ── 3. set (or refresh) the marker and return immediately (#2587) ─────
+    if existing is not None:
+        click.echo(
+            f"replacing stale roll-pending marker ({existing.describe()}) "
+            f"with v{record.target_version}"
+        )
+    write_roll_pending(
+        RollPending(
+            target_version=record.target_version,
+            set_at=time.time(),
+            reason="nightly-window",
+        )
+    )
+    click.echo(
+        f"roll pending: v{record.target_version} — the drive-queue tick will "
+        f"fire `coord release propagate` at the next inter-drive gap "
+        f"(#2587); {queue_timer} is never stopped"
+    )
+    _finish(rw.STATUS_ROLL_PENDING, 0)
 
 
 @release_group.command(

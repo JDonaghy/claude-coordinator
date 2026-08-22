@@ -55,7 +55,12 @@ def test_no_target_version_needs_no_roll():
 
 
 def test_ok_statuses_are_exactly_the_happy_and_correctly_inert_ones():
-    assert rw.OK_STATUSES == {rw.STATUS_UP_TO_DATE, rw.STATUS_ROLLED, rw.STATUS_DRY_RUN}
+    assert rw.OK_STATUSES == {
+        rw.STATUS_UP_TO_DATE, rw.STATUS_ROLLED, rw.STATUS_DRY_RUN,
+        # #2587: a set marker is a GOOD outcome — the drive-queue tick, not
+        # this command, fires the actual roll at the next inter-drive gap.
+        rw.STATUS_ROLL_PENDING,
+    }
 
 
 def test_loud_statuses_are_everything_else():

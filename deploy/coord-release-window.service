@@ -1,67 +1,100 @@
 # coord release nightly-window — guarantee the daemon host rolls instead of
-# waiting for a quiescent window that may never come (#2112).
+# waiting for a quiescent window that may never come (#2112, rewritten #2587).
 #
 # A systemd *user* unit (mirrors coord-drive-queue/coord-release-propagate),
-# paired with coord-release-window.timer. Each fire is one attempt:
+# paired with coord-release-window.timer AND started a second way — see
+# "TWO TRIGGERS" below. Each run of `coord release nightly-window`:
 #
-#   1. resolve the released version and the daemon host's own python-lane
-#      version; if the daemon host is already current, STOP — the queue is
-#      never touched (#2112 acceptance 3);
-#   2. otherwise, `systemctl --user stop coord-drive-queue.timer` — no new
-#      drives may launch for the rest of this run;
-#   3. wait (bounded — see TimeoutStartSec below and
-#      `coord release nightly-window --drain-deadline`) for whatever is
-#      already running to finish, reconciling with `coord drive-queue tick
-#      --reconcile-only` on every poll (#2110 — this is what stops the
-#      drain from deadlocking now that the timer that normally does that
-#      reconciliation is stopped);
-#   4. roll with `coord release propagate --daemon-host <derived>
-#      --target <resolved>` — no --force, ever (trap 1);
-#   5. `systemctl --user start coord-drive-queue.timer` — ALWAYS, whatever
-#      happened in 1-4, including a crash;
-#   6. report the outcome: stdout (this unit's journal), the
+#   1. resolves the released version and the daemon host's own python-lane
+#      version; if the daemon host is already current, STOP — nothing is
+#      touched (#2112 acceptance 3);
+#   2. reads the roll-pending marker (`coord.drive_queue.RollPending`, a
+#      plain JSON file under `~/.coord/`, never a `board_meta` DB row — see
+#      `coord.commands.drive_queue`'s module comment for why):
+#        a. no marker pending yet, or one pending for a DIFFERENT (stale)
+#           target -> (re)set it to the resolved target and RETURN
+#           IMMEDIATELY. No timer is stopped. No drain. No wait.
+#        b. a marker already pending for THIS target -> make one best-effort
+#           attempt to fire it now via `coord release propagate
+#           --daemon-host <derived> --target <resolved>` (no --force, ever —
+#           trap 1). Still busy -> leave the marker exactly as it was, exit
+#           0. Verified/rolled/up-to-date -> clear the marker, exit 0. A
+#           genuine failure -> loud (the same escalation channel #2101's
+#           drain-deadline used to use), marker left standing, exit non-zero.
+#   3. report the outcome: stdout (this unit's journal), the
 #      `~/.coord/release_window.jsonl` journal (`coord release
-#      window-history`), and — for anything short of a clean roll or a
-#      confirmed already-current fleet — the same escalation channel
-#      `coord drive escalations` and the TUI already surface #2101's
-#      drain-deadline escalation through.
+#      window-history`), and — for anything short of a happy path — the
+#      `coord drive escalations` / TUI escalation channel.
+#
+# TWO TRIGGERS, ONE UNIT, ONE COMMAND
+# ------------------------------------
+# 1. `coord-release-window.timer` fires this unit nightly — the "is a roll
+#    needed, and if so, is the marker already there" check above.
+# 2. `coord drive-queue tick` (`coord/commands/drive_queue.py`) fires this
+#    SAME unit — `systemctl --user start --no-block
+#    coord-release-window.service` — the INSTANT it observes the queue has
+#    emptied out (`TickPlan.occupied == 0`) while a marker is pending. This
+#    is the actual roll-at-the-next-inter-drive-gap mechanism #2587 exists
+#    for: the tick notices quiescence roughly every 3 minutes (the fleet's
+#    own natural cadence between one drive finishing and the next launching,
+#    which happens far more often than fleet-wide idle), and hands the roll
+#    off to a unit that outlives the tick's own process tree rather than
+#    performing it inline — the roll swaps the venv the tick itself runs
+#    from. `--no-block` is why this returns to the tick almost instantly:
+#    it requests the start and moves on, never waiting for this unit to
+#    finish.
+#
+# The SAME command handles both triggers without knowing which one fired it
+# — branch (2) above (marker present -> attempt a fire) is exactly what the
+# tick-triggered run needs, and is equally safe (a no-op-but-safe re-check)
+# if the nightly timer happens to fire while a marker from a PRIOR,
+# still-pending night survives.
+#
+# NEVER STOPS A TIMER (#2587's core rule)
+# -----------------------------------------
+# The pre-#2587 version of this unit stopped `coord-drive-queue.timer` for
+# the whole drain. Measured 2026-08-22: an attended manual roll ran for the
+# full 60-minute drain deadline, drained nothing, rolled nothing — with
+# `coord-drive-queue.timer` stopped (so NEW work) and, worse, WITH IT the
+# reconciliation that would have let the queue's true state ever be seen —
+# the entire time. The fleet-wide quiescent window a continuously-refilling
+# drive queue waits for essentially never arrives; #2587 replaces "wait for
+# it" with "notice the moment it does, from inside the loop that's already
+# running". `coord notify` also stops dispatching NEW legs (never existing
+# ones) while the marker is live, closing the other gap the 2026-08-22
+# incident found: a review for #2540 and a work dispatch for #2541 both
+# landed within the drain's first minute, because nothing had ever told
+# `coord notify` a drain was even in progress.
 #
 # WHY THIS EXISTS SEPARATELY FROM coord-release-propagate.timer
 # ----------------------------------------------------------------
 # `coord release propagate` already rolls every OTHER host at its own
 # per-host quiescent window (#2067), and cordons a behind host so it drains
-# on its own (#2101). Neither mechanism reaches the daemon host itself: the
-# daemon must lead every roll (the documented 405), so if IT is busy the
-# whole run defers — and dellserver is both the daemon host and the box
-# whose drive-queue tick launches work fleet-wide, so almost any queued
-# drive anywhere keeps it "busy". Cordoning the daemon host would not help:
-# cordoning stops new work from ROUTING there, but does not stop the
-# daemon's own tick from LAUNCHING new drive-queue entries in the first
-# place. The only way to guarantee the daemon host reaches quiescence is to
-# stop the thing that launches work onto it — which is exactly what this
-# unit's `--ensure-queue-running` ExecStopPost= below makes safe to do
-# unattended. See coord/release_window.py's module docstring for the full
-# mechanism and the 2026-08-10 measurement (eleven releases behind, with
-# elitebook idle and rollable the whole time).
-#
-# GATED ON #2110 — HARD PREREQUISITE. Steps 2-3 above are exactly the
-# sequence that deadlocked on 2026-08-10: the reconciler that clears a
-# finished drive's `running` row lives INSIDE `coord drive-queue tick`, so
-# stopping the timer used to stop reconciliation too, and the last drive's
-# row would stay `running` forever — the daemon host would read as busy
-# permanently and this unit would defer every night, unattended, silently,
-# forever. Do not install this unit on a build that predates #2110.
+# on its own (#2101) — and (#2587) now ALSO arms this same roll-pending
+# marker itself, the one time it hits the identical daemon-busy deadlock
+# this unit exists to route around. Neither mechanism reaches the daemon
+# host itself on its own: the daemon must lead every roll (the documented
+# 405), so if IT is busy the whole propagate run just defers — and
+# dellserver is both the daemon host and the box whose drive-queue tick
+# launches work fleet-wide, so almost any queued drive anywhere keeps it
+# "busy". This unit (via the marker + the tick's own inter-drive-gap watch)
+# is what actually gets the daemon host rolled without a human re-running
+# `coord release propagate` by hand until it happens to land in a gap. See
+# `coord/release_window.py`'s module docstring for the full mechanism and
+# history (the 2026-08-10 measurement that motivated #2112 in the first
+# place: eleven releases behind, with elitebook idle and rollable the whole
+# time).
 #
 # WHICH HOST
 # ----------
 # Install ONLY on the daemon host (dellserver in production — the same box
-# that runs coord-serve/coord-drive-queue/coord-release-propagate). This
-# unit stops and restarts coord-drive-queue.timer, which only exists on
-# that host; installing a second copy elsewhere has no queue to stop and
-# would just repeatedly fail `systemctl --user stop coord-drive-queue.timer`
-# — a locally-scoped, harmless-but-noisy failure, not the #1440
-# two-overseers hazard `coord-release-propagate.timer`'s header warns about,
-# but still pointless. Don't.
+# that runs coord-serve/coord-drive-queue/coord-release-propagate). The
+# roll-pending marker this unit reads/writes is a LOCAL file
+# (`coord.commands.drive_queue.roll_pending_path`), and the drive-queue tick
+# that is this unit's second trigger only runs there too; installing a
+# second copy elsewhere has nothing to watch and nothing useful to roll —
+# not the #1440 two-overseers hazard `coord-release-propagate.timer`'s
+# header warns about, but still pointless. Don't.
 #
 # COORD_BIN — same #1523 pinned-non-editable-install requirement as
 # coord-drive-queue.service/coord-release-propagate.service: the CLI this
@@ -79,10 +112,20 @@
 #
 # Read the journal it writes with `coord release window-history`, not just
 # `journalctl` — the JSONL record survives a half-installed venv, same
-# reason coord-release-propagate.service's does.
+# reason coord-release-propagate.service's does. `coord drive-queue status`
+# (and the TUI) show the roll-pending marker itself while it is live.
+#
+# LEGACY ESCAPE HATCH
+# --------------------
+# `coord release nightly-window --ensure-queue-running` still exists
+# (`systemctl --user start coord-drive-queue.timer` and nothing else) for an
+# operator who stopped the timer by hand on a pre-#2587 build or out of
+# habit — it is NOT wired into this unit any more (no more ExecStopPost=):
+# #2587 never stops the timer in the first place, so there is nothing here
+# for it to guarantee restarted.
 
 [Unit]
-Description=Nightly release window on the daemon host (#2112)
+Description=Release window: set/fire the #2587 roll-pending marker on the daemon host
 After=network-online.target coord-drive-queue.service
 Wants=network-online.target
 
@@ -90,30 +133,25 @@ Wants=network-online.target
 Type=oneshot
 # No --force, ever (trap 1) — coord/commands/release.py's
 # release_nightly_window never passes it to the `coord release propagate`
-# it shells out to. A drain that has not finished by the deadline is
-# reported and declined, not overridden.
+# it shells out to when firing an already-pending marker. A fleet that is
+# still busy is reported and left for the drive-queue tick to keep
+# watching, never overridden.
 ExecStart=%h/.local/bin/coord release nightly-window --config %h/.coord/coordinator.yml
-# #2112 trap 4 / acceptance 4: "the queue timer is running after the job in
-# EVERY path, including the failure ones — test by killing the job
-# mid-window." A `finally` block inside ExecStart cannot survive SIGKILL
-# (TimeoutStartSec below, or an operator's own `systemctl --user kill`).
-# ExecStopPost= is systemd's OWN guarantee of exactly that: it runs after
-# the main process exits for ANY reason — clean exit, non-zero exit, or
-# killed by a signal — so this is the backstop the in-process `finally`
-# cannot be. `--ensure-queue-running` does nothing but
-# `systemctl --user start coord-drive-queue.timer` and is idempotent: on
-# the overwhelmingly common path where ExecStart already restarted the
-# timer cleanly, this is a harmless no-op assertion, not a second action.
-ExecStopPost=%h/.local/bin/coord release nightly-window --ensure-queue-running --config %h/.coord/coordinator.yml
-# The drain alone may wait up to its own --drain-deadline (default 1h) on
-# top of the roll+verify sweep `coord release propagate` performs
-# (generous relative to its own 1800s TimeoutStartSec — see
-# coord-release-propagate.service). 2.5h total leaves this unit's own
-# worst case well inside the 22:00-08:00 quiet-hours window even starting
-# at 03:00, per coord-release-window.timer's header.
-TimeoutStartSec=9000
+# Bounded by the SAME ceiling coord-release-propagate.service uses: the
+# "marker already pending -> attempt a fire" branch shells out to `coord
+# release propagate` with its own 1800s subprocess timeout
+# (`coord.commands.release._run_propagate`), and this unit's own worst case
+# cannot exceed that plus a small margin — nothing here polls or drains any
+# more, so there is no separate multi-hour deadline to leave room for.
+TimeoutStartSec=1800
 
-# This is a Type=oneshot service activated BY THE TIMER — do not
-# `systemctl --user enable coord-release-window.service` directly (it has
-# no [Install] section; the timer unit is what you enable — same pattern
-# as coord-release-propagate.service/coord-drive-queue.service).
+# This is a Type=oneshot service, started BOTH by its own timer AND by
+# `coord drive-queue tick` (`systemctl --user start --no-block
+# coord-release-window.service`) — do not `systemctl --user enable
+# coord-release-window.service` directly (it has no [Install] section; the
+# timer unit is what you enable — same pattern as
+# coord-release-propagate.service/coord-drive-queue.service). A `start`
+# while a previous run is still active is systemd's own no-op-if-already-
+# running default (`Type=oneshot`, no `RemainAfterExit=`), so a tick firing
+# seconds after the nightly timer (or after itself, on a later gap while a
+# fire attempt is already mid-flight) cannot stack two concurrent rolls.

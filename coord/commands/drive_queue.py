@@ -52,6 +52,8 @@ from coord.drive_queue import (
     QUEUE_ALERT_REPO,
     QUEUE_ALERT_STAGE,
     RESUME_PROBE_TIMEOUT_SECONDS,
+    ROLL_PENDING_DEFAULT_MAX_DEFERRALS,
+    ROLL_PENDING_DEFAULT_TTL_SECONDS,
     STATE_BLOCKED,
     STATE_DONE,
     STATE_FAILED,
@@ -63,6 +65,7 @@ from coord.drive_queue import (
     ProbeResult,
     QueueEntry,
     QueueError,
+    RollPending,
     TickPlan,
     build_board_view,
     diagnose_blocked_after,
@@ -1034,6 +1037,11 @@ def drive_queue_status(output_json: bool, config_path: Path) -> None:
     counts = _counts(rows)
     alert = _queue_alert()
     held = fired_holds(entries_from_rows(rows))
+    # #2587: read directly from the marker file, not from the last tick's
+    # `TickPlan` — `status` may run between ticks (or on a machine that never
+    # ticks at all), and the marker's own `deferrals`/TTL are exactly what an
+    # operator needs to see this is a DELIBERATE hold, not a stalled queue.
+    roll_pending = read_roll_pending()
 
     if output_json:
         click.echo(
@@ -1057,6 +1065,9 @@ def drive_queue_status(output_json: bool, config_path: Path) -> None:
                         }
                         for e in held
                     ],
+                    "roll_pending": (
+                        roll_pending.to_dict() if roll_pending is not None else None
+                    ),
                 }
             )
         )
@@ -1078,6 +1089,19 @@ def drive_queue_status(output_json: bool, config_path: Path) -> None:
         for line in _hold_lines(entry):
             click.echo(line)
         click.echo("      release with: coord drive-queue resume")
+    if roll_pending is not None:
+        # #2587: deliberately its OWN line, not folded into `alert:` below —
+        # this is a benign, self-clearing, EXPECTED state ("the fleet is
+        # about to upgrade itself"), not an anomaly needing operator action,
+        # and #2587 is explicit that a held-for-a-roll queue must never read
+        # as broken.
+        age = max(0.0, time.time() - roll_pending.set_at)
+        click.echo(
+            f"{roll_pending.describe()} — set {age:.0f}s ago, "
+            f"{roll_pending.deferrals}/{roll_pending.max_deferrals} deferrals, "
+            f"launches nothing until the queue empties out or "
+            f"{max(0.0, roll_pending.ttl_seconds - age):.0f}s pass"
+        )
     if alert is not None:
         click.echo(f"alert: {alert.get('reason') or ''}")
         for detail in (alert.get("gate_readings") or "").split(" | "):
@@ -1870,6 +1894,205 @@ def _fetch_editable_drift() -> tuple[str, str] | None:
         return None
     repo_root, shown = drift
     return (str(repo_root), shown)
+
+
+# ── #2587: roll-pending marker store ──────────────────────────────────────────
+#
+# A plain JSON file, not a `board_meta` DB row: every reader/writer —
+# `coord release propagate` / `coord release nightly-window`
+# (`coord/commands/release.py`), this module's own `tick`, and `coord notify`
+# (`coord/notify.py`) — runs ONLY on the daemon host in production
+# (`deploy/coord-release-window.service`'s and `deploy/coord-notify.service`'s
+# own headers both say so: `coord-drive-queue.timer`/`coord.db` exist there and
+# nowhere else). There is therefore exactly one process family ever touching
+# this file, on exactly one machine, and no daemon-routing/thin-client seam
+# (`coord.board_service`) to plug into — the same reasoning
+# `coord.machine_pause`'s local pause/cordon store predates its own daemon-aware
+# half. Kept a standalone file (mirroring `coord.machine_pause`'s
+# `paused_machines.json`) rather than a new `board_meta` key: unlike a cordon or
+# a milestone drain, at most one roll is ever pending at a time, so there is no
+# list to keep, and it lets `coord release propagate`/`nightly-window` set this
+# marker without importing `coord.state`'s DB machinery at all.
+_ROLL_PENDING_FILENAME = "roll_pending.json"
+
+
+def roll_pending_path() -> Path:
+    """Absolute path to the roll-pending marker file.
+
+    ``$COORD_ROLL_PENDING_STATE`` overrides it — the same seam
+    ``coord.notifier.store.state_path`` uses, so a test redirects this store
+    with one env var rather than monkeypatching a private function
+    (``_no_real_pause_store``'s (#2101) heavier-weight approach, from before
+    this seam existed). Never let a test write the OPERATOR'S real
+    ``~/.coord/roll_pending.json`` — a state file a test *can* write is a
+    state file a test *will* write, and this one gates whether the daemon
+    host's drive queue launches anything at all.
+    """
+    import os  # noqa: PLC0415
+
+    from coord.platform_paths import default_coord_dir  # noqa: PLC0415
+
+    override = os.environ.get("COORD_ROLL_PENDING_STATE")
+    if override:
+        return Path(override).expanduser()
+    return default_coord_dir() / _ROLL_PENDING_FILENAME
+
+
+def read_roll_pending() -> RollPending | None:
+    """The current marker, or ``None`` when no roll is pending.
+
+    Fail-soft on a missing/corrupt/hand-edited file — same posture
+    :func:`_fetch_cordons` takes on an unreadable cordon store, and for the
+    same reason: a marker this read cannot make sense of must read as "no
+    roll pending" (resume launching), never as a reason to stop the tick.
+    """
+    path = roll_pending_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        click.echo(
+            f"warning: could not read {path} ({exc}) — treating no roll as pending",
+            err=True,
+        )
+        return None
+    if not raw.strip():
+        return None
+    try:
+        data = _json.loads(raw)
+    except ValueError:
+        click.echo(f"warning: {path} is not valid JSON — ignoring it", err=True)
+        return None
+    if not isinstance(data, dict) or not data:
+        return None
+    try:
+        return RollPending.from_dict(data)
+    except ValueError as exc:
+        click.echo(f"warning: {path} is not a usable roll-pending record ({exc})", err=True)
+        return None
+
+
+def write_roll_pending(pending: RollPending) -> None:
+    """Persist *pending*, overwriting whatever was there before.
+
+    Used both for the INITIAL set (`coord release propagate`/
+    `nightly-window`) and for this module's own re-write after bumping
+    ``deferrals`` each tick it does not fire the roll.
+    """
+    path = roll_pending_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_json.dumps(pending.to_dict(), sort_keys=True), encoding="utf-8")
+
+
+def clear_roll_pending() -> None:
+    """Drop the marker. A no-op (not an error) when nothing was pending."""
+    path = roll_pending_path()
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _fire_pending_roll(*, dry_run: bool = False) -> tuple[bool, str]:
+    """Best-effort ``systemctl --user start --no-block
+    coord-release-window.service`` (#2587 design point 3).
+
+    ``--no-block`` (a.k.a. ``--job-mode=fail`` without ``--wait``, the
+    systemctl default) is the whole point: this must return almost instantly
+    and hand the actual roll off to a unit that outlives THIS tick's process
+    tree, never a synchronous, in-process ``coord release propagate`` call —
+    the roll swaps the venv the tick is executing from, so it must not be a
+    child of the tick's own cgroup or share its lifetime. See
+    ``deploy/coord-release-window.service`` for what that unit actually does.
+
+    Returns ``(fired, detail)``, never raises — a `systemctl` this host
+    cannot run (no systemd, PATH issue, unit not installed) must be a
+    deferral the marker survives to retry next tick, not a crashed tick.
+    """
+    if dry_run:
+        return True, "--dry-run: would run `systemctl --user start --no-block coord-release-window.service`"
+    try:
+        proc = subprocess.run(  # noqa: S603, S607 — fixed argv, no shell
+            ["systemctl", "--user", "start", "--no-block", "coord-release-window.service"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    if proc.returncode == 0:
+        return True, "started coord-release-window.service"
+    detail = (proc.stderr or proc.stdout or "").strip() or f"exit {proc.returncode}"
+    return False, detail
+
+
+def _bump_roll_pending_deferral(pending: RollPending) -> RollPending:
+    """*pending* with ``deferrals`` incremented by one — every OTHER field
+    (including ``set_at``, deliberately never refreshed) unchanged.
+
+    Called once per tick this marker survives without firing — the tick-count
+    half of #2587's bound (see `ROLL_PENDING_DEFAULT_MAX_DEFERRALS`'s
+    comment). `set_at` stays frozen at the ORIGINAL set time so the TTL half
+    of the bound measures real wall-clock age, not "time since last bumped" —
+    a marker re-armed every tick would otherwise never age out on the clock
+    at all, defeating the whole point of having two independent bounds.
+    """
+    import dataclasses as _dataclasses  # noqa: PLC0415
+
+    return _dataclasses.replace(pending, deferrals=pending.deferrals + 1)
+
+
+#: #2587's own escalation key — deliberately NOT `QUEUE_ALERT_REPO`/
+#: `QUEUE_ALERT_ISSUE`: that single slot is overwritten (or cleared via
+#: `_clear_queue_alert()`) by THIS SAME tick's `plan.alert` handling further
+#: down, which would erase an expiry record the instant it was written (the
+#: marker is already cleared by the time that code runs, so `plan.alert` is
+#: back to whatever the rest of the tick decided). Mirrors
+#: `coord.commands.release`'s `WINDOW_ALERT_REPO`/`WINDOW_ALERT_ISSUE`/
+#: `WINDOW_ALERT_STAGE` — same shape, same reasoning, one escalation slot per
+#: independent "this must be loud" condition.
+ROLL_PENDING_ALERT_REPO = "(roll-pending)"
+ROLL_PENDING_ALERT_ISSUE = 0
+ROLL_PENDING_ALERT_STAGE = "roll-pending"
+
+
+def _escalate_roll_pending_expired(pending: RollPending, *, now: float) -> None:
+    """Surface an expired roll-pending marker loudly (#2587's own "never
+    silently held" requirement — mirrors `coord.commands.release.
+    _escalate_window`'s "a skipped/failed night must be loud" reasoning, one
+    level up: here it is a roll that never got its window, not a night that
+    never rolled).
+    """
+    from coord.state import record_drive_escalation  # noqa: PLC0415
+
+    age_seconds = max(0.0, now - pending.set_at)
+    reason = (
+        f"roll-pending for v{pending.target_version} expired without reaching "
+        f"a quiescent window ({age_seconds:.0f}s elapsed / {pending.deferrals} "
+        "tick(s) deferred) — resuming normal launching (#2587: a pending "
+        "roll must never hold the queue down indefinitely)"
+    )
+    click.echo(f"warning: {reason}", err=True)
+    try:
+        record_drive_escalation(
+            ROLL_PENDING_ALERT_REPO,
+            ROLL_PENDING_ALERT_ISSUE,
+            stage=ROLL_PENDING_ALERT_STAGE,
+            reason=reason,
+            gate_readings=(
+                f"target_version={pending.target_version} | reason={pending.reason} | "
+                f"ttl_seconds={pending.ttl_seconds} | "
+                f"deferrals={pending.deferrals}/{pending.max_deferrals}"
+            ),
+            proposed_command=(
+                f"coord release propagate --target {pending.target_version}"
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — the stderr line above is the
+        # floor; an escalation table that cannot be written must not take
+        # the message down with it.
+        click.echo(f"  (could not record the roll-pending escalation: {exc})", err=True)
 
 
 def _fetch_board_view() -> BoardView:
@@ -2842,6 +3065,17 @@ def drive_queue_tick(
     safe to run with the periodic timer stopped — see
     `docs/AGENT_OPERATIONS.md`'s propagation section for why that combination
     used to deadlock.
+
+    #2587: when a fleet roll is pending (`coord release propagate`/
+    `nightly-window` set the marker instead of draining — see
+    `coord.drive_queue.RollPending`), this tick behaves exactly as if
+    `--reconcile-only` had been passed, whatever `--max-parallel` says —
+    reconciliation still runs, launching nothing — and, once THIS tick's own
+    reconciliation empties the queue out (zero entries still occupying a
+    slot), fires the roll itself (`systemctl --user start --no-block
+    coord-release-window.service`) and clears the marker. Never stops
+    `coord-drive-queue.timer` to get there — see the marker's own docstring
+    for why that would reproduce #2569.
     """
     from coord.filelock import FileLock, LockBusy, drive_queue_lock_path  # noqa: PLC0415
     from coord.state import list_drive_queue, update_drive_queue_entry  # noqa: PLC0415
@@ -2860,7 +3094,6 @@ def drive_queue_tick(
     # one flag is a mnemonic for the other rather than a second code path, so
     # there is exactly one way this behaves, not two that could drift apart.
     reconcile_only = reconcile_only or max_parallel == 0
-    effective_capacity = 0 if reconcile_only else max_parallel
 
     lock = FileLock(drive_queue_lock_path())
     try:
@@ -2886,6 +3119,26 @@ def drive_queue_tick(
             ) from None
 
         entries = entries_from_rows(list_drive_queue())
+
+        # #2587: is a fleet roll queued for the next inter-drive gap? Read
+        # BEFORE `effective_capacity` is resolved — a live, unexpired marker
+        # forces this tick into the exact same posture `--reconcile-only`
+        # already gives #2110 (see `RollPending`'s docstring for why this
+        # reuses that path rather than inventing a new one): reconcile, skip
+        # the merge-only/CI-revalidate side effects below, launch nothing.
+        # An EXPIRED marker (TTL or deferral ceiling — `RollPending.expired`)
+        # is dropped right here, loudly (`_escalate_roll_pending_expired`),
+        # and this tick proceeds exactly as if no marker had ever been set —
+        # the #2587 "never hold the queue down indefinitely" requirement.
+        now = time.time()
+        roll_pending = read_roll_pending()
+        if roll_pending is not None and roll_pending.expired(now):
+            _escalate_roll_pending_expired(roll_pending, now=now)
+            clear_roll_pending()
+            roll_pending = None
+        if roll_pending is not None:
+            reconcile_only = True
+        effective_capacity = 0 if reconcile_only else max_parallel
 
         # #1757: run each held gate's `--resume-when` BEFORE deciding
         # anything, and hand the results to `plan_tick` as data so the
@@ -2983,7 +3236,7 @@ def drive_queue_tick(
             effective_capacity,
             max_parallel_per_repo=max_parallel_per_repo,
             probes=probes,
-            now=time.time(),
+            now=now,
             local_host=_local_host_id(),
             exit_reasons=exit_reasons,
             exit_refused=exit_refused,
@@ -2995,9 +3248,19 @@ def drive_queue_tick(
             live_blocked_gate=live_blocked_gate,
             editable_drift=editable_drift,
             merge_only_ready=merge_only_ready,
+            roll_pending_reason=roll_pending.describe() if roll_pending is not None else "",
         )
 
-        if reconcile_only:
+        if roll_pending is not None:
+            # #2587: name the marker, not just the generic reconcile-only
+            # notice below — an operator reading the journal should see WHY
+            # without cross-referencing `coord drive-queue status`.
+            click.echo(
+                f"({roll_pending.describe()}: updating queue state, launching "
+                f"nothing until the queue empties out — {plan.occupied} "
+                "entries still occupying a slot)"
+            )
+        elif reconcile_only:
             # #2110: capacity 0 already makes `plan_tick` return before its
             # capacity walk (no deferrals, no queue-level alert, no launch —
             # see its docstring's step 3), so `plan.launch` is guaranteed
@@ -3012,6 +3275,45 @@ def drive_queue_tick(
             return
 
         _apply_writes(plan)
+
+        # #2587: this tick's own reconciliation (just applied above) may have
+        # been the very thing that emptied the queue out — `plan.occupied` is
+        # the POST-reconcile reading (see `RollPending`'s docstring), so this
+        # is the earliest point at which "the inter-drive gap arrived" can be
+        # known. Fires the roll the INSTANT that is true, rather than polling
+        # a separate bounded drain — the whole point of #2587. Skipped
+        # entirely once `dry_run` has already returned above, matching
+        # `--dry-run`'s "mutate nothing" contract for every other write in
+        # this function.
+        if roll_pending is not None:
+            if plan.occupied == 0:
+                fired, detail = _fire_pending_roll()
+                if fired:
+                    clear_roll_pending()
+                    click.echo(f"roll fired for {roll_pending.describe()}: {detail}")
+                else:
+                    # Could not even hand off to systemd — stays pending, one
+                    # deferral spent, retried next tick. Loud (stderr): a
+                    # roll that is quiescent-ready but cannot be started is
+                    # not the benign "still busy" case below.
+                    bumped = _bump_roll_pending_deferral(roll_pending)
+                    write_roll_pending(bumped)
+                    click.echo(
+                        f"roll pending for v{roll_pending.target_version}: queue is "
+                        f"quiescent but could not start coord-release-window.service "
+                        f"({detail}) — will retry next tick "
+                        f"({bumped.deferrals}/{bumped.max_deferrals} deferrals)",
+                        err=True,
+                    )
+            else:
+                # Still busy — the normal, expected steady state while
+                # waiting for a gap. Quiet on purpose: this is every tick's
+                # cadence (every ~3 minutes in production) until the gap
+                # arrives, same "benign, not a stall" reasoning
+                # `Deferral.benign` already applies to a cordon/repo-limit/
+                # backoff deferral elsewhere in this module.
+                bumped = _bump_roll_pending_deferral(roll_pending)
+                write_roll_pending(bumped)
 
         # #2350: attempt the direct merges `plan_tick` marked `merge_only`,
         # right after the rest of the plan's writes have landed. Skipped
