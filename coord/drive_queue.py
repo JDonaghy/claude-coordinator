@@ -1443,6 +1443,20 @@ class RollPending:
     Persisted as JSON by the shell (`coord.commands.drive_queue.
     write_roll_pending`) — never read or written from this module, which
     stays pure; see the module docstring.
+
+    #2587 review: the tick that FIRES the roll (``systemctl --user start
+    --no-block coord-release-window.service``) never clears this marker
+    itself — a ``--no-block`` accept is proof the start request was queued,
+    not that anything rolled. Only the spawned process
+    (`coord.commands.release.release_nightly_window`, that unit's
+    ``ExecStart=``) clears it, and only once it has actually confirmed the
+    roll via `coord release propagate`. Clearing it from the tick's own
+    process, in the same statement that fired the unit, raced the freshly
+    spawned process out from under it on every real invocation: that process
+    re-resolves its target from scratch (a PyPI lookup plus a fleet health
+    gather) before it ever reads this marker, by which point the tick had
+    already deleted it — so the spawned process always found nothing
+    pending and just re-armed a fresh marker instead of ever propagating.
     """
 
     #: The version this roll is for — carried through to the alert/status
