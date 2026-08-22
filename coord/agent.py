@@ -5762,7 +5762,8 @@ class AgentServer:
 
     @staticmethod
     def _tmux_session_alive(assignment_id: str) -> bool:
-        """Return True when a ``coord-<assignment_id>`` tmux session is up.
+        """Return True when a ``coord-<assignment_id>`` tmux session is
+        genuinely still in use — alive AND its pane is not dead.
 
         Load-bearing guard for :meth:`clean_worktrees` (#1295): an
         interactive Test/Review/Merge/Work pane keeps its tmux session
@@ -5772,11 +5773,16 @@ class AgentServer:
         is the only reliable "someone is still using this worktree"
         signal.
 
-        Uses ``tmux has-session -t coord-<assignment_id>``; exit 0 means
-        the session exists.  Delegates to
-        :func:`coord.interactive.tmux_session_alive` so a single
-        implementation handles the subprocess and error-swallowing
-        semantics.  When ``tmux`` is not installed / not running / the
+        Delegates to :func:`coord.interactive.tmux_session_running` (a bare
+        ``tmux has-session`` alone is NOT enough — #2541 set
+        ``remain-on-exit on`` on every freshly-created coord tmux session so
+        a crashed pane's screen stays inspectable, which means
+        ``has-session`` now stays ``True`` after ANY pane exit, clean
+        success or crash, until a reaper notices and kills it. Without the
+        pane-dead check this guard would keep protecting — and thus never
+        cleaning up — a worktree whose interactive session has already
+        finished, for as long as the now-longer-lived dead session
+        lingers). When ``tmux`` is not installed / not running / the
         subprocess errors, we return ``False`` — "no live session, keep
         sweeping" — rather than raising, so one broken tmux install
         never aborts a fleet sweep across the rest of an agent's
@@ -5788,15 +5794,15 @@ class AgentServer:
         try:
             from coord.interactive import (  # noqa: PLC0415
                 tmux_available,
-                tmux_session_alive,
                 tmux_session_name,
+                tmux_session_running,
             )
         except Exception:  # noqa: BLE001 — defensive; module missing → no guard
             return False
         try:
             if not tmux_available():
                 return False
-            return tmux_session_alive(tmux_session_name(assignment_id))
+            return tmux_session_running(tmux_session_name(assignment_id))
         except Exception:  # noqa: BLE001 — never propagate out of the sweep
             return False
 

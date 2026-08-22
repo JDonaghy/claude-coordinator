@@ -1951,7 +1951,7 @@ def _diagnose_orphan_worktrees(config_path: Path, *, dry_run: bool) -> None:
     from coord.interactive import (  # noqa: PLC0415
         tmux_available,
         tmux_session_name,
-        tmux_session_alive,
+        tmux_session_running,
     )
     from coord.agent import check_worktree_writable, find_blocking_deny_rule  # noqa: PLC0415
     from coord.board_service import read_board  # noqa: PLC0415
@@ -2002,6 +2002,11 @@ def _diagnose_orphan_worktrees(config_path: Path, *, dry_run: bool) -> None:
         return
 
     # Collect all assignment_ids with live tmux sessions.
+    # #2541: tmux_session_running (alive AND pane not dead) — remain-on-exit
+    # keeps a session's has-session bit True after ANY pane exit (clean
+    # success or crash) until a reaper notices, so the bare alive check
+    # would count a finished session's worktree as still in use and skip it
+    # in this sweep.
     tmux_ok = tmux_available()
     live_tmux: set[str] = set()
     if tmux_ok:
@@ -2009,7 +2014,7 @@ def _diagnose_orphan_worktrees(config_path: Path, *, dry_run: bool) -> None:
             if not entry.is_dir():
                 continue
             aid = entry.name
-            if tmux_session_alive(tmux_session_name(aid)):
+            if tmux_session_running(tmux_session_name(aid)):
                 live_tmux.add(aid)
 
     # All running/pending assignment_ids from the board (includes live tmux ones

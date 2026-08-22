@@ -92,6 +92,39 @@ def test_session_state_live_tmux_never_asks_the_agent(monkeypatch, config) -> No
     assert probed == []  # tmux already said live — no need to probe the agent
 
 
+def test_session_state_dead_pane_falls_through_to_agent_check(
+    monkeypatch, config
+) -> None:
+    """#2541: ``remain-on-exit on`` keeps ``tmux has-session`` True after a
+    pane exits (clean success OR crash) until a reaper notices it — so a
+    bare ``tmux_session_alive`` check alone would misreport a crashed
+    ``--merge-of`` interactive session as "live" and never fall through to
+    the agent cross-check below, undermining the diagnosability
+    ``coord diagnose`` exists to provide. With the pane-dead check, a
+    session that exists but whose pane already died must be treated the
+    same as "tmux says dead" — falling through to ``_agent_liveness``.
+    """
+    from coord.network import StatusResult
+
+    monkeypatch.setattr("coord.interactive.tmux_session_alive", lambda *a, **k: True)
+    monkeypatch.setattr("coord.interactive.tmux_pane_dead", lambda *a, **k: True)
+    probed = []
+
+    def _fake_fetch_status(*a, **k):
+        probed.append(1)
+        return StatusResult(data={"active": [{"id": "w1"}], "completed": []})
+
+    monkeypatch.setattr("coord.network.fetch_status", _fake_fetch_status)
+    a = _assign(aid="w1", typ="review", status="running")
+    # The agent confirms "w1" is in its active list, so the overall result
+    # is "live" — but the point of this test is that reaching that verdict
+    # required falling through to the agent check at all (see `probed`
+    # below), rather than the dead-pane session short-circuiting straight
+    # to "live" off the bare tmux_session_alive() == True.
+    assert diagnose._session_state(a, config) == "live"
+    assert probed, "dead-pane session must fall through to the agent check"
+
+
 def test_session_state_headless_worker_reported_active_by_agent_is_live(
     monkeypatch, config
 ) -> None:
@@ -1927,6 +1960,61 @@ def test_diagnose_orphan_worktrees_flag_dry_run(monkeypatch, tmp_path) -> None:
     # Dry-run must mention the orphan but not remove it.
     assert "dry-run" in result.output
     assert orphan.exists(), "dry-run must not remove the orphan worktree"
+
+
+def test_diagnose_orphan_worktrees_sweeps_dead_pane_session(monkeypatch, tmp_path) -> None:
+    """#2541: a worktree whose ``coord-<aid>`` tmux session still exists
+    (``has-session`` True — the pane lingers under ``remain-on-exit``) but
+    whose pane has already died must NOT be protected as "live" by this
+    sweep — the bare ``tmux_session_alive`` check the sweep used to make
+    would count it as in-use and skip it forever, since a dead-pane session
+    only gets cleaned up by the (much slower) stale-session reaper.
+    """
+    import subprocess
+
+    from click.testing import CliRunner
+
+    from coord.cli import main
+
+    cfg_file = tmp_path / "coordinator.yml"
+    cfg_file.write_text(CONFIG_YAML_FOR_DIAGNOSE)
+
+    worktrees_dir = tmp_path / "coord_home" / "worktrees"
+    orphan = worktrees_dir / "dead-pane-aid" / "r"
+    orphan.mkdir(parents=True)
+
+    monkeypatch.setattr("coord.state.COORD_DIR", tmp_path / "coord_home")
+    monkeypatch.setattr("coord.state.build_board", lambda: Board())
+
+    # tmux IS available and has-session succeeds for this session (the
+    # remain-on-exit-lingering dead pane), but the pane itself is dead.
+    monkeypatch.setattr("coord.interactive.tmux_available", lambda: True)
+    monkeypatch.setattr("coord.interactive.tmux_session_alive", lambda *a, **k: True)
+    monkeypatch.setattr("coord.interactive.tmux_pane_dead", lambda *a, **k: True)
+
+    repo_path = Path("/tmp/api")
+    porcelain = _make_porcelain_output([{"path": str(orphan), "branch": "issue-1-foo"}])
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: type(
+        "R", (), {"returncode": 0, "stdout": porcelain}
+    )())
+
+    api_path = tmp_path / "api"
+    api_path.mkdir()
+
+    def _patched_repo_path(self, repo_name):  # type: ignore[no-untyped-def]
+        return str(api_path) if repo_name == "api" else None
+
+    monkeypatch.setattr("coord.config.Machine.repo_path", _patched_repo_path)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["diagnose", "--config", str(cfg_file), "--orphan-worktrees", "--dry-run"],
+    )
+    assert result.exit_code == 0, result.output
+    # The dead-pane worktree must be reported as an orphan candidate, not
+    # silently protected as "live" the way a bare has-session check would.
+    assert "dead-pane-aid" in result.output
 
 
 def test_diagnose_missing_repo_and_issue_errors(monkeypatch, tmp_path) -> None:

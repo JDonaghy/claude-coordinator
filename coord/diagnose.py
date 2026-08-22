@@ -254,8 +254,8 @@ def _session_state(assignment: "Assignment", config: "Config") -> str:
 
     from coord.interactive import (  # noqa: PLC0415
         TmuxHost,
-        tmux_session_alive,
         tmux_session_name,
+        tmux_session_running,
     )
 
     if not assignment.assignment_id:
@@ -276,7 +276,14 @@ def _session_state(assignment: "Assignment", config: "Config") -> str:
     host = TmuxHost(ssh_target=ssh_target)
     sname = tmux_session_name(assignment.assignment_id)
     try:
-        if tmux_session_alive(sname, host=host):
+        # #2541: tmux_session_running (alive AND pane not dead), not the
+        # bare has-session check this used to make — remain-on-exit keeps
+        # has-session True after ANY pane exit (clean success or crash)
+        # until a reaper notices, so a bare check here would report a
+        # crashed/finished --merge-of session as "live" and never fall
+        # through to the agent cross-check below, undermining exactly the
+        # diagnosability this probe exists for (#1658).
+        if tmux_session_running(sname, host=host):
             return "live"
     except Exception:  # noqa: BLE001 — never let a probe error finalize a session
         return "unknown"

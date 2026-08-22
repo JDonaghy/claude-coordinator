@@ -141,8 +141,8 @@ def _dispatch_review_of(
         finalize_interactive_exit,
         launch_human_attended_interactive,
         tmux_available as _tmux_avail,
-        tmux_session_alive as _tmux_alive,
         tmux_session_name as _tmux_name,
+        tmux_session_running as _tmux_alive,
     )
 
     from coord.review import (  # noqa: PLC0415
@@ -648,8 +648,8 @@ def _dispatch_smoke_of(
         launch_human_attended_interactive,
         snapshot_live_checkout_for_smoke,
         tmux_available as _tmux_avail,
-        tmux_session_alive as _tmux_alive,
         tmux_session_name as _tmux_name,
+        tmux_session_running as _tmux_alive,
     )
 
     from coord.models import Assignment as _AssignmentSm  # noqa: PLC0415
@@ -1142,8 +1142,8 @@ def _dispatch_audit_of(
         finalize_interactive_exit,
         launch_human_attended_interactive,
         tmux_available as _tmux_avail,
-        tmux_session_alive as _tmux_alive,
         tmux_session_name as _tmux_name,
+        tmux_session_running as _tmux_alive,
     )
     from coord.models import Assignment as _AssignmentAu  # noqa: PLC0415
     from coord.state import record_dispatched_assignment as _record_au  # noqa: PLC0415
@@ -1486,8 +1486,8 @@ def _dispatch_milestone_chat_of(
         finalize_interactive_exit,
         launch_human_attended_interactive,
         tmux_available as _tmux_avail,
-        tmux_session_alive as _tmux_alive,
         tmux_session_name as _tmux_name,
+        tmux_session_running as _tmux_alive,
     )
     from coord.milestone_chat import resolve_milestone_chat_briefing  # noqa: PLC0415
     from coord.board_service import read_board as _read_board_mc  # noqa: PLC0415
@@ -1682,8 +1682,8 @@ def _run_troubleshoot_or_chat(
         finalize_interactive_exit,
         launch_human_attended_interactive,
         tmux_available as _tmux_avail,
-        tmux_session_alive as _tmux_alive,
         tmux_session_name as _tmux_name,
+        tmux_session_running as _tmux_alive,
     )
 
     from coord.board_service import read_board as _read_board_ts  # noqa: PLC0415
@@ -2044,8 +2044,8 @@ def _dispatch_fix_of(
         launch_human_attended_interactive,
         remote_worktree_exists as _remote_wt_exists,
         tmux_available as _tmux_avail,
-        tmux_session_alive as _tmux_alive,
         tmux_session_name as _tmux_name,
+        tmux_session_running as _tmux_alive,
     )
 
     from coord.auto_loop import (  # noqa: PLC0415
@@ -2731,8 +2731,8 @@ def _dispatch_rework_of(
         launch_human_attended_interactive,
         remote_worktree_exists as _remote_wt_exists,
         tmux_available as _tmux_avail,
-        tmux_session_alive as _tmux_alive,
         tmux_session_name as _tmux_name,
+        tmux_session_running as _tmux_alive,
     )
 
     from coord.agent import (  # noqa: PLC0415
@@ -3294,8 +3294,8 @@ def _dispatch_merge_of(
         launch_human_attended_interactive,
         remote_worktree_exists as _remote_wt_exists,
         tmux_available as _tmux_avail,
-        tmux_session_alive as _tmux_alive,
         tmux_session_name as _tmux_name,
+        tmux_session_running as _tmux_alive,
     )
 
     from coord.agent import (  # noqa: PLC0415
@@ -3932,8 +3932,8 @@ def _dispatch_interactive_work(
         launch_human_attended_interactive,
         remote_worktree_exists as _remote_wt_exists,
         tmux_available as _tmux_avail,
-        tmux_session_alive as _tmux_alive,
         tmux_session_name as _tmux_name,
+        tmux_session_running as _tmux_alive,
     )
 
     if _is_local:

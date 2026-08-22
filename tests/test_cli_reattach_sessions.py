@@ -696,6 +696,56 @@ class TestReattachCmd:
         assert kwargs["repo_name"] == "myrepo"
         assert result.exit_code == 0
 
+    def test_dead_pane_after_attach_calls_finalize(
+        self, config_file: Path, coord_db: Any
+    ) -> None:
+        """#2541: ``remain-on-exit on`` keeps ``has-session`` True after the
+        pane dies (clean completion OR crash), until a reaper notices. A
+        bare ``tmux_session_alive`` check after attach returns would
+        misreport this as "still running" (see
+        ``test_session_alive_after_detach_does_not_call_finalize`` above for
+        the genuinely-alive case) and finalize would never run. With the
+        pane-dead check (:func:`coord.interactive.tmux_session_running`),
+        a session that still exists but whose pane already died must be
+        finalized just like a session that fully disappeared.
+        """
+        _insert_assignment(
+            coord_db,
+            "aid-dead-pane",
+            issue_number=88,
+            repo_name="myrepo",
+            repo_github="acme/myrepo",
+            machine_name="mymachine",
+        )
+
+        attach_result = MagicMock()
+        attach_result.returncode = 0
+
+        # has-session reports True both before AND after attach (the
+        # lingering dead pane) — only tmux_pane_dead distinguishes it.
+        alive_seq = iter([True, True])
+
+        fake_result = MagicMock()
+        fake_result.already_recorded = False
+        fake_result.terminal_status = "done"
+        fake_result.commits_ahead = 2
+        fake_result.push_ok = True
+
+        with patch("coord.interactive.tmux_available", return_value=True), \
+             patch("coord.interactive.tmux_session_alive", side_effect=lambda _n, host=None: next(alive_seq, True)), \
+             patch("coord.interactive.tmux_pane_dead", return_value=True), \
+             patch("subprocess.run", return_value=attach_result), \
+             patch("coord.interactive.finalize_interactive_exit", return_value=fake_result) as mock_fin:
+            result = CliRunner().invoke(
+                main, ["reattach", "aid-dead-pane", "--config", str(config_file)]
+            )
+
+        mock_fin.assert_called_once()
+        kwargs = mock_fin.call_args[1]
+        assert kwargs["assignment_id"] == "aid-dead-pane"
+        assert result.exit_code == 0
+        assert "Session is still running" not in result.output
+
     def test_session_ended_backstop_output_shown(
         self, config_file: Path, coord_db: Any
     ) -> None:
@@ -1314,3 +1364,115 @@ class TestInjectBriefingIntoTmuxSession:
         assert load_calls
         # rstrip("\n") removes trailing newlines — matches briefing.rstrip("\n")
         assert load_calls[0]["kwargs"]["input"] == briefing.rstrip("\n")
+
+
+# ── _inject_briefing_into_tmux_session — #2541 blocking-prompt detection ────
+
+
+class TestInjectBriefingHoldsForBlockingPrompt:
+    """#2541: a settled pane showing a claude confirmation dialog (first-run
+    trust prompt, tool/MCP permission question, "bypass permissions"
+    warning, ...) must NOT be pasted into — those dialogs consume a single
+    keystroke, not a bracketed-paste block, and doing so is the leading
+    suspect for the "claude exited with status 1" crash the issue reports.
+    ``_inject_briefing_into_tmux_session`` must detect this and return
+    ``False`` WITHOUT ever calling ``load-buffer``/``paste-buffer``.
+    """
+
+    def _mock_capture(self, content: str) -> Any:
+        def _mock(cmd: list[str], **kwargs: Any) -> MagicMock:
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = content if "capture-pane" in cmd else ""
+            return m
+
+        return _mock
+
+    def test_numbered_selection_prompt_holds_injection(self) -> None:
+        """A "❯ 1. Yes" style confirmation menu (trust dialog / permission
+        question / bypass-permissions warning all share this shape) holds
+        the injection: no load-buffer/paste-buffer call at all."""
+        from coord.interactive import _inject_briefing_into_tmux_session
+
+        calls: list[list[str]] = []
+        dialog = (
+            "Do you want to proceed?\n"
+            "❯ 1. Yes\n"
+            "  2. No, and tell Claude what to do differently\n"
+        )
+
+        def _mock(cmd: list[str], **kwargs: Any) -> MagicMock:
+            calls.append(list(cmd))
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = dialog if "capture-pane" in cmd else ""
+            return m
+
+        with patch("subprocess.run", side_effect=_mock), \
+             patch("coord.interactive._READY_QUIESCE_S", 0.02), \
+             patch("time.sleep"):
+            result = _inject_briefing_into_tmux_session(
+                "coord-prompt", "my briefing", timeout=1.0
+            )
+
+        assert result is False
+        assert not any("load-buffer" in c for c in calls), (
+            "must never load the briefing buffer while a confirmation "
+            "dialog is on screen"
+        )
+        assert not any("paste-buffer" in c for c in calls), (
+            "must never paste into a confirmation dialog"
+        )
+
+    def test_trust_dialog_text_holds_injection(self) -> None:
+        """Known first-run dialog text holds the injection even before any
+        "❯ 1." cursor line has rendered."""
+        from coord.interactive import _inject_briefing_into_tmux_session
+
+        calls: list[list[str]] = []
+        dialog = "Do you trust the files in this folder?\n"
+
+        def _mock(cmd: list[str], **kwargs: Any) -> MagicMock:
+            calls.append(list(cmd))
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = dialog if "capture-pane" in cmd else ""
+            return m
+
+        with patch("subprocess.run", side_effect=_mock), \
+             patch("coord.interactive._READY_QUIESCE_S", 0.02), \
+             patch("time.sleep"):
+            result = _inject_briefing_into_tmux_session(
+                "coord-trust", "my briefing", timeout=1.0
+            )
+
+        assert result is False
+        assert not any("load-buffer" in c for c in calls)
+        assert not any("paste-buffer" in c for c in calls)
+
+    def test_real_input_box_is_not_mistaken_for_a_prompt(self) -> None:
+        """The normal chat input box ("❯ Try a task...") does NOT match the
+        blocking-prompt heuristic and injects normally — regression guard
+        against over-broad detection."""
+        from coord.interactive import _inject_briefing_into_tmux_session
+
+        calls: list[list[str]] = []
+        box = "❯ Try a task, ask a question, or type /help\nmy briefing landed here"
+
+        def _mock(cmd: list[str], **kwargs: Any) -> MagicMock:
+            calls.append(list(cmd))
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = box if "capture-pane" in cmd else ""
+            return m
+
+        with patch("subprocess.run", side_effect=_mock), \
+             patch("coord.interactive._READY_QUIESCE_S", 0.02), \
+             patch("time.sleep"):
+            result = _inject_briefing_into_tmux_session(
+                "coord-box", "my briefing", timeout=1.0
+            )
+
+        assert result is True
+        assert any("load-buffer" in c for c in calls)
+        assert any("paste-buffer" in c for c in calls)
