@@ -807,7 +807,7 @@ def _hold_lines(entry: QueueEntry) -> list[str]:
 # ── #2235 Phase 0 stall log ──────────────────────────────────────────────────
 
 
-def _record_block_log(events: list[dict[str, Any]]) -> None:
+def _record_block_log(events: list[dict[str, Any]]) -> int:
     """Append #2235's Phase-0 stall records.  Observability only.
 
     Best-effort by construction (:func:`coord.block_log.record` swallows its
@@ -817,12 +817,19 @@ def _record_block_log(events: list[dict[str, Any]]) -> None:
     dispatch or attempt-accounting decision, and the cheapest way to guarantee
     that is for the log to sit downstream of every decision and be read by
     none of them.
+
+    Returns how many events actually landed — :func:`coord.block_log.record`'s
+    own count, ``0`` on a full disk / read-only ``$HOME`` / unserialisable
+    event. Every tick call site treats this as fire-and-forget and ignores
+    the count; ``drive_queue_log_intervention`` is the one caller that must
+    not (#2540 review) — printing "logged" on the strength of "did not raise"
+    alone is the "unconfirmed success" shape epic #2096's checklist forbids.
     """
     if not events:
-        return
+        return 0
     from coord import block_log  # noqa: PLC0415
 
-    block_log.record(events)
+    return block_log.record(events)
 
 
 def _record_operator_release(row: Mapping[str, Any] | None, *, resolution: str) -> None:
@@ -902,18 +909,41 @@ def drive_queue_log_intervention(
     A REPO ISSUE this host has never recorded a stall for has nothing to
     attach this to — the record is still written (append-only, never lost),
     but this warns rather than pretending it landed somewhere.
+
+    Runs against **this host's** block log only — it is per-host by design
+    (see `coord/block_log.py`). Run it on the same host that recorded the
+    original stall (usually the daemon host that ran the tick), not e.g. your
+    laptop, or the write lands in a log `coord drive-queue block-log` on the
+    host that actually stalled will never read.
     """
     from coord.block_log import episodes, intervention_event, read_events  # noqa: PLC0415
 
     key = entry_key(repo, issue)
-    _record_block_log(
-        [
-            intervention_event(
-                key=key, category=category, note=note, host=_local_host_id()
-            )
-        ]
+    event = intervention_event(
+        key=key, category=category, note=note, host=_local_host_id()
     )
-    matches = [ep for ep in episodes(read_events()) if ep.get("key") == key]
+    written = _record_block_log([event])
+    if written < 1:
+        raise click.ClickException(
+            f"failed to log intervention against {key} — the block log did "
+            "not accept the write (full disk, read-only $HOME, or an "
+            "unserialisable record); nothing was recorded, try again"
+        )
+
+    # #2540 review: "did not raise" is not "landed" — read the log back and
+    # confirm the record we just wrote is actually in it before telling the
+    # operator it's logged. This reuses the same `read_events()` call
+    # `episodes()` below already needs for the attach-to-episode check (one
+    # membership check against it), rather than a second pass over the log.
+    all_events = read_events()
+    if event not in all_events:
+        raise click.ClickException(
+            f"failed to log intervention against {key} — the write reported "
+            "success but the record could not be read back afterward; "
+            "nothing is confirmed logged, try again"
+        )
+
+    matches = [ep for ep in episodes(all_events) if ep.get("key") == key]
     if not matches:
         click.echo(
             f"logged, but {key} has no recorded stall on this host's block "
