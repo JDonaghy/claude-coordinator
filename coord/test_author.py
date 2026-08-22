@@ -247,6 +247,7 @@ def build_test_author_briefing(
     issue_body: str | None,
     driver_entrypoint: str = "",
     driver_mock: str = "",
+    default_branch: str = "main",
 ) -> str:
     """Compose the test-author's briefing (its first/only user message).
 
@@ -254,6 +255,16 @@ def build_test_author_briefing(
     work, then extended just-in-time": *milestone mode* (`issue_number` is
     None) authors the full initial suite from the contract; *JIT mode*
     (`issue_number` set) extends just that issue's slice.
+
+    *default_branch* (#2539) is the repo's merge target (``repo_cfg.
+    default_branch or "main"`` at both call sites, the same value already
+    sent as the dispatch payload's ``branch`` field). JIT mode uses it to
+    tell the author to check this branch's mergeability before finishing —
+    a re-dispatch onto an already-authored slice branch (see the #2552
+    RESUMING note appended by `dispatch_test_author`) previously had no
+    instruction to look at `default_branch` at all, so a slice that had
+    gone stale behind a sibling slice's merge would report done with an
+    unresolved conflict still sitting on the PR (coord-portal#132).
 
     *driver_entrypoint* (#1552) is the driver's declared ``entrypoint:`` —
     the crate root a slice must be registered in before the run command can
@@ -346,6 +357,43 @@ def build_test_author_briefing(
         parts.append("")
         parts.append(f"ISSUE #{issue_number}: {issue_title or '(no title)'}")
         parts.append(issue_body.strip() if issue_body and issue_body.strip() else "(no body)")
+        parts.append("")
+        parts.append(
+            f"MERGEABILITY (#2539): before you finish — after step 4b's "
+            f"manifest update, before step 6's commit/push — fetch "
+            f"`{default_branch}` (`git fetch origin {default_branch}`) and "
+            f"check whether this branch still merges onto it cleanly (e.g. "
+            f"`git merge --no-commit --no-ff origin/{default_branch}`, then "
+            "`git merge --abort` once you've seen the result — never leave "
+            "the worktree mid-merge). This branch may already carry commits "
+            "from a prior dispatch (see any note above about resuming "
+            "unfinished work), and a sibling slice's PR may have merged "
+            f"into `{default_branch}` since this one was authored. If it "
+            "merges clean, proceed to commit/push as normal. If it "
+            "conflicts:\n"
+            f"  - Confined to `{ACCEPTANCE_DIRNAME}/{ms_dir}/**` (the sealed "
+            "suite YOU already have authoring rights over) AND a clean "
+            "additive collision — the common case is two slices each "
+            "appending their own block to the shared "
+            "`manifest.(yml|json)` (that file documents its own "
+            "convention: later slices MERGE into it) — resolve it "
+            f"yourself: rebase onto `origin/{default_branch}` and keep BOTH "
+            "sides' additions, never dropping the other slice's entries to "
+            "make yours resolve. Re-run step 4's red-check afterward — a "
+            "rebase can shift what the tests see underneath them.\n"
+            "  - Anything else — a conflict that reaches outside "
+            f"`{ACCEPTANCE_DIRNAME}/{ms_dir}/**`, or isn't a clean additive "
+            "collision — do NOT guess a resolution. Abort the merge/rebase, "
+            "leave the branch as it was, and STOP with:\n"
+            f"      STUCK: merge conflict against {default_branch} in "
+            "<file(s)> — outside sealed-authoring scope or not a clean "
+            "additive merge\n"
+            "(same posture a `conflict-fix` session takes for a "
+            "non-rebaseable conflict — you are simply the only dispatch "
+            f"type structurally allowed to touch `{ACCEPTANCE_DIRNAME}/` "
+            "at all, so a conflict confined there is yours to resolve, not "
+            "conflict-fix's)."
+        )
 
     parts.append("")
     parts.append("---")
@@ -499,6 +547,7 @@ def dispatch_test_author(
         issue_number=issue_number,
         issue_title=issue_title,
         issue_body=issue_body,
+        default_branch=repo_cfg.default_branch or "main",
     )
 
     # #1171: milestone-mode dispatches (issue_number is None) keep a single
@@ -889,6 +938,7 @@ def dispatch_test_author_interactive(
         issue_number=issue_number,
         issue_title=issue_title,
         issue_body=issue_body,
+        default_branch=repo_cfg.default_branch or "main",
     )
 
     # Same FIXED title as the headless dispatch (see dispatch_test_author's

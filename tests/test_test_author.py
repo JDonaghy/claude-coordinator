@@ -49,11 +49,13 @@ def _config(
     driver: AcceptanceDriverConfig | None = None,
     worker_permissions: WorkerPermissionsConfig | None = None,
     models: ModelsConfig | None = None,
+    default_branch: str | None = None,
 ) -> Config:
     repo = Repo(
         name=repo_name,
         github="acme/coord-tui",
         worker_permissions=worker_permissions,
+        **({"default_branch": default_branch} if default_branch else {}),
     )
     acceptance = AcceptanceConfig(drivers={repo_name: driver} if driver else {})
     return Config(
@@ -159,6 +161,55 @@ class TestBuildBriefing:
         assert "just-in-time slice extension for issue #101" in briefing
         assert "Add foo" in briefing
         assert "Body text" in briefing
+
+    # ── #2539: mergeability check + sealed-path conflict resolution ────────
+
+    def test_jit_mode_includes_mergeability_check_against_default_branch(self) -> None:
+        """A re-dispatch onto an already-authored slice branch previously had
+        no instruction to look at the target branch at all — it could
+        report done with a conflict still sitting on the PR
+        (coord-portal#132). JIT mode must tell the author to check."""
+        briefing = build_test_author_briefing(**self._kwargs(
+            issue_number=101, issue_title="Add foo", issue_body="Body text",
+            default_branch="develop",
+        ))
+        assert "MERGEABILITY" in briefing
+        assert "git fetch origin develop" in briefing
+        assert "origin/develop" in briefing
+
+    def test_jit_mode_mergeability_defaults_to_main(self) -> None:
+        briefing = build_test_author_briefing(**self._kwargs(
+            issue_number=101, issue_title="Add foo", issue_body="Body text",
+        ))
+        assert "git fetch origin main" in briefing
+
+    def test_jit_mode_mergeability_instructs_sealed_path_resolution(self) -> None:
+        """The common case — two slices additively appending to the shared
+        manifest — is a mechanical rebase + keep-both, and must be spelled
+        out as something the author resolves itself, not escalates."""
+        briefing = build_test_author_briefing(**self._kwargs(
+            issue_number=101, issue_title="Add foo", issue_body="Body text",
+        ))
+        assert "tests/acceptance/ms-25/**" in briefing
+        assert "manifest.(yml|json)" in briefing
+        assert "keep BOTH" in briefing
+        assert "rebase onto `origin/main`" in briefing
+
+    def test_jit_mode_mergeability_refuses_conflicts_outside_sealed_scope(self) -> None:
+        """A conflict reaching outside tests/acceptance/** (or one that isn't
+        a clean additive collision) must be surfaced, not guessed at — same
+        posture conflict-fix already takes for a non-rebaseable conflict."""
+        briefing = build_test_author_briefing(**self._kwargs(
+            issue_number=101, issue_title="Add foo", issue_body="Body text",
+        ))
+        assert "do NOT guess a resolution" in briefing
+        assert "STUCK: merge conflict against main" in briefing
+
+    def test_milestone_mode_has_no_mergeability_section(self) -> None:
+        """Milestone mode's shared Gate-A branch isn't the re-dispatch path
+        #2539 is about — the mergeability instruction is JIT-only."""
+        briefing = build_test_author_briefing(**self._kwargs())
+        assert "MERGEABILITY" not in briefing
 
     # ── #1552: the driver's crate-root entry point ─────────────────────────
 
@@ -489,6 +540,37 @@ class TestDispatchTestAuthor:
         payload = fake_client.post.call_args.kwargs["json"]
         assert "Add foo" in payload["briefing"]
         assert "Body text" in payload["briefing"]
+
+    def test_jit_dispatch_threads_repo_default_branch_into_mergeability_check(
+        self,
+    ) -> None:
+        """#2539: the mergeability instruction must check the REPO's actual
+        merge target, not a hardcoded 'main' — a repo on the `develop`
+        integration-branch convention (models.py's `default_branch`) needs
+        the author fetching/rebasing onto `develop`, not a branch that
+        doesn't exist."""
+        cfg = _config(
+            [_machine("laptop", ["coord-tui"])], driver=self._driver(),
+            default_branch="develop",
+        )
+        fake_client = MagicMock()
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"id": "xyz789"}
+        fake_client.post.return_value = fake_resp
+
+        with patch("coord.test_author.fetch_milestone_context", return_value=self._ctx()), \
+             patch(
+                 "coord.test_author.github_ops.get_issue",
+                 return_value={"title": "Add foo", "body": "Body text"},
+             ), \
+             patch("coord.state.record_dispatched_assignment"):
+            dispatch_test_author(
+                "coord-tui", 947, cfg, issue_number=101, http_client=fake_client,
+            )
+
+        payload = fake_client.post.call_args.kwargs["json"]
+        assert "git fetch origin develop" in payload["briefing"]
+        assert "origin/develop" in payload["briefing"]
 
     def test_jit_slice_gets_its_own_branch_outside_issue_namespace(self) -> None:
         """#1171: a JIT slice must NOT collapse onto the milestone's shared
